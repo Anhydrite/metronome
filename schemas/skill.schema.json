@@ -1,0 +1,125 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Anhydrite/metronome/main/schemas/skill.schema.json",
+  "title": "Metronome Skill Definition",
+  "description": "Schema for an oh-my-openagent-compatible custom skill file. Skills are SKILL.md files with YAML frontmatter, located in their own subdirectory.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Skill identifier. If omitted, defaults to the directory name.",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "examples": ["debugging", "visual-qa", "git-master"]
+    },
+    "description": {
+      "type": "string",
+      "description": "What this skill does and when to use it. Include trigger phrases for auto-matching.",
+      "examples": [
+        "Visual quality assurance for UIs. Triggers: 'visual QA', 'screenshot review'."
+      ]
+    },
+    "model": {
+      "type": "string",
+      "description": "Override the default model for this skill only.",
+      "pattern": "^[a-z0-9_-]+/[a-z0-9_.-]+$"
+    },
+    "agent": {
+      "type": "string",
+      "description": "Force a specific agent to execute this skill.",
+      "examples": ["oracle", "chef-dorchestre", "explore"]
+    },
+    "subtask": {
+      "type": "boolean",
+      "description": "Run this skill in a subtask (separate session) instead of inline.",
+      "default": false
+    },
+    "argument-hint": {
+      "type": "string",
+      "description": "Hint shown to the user about what arguments to pass.",
+      "examples": ["<file-path>", "<pr-number>"]
+    },
+    "license": {
+      "type": "string",
+      "description": "License identifier (SPDX format recommended).",
+      "examples": ["MIT", "Apache-2.0", "SUL-1.0"]
+    },
+    "compatibility": {
+      "type": "string",
+      "description": "Free-form compatibility notes.",
+      "examples": ["OpenCode, Claude Code"]
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Arbitrary key-value pairs. metadata.short-description is shown in skill listings.",
+      "additionalProperties": { "type": "string" },
+      "properties": {
+        "short-description": {
+          "type": "string",
+          "description": "One-line summary shown in compact listings."
+        }
+      }
+    },
+    "allowed-tools": {
+      "oneOf": [
+        { "type": "string", "description": "Comma-separated tool list." },
+        { "type": "array", "items": { "type": "string" }, "description": "YAML array of tool names." }
+      ]
+    },
+    "mcp": {
+      "type": "object",
+      "description": "MCP server definitions. Each server starts when the skill loads and stops when it unloads.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["type"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["stdio", "http", "sse"]
+          },
+          "command": {
+            "type": "string",
+            "description": "For stdio: the executable to run."
+          },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "For http/sse: the server URL."
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "name": "metronome-validator",
+      "description": "Validates Chef d'orchestre installation. Triggers: 'validate metronome', 'check agents'.",
+      "agent": "chef-dorchestre",
+      "subtask": true,
+      "argument-hint": "[agents|skills|all]"
+    },
+    {
+      "name": "codebase-analyzer",
+      "description": "Analyzes codebase structure. Triggers: 'analyze codebase'.",
+      "mcp": {
+        "codegraph": {
+          "type": "stdio",
+          "command": "codegraph-mcp",
+          "args": ["--stdio"]
+        }
+      }
+    }
+  ]
+}

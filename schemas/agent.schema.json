@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Anhydrite/metronome/main/schemas/agent.schema.json",
+  "title": "Metronome Agent Definition",
+  "description": "Schema for an oh-my-openagent-compatible custom agent file. Agents are Markdown files with YAML frontmatter; the frontmatter is validated against this schema and the body becomes the agent's system prompt.",
+  "type": "object",
+  "required": ["name", "description"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Agent identifier. MUST match the filename (without .md). Lowercase, kebab-case.",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "examples": ["chef-dorchestre", "db-migrator", "security-auditor"]
+    },
+    "description": {
+      "type": "string",
+      "description": "One-sentence description of what the agent does. Include trigger phrases.",
+      "minLength": 10,
+      "examples": [
+        "Conductor persona for multi-agent orchestration. Delegates to specialist agents.",
+        "Database migration specialist. Triggers: 'migrate', 'add column', 'schema change'."
+      ]
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier in 'provider/model-id' format.",
+      "pattern": "^[a-z0-9_-]+/[a-z0-9_.-]+$",
+      "examples": [
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-sonnet-4-6",
+        "openai/gpt-5.5",
+        "google/gemini-3.1-pro"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "description": "Agent visibility mode.",
+      "enum": ["primary", "subagent", "all"],
+      "default": "subagent"
+    },
+    "tools": {
+      "type": "string",
+      "description": "Comma-separated whitelist of tools. Omit for full tool access.",
+      "examples": [
+        "Read,Grep,Glob",
+        "Read,Grep,Glob,Bash",
+        "Read,Write,Edit"
+      ]
+    },
+    "prompt": {
+      "type": "string",
+      "description": "Optional inline prompt. If set, OVERRIDES the Markdown body. Usually leave empty and write the prompt in the body."
+    }
+  },
+  "examples": [
+    {
+      "name": "chef-dorchestre",
+      "description": "Conductor persona for multi-agent orchestration. Delegates to specialist agents.",
+      "model": "anthropic/claude-opus-4-7",
+      "mode": "primary"
+    },
+    {
+      "name": "codebase-searcher",
+      "description": "Fast codebase search. Triggers: 'find file', 'where is X'.",
+      "model": "anthropic/claude-sonnet-4-6",
+      "mode": "subagent",
+      "tools": "Read,Grep,Glob"
+    }
+  ]
+}
