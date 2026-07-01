@@ -132,18 +132,22 @@ The agent becomes available immediately after restarting oh-my-openagent.
 
 ## Creating your own skills
 
-Two ways:
+Three paths — pick what fits:
 
-**Option A: Trigger the create-skill skill**
+**Option A: Trigger the create-skill skill (Metronome-native, recommended for most cases)**
 
 In oh-my-openagent with the chef-dorchestre agent active, say:
 > "Create a skill that audits Lighthouse performance"
 
 The `create-skill` skill auto-loads and guides you through the workflow using proven patterns extracted from OmO's 25+ built-in skills.
 
-**Option B: Manual**
+**Option B: Use superpowers' `writing-skills` (heavier, TDD methodology)**
 
-1. Read the template: [`templates/SKILL-TEMPLATE.md`](templates/SKILL-TEMPLATE.md) (or trigger the `create-skill` skill above)
+If you prefer a rigorous TDD-based approach — write failing pressure scenarios with subagents, then write the skill, then watch tests pass, then close loopholes — install [obra/superpowers](https://github.com/obra/superpowers) (already cached by OpenCode) and trigger its `writing-skills` skill. This is the approach used by the broader Claude/Codex skills ecosystem and is the closest thing to a canonical `writing-skills` in the wild. Note: this skill is not from oh-my-openagent (OmO does not ship a skill-authoring skill); it is a third-party option.
+
+**Option C: Manual**
+
+1. Read the template: [`templates/SKILL-TEMPLATE.md`](templates/SKILL-TEMPLATE.md) (or trigger `create-skill` above)
 2. Create your directory: `skills/my-skill/`
 3. Create `SKILL.md` inside it
 4. Validate: `./scripts/validate.sh skills`
