@@ -52,7 +52,7 @@ if [[ "$UNINSTALL" == "true" ]]; then
       rm "$f" && echo "  ✓  removed  $f"
     fi
   done
-  for d in "$GLOBAL_DIR/skills/metronome-validator" "$GLOBAL_DIR/skills/create-agent" "$GLOBAL_DIR/skills/create-skill"; do
+  for d in "$GLOBAL_DIR/skills/metronome-validator" "$GLOBAL_DIR/skills/create-agent"; do
     if [[ -d "$d" ]]; then
       rm -rf "$d" && echo "  ✓  removed  $d"
     fi
@@ -150,4 +150,4 @@ echo ""
 echo "Next steps:"
 echo "  1. Restart oh-my-openagent to pick up new agents and skills"
 echo "  2. Switch to the 'chef-dorchestre' agent from the UI"
-echo "  3. Use the 'create-agent' or 'create-skill' skills to add your own"
+  echo "  3. Use the 'create-agent' skill to add your own, or OmO's built-in 'writing-skills' for skills"
