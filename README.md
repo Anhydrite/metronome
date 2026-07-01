@@ -23,10 +23,13 @@ metronome/
 ├── skills/
 │   ├── create-agent/              # Skill that creates new agents
 │   │   └── SKILL.md
+│   ├── create-skill/              # Skill that creates new skills
+│   │   └── SKILL.md
 │   └── metronome-validator/       # Validates your installation
 │       └── SKILL.md
-├── templates/                     # Standalone reference docs (agent creation)
-│   └── AGENT-TEMPLATE.md
+├── templates/                     # Standalone reference docs (mirror of create-* skills)
+│   ├── AGENT-TEMPLATE.md
+│   └── SKILL-TEMPLATE.md
 ├── schemas/
 │   ├── agent.schema.json          # JSON schema for agents
 │   └── skill.schema.json          # JSON schema for skills
@@ -78,7 +81,7 @@ If you prefer to manage files yourself, use `install.sh`:
 ./scripts/install.sh agents                                # Only agents
 ./scripts/install.sh skills                                # Only skills
 ./scripts/install.sh agents chef-dorchestre                # Specific agent
-./scripts/install.sh skills create-agent                  # Specific skills
+./scripts/install.sh skills create-agent create-skill      # Specific skills
 ./scripts/install.sh --force                               # Overwrite existing
 ```
 
@@ -98,6 +101,7 @@ Expected output:
 
 → Skills
   ✓  create-agent
+  ✓  create-skill
   ✓  metronome-validator
 
 ─────────────────────
@@ -128,12 +132,22 @@ The agent becomes available immediately after restarting oh-my-openagent.
 
 ## Creating your own skills
 
-Use **`oh-my-openagent`'s built-in `writing-skills` skill** — it's the canonical way and follows the proven patterns from OmO's 25+ built-in skills.
+Two ways:
+
+**Option A: Trigger the create-skill skill**
 
 In oh-my-openagent with the chef-dorchestre agent active, say:
 > "Create a skill that audits Lighthouse performance"
 
-The `writing-skills` skill auto-loads and guides you through the workflow.
+The `create-skill` skill auto-loads and guides you through the workflow using proven patterns extracted from OmO's 25+ built-in skills.
+
+**Option B: Manual**
+
+1. Read the template: [`templates/SKILL-TEMPLATE.md`](templates/SKILL-TEMPLATE.md) (or trigger the `create-skill` skill above)
+2. Create your directory: `skills/my-skill/`
+3. Create `SKILL.md` inside it
+4. Validate: `./scripts/validate.sh skills`
+5. Install: `./scripts/install.sh skills my-skill`
 
 ## Core Principles
 

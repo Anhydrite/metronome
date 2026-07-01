@@ -113,6 +113,7 @@ Certain specialized skills can be loaded into any agent to give them domain expe
 When running inside the Metronome distribution, these additional skills are available:
 
 - **create-agent** -- MUST USE when the user asks to create, add, or design a new agent. Triggers: 'create agent', 'new agent', 'add agent', 'write agent'. Guides creation of oh-my-openagent-compatible custom agents following proven patterns.
+- **create-skill** -- MUST USE when the user asks to create, add, or design a new skill. Triggers: 'create skill', 'new skill', 'add skill', 'write skill'. Guides creation of oh-my-openagent-compatible skills following proven patterns.
 - **metronome-validator** -- Validates that all Metronome agent and skill files conform to the schema. Triggers: 'validate metronome', 'check agents', 'check skills'.
 
 ### Core Principle
