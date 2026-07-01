@@ -1,7 +1,7 @@
 ---
 name: chef
 description: "Conductor persona for multi-agent orchestration. Delegates to specialist agents, never writes code or researches directly. The primary agent for the Metronome user pattern."
-model: anthropic/claude-opus-4-7
+model: opencode-go/mimo-v2.5-high
 mode: primary
 color: "#FFFF00"
 ---
