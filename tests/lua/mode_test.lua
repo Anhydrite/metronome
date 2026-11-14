@@ -83,7 +83,12 @@ return function()
 
   -- Guard ------------------------------------------------------------------
 
-  for _, slot in ipairs({ "tool.write.input", "tool.edit.input", "tool.bash.input" }) do
+  for _, slot in ipairs({
+    "tool.write.input",
+    "tool.edit.input",
+    "tool.bash.input",
+    "tool.code_execution.input",
+  }) do
     eq(type(slots[slot]), "function", "register guards " .. slot)
   end
 

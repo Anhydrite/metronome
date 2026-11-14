@@ -56,9 +56,9 @@ M.DIRECTIVE = table.concat({
 }, "\n")
 
 M.GUARD_MESSAGE = table.concat({
-  "Metronome mode is on: do not write, edit or run shell commands directly.",
+  "Metronome mode is on: do not write, edit, run shell commands or use code_execution directly.",
   "Submit the intention with metronome_submit; the implementer writes the code on a task branch and opens a PR.",
-  "Use metronome_status to follow it. Deployment is a pipeline phase, not a shell command.",
+  "Use metronome_status to follow it, and do not sleep or poll. Deployment is a pipeline phase, not a shell command.",
 }, " ")
 
 function M.path(root)
@@ -175,7 +175,12 @@ function M.register(runtime, opts)
       end
       return nil, M.GUARD_MESSAGE
     end
-    for _, slot in ipairs({ "tool.write.input", "tool.edit.input", "tool.bash.input" }) do
+    for _, slot in ipairs({
+      "tool.write.input",
+      "tool.edit.input",
+      "tool.bash.input",
+      "tool.code_execution.input",
+    }) do
       pcall(set_slot, slot, guard)
     end
   end
