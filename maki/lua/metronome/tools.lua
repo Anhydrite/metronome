@@ -25,10 +25,6 @@ function M.definitions()
             type = "string",
             description = "The intention to deliver, captured verbatim.",
           },
-          wait = {
-            type = "boolean",
-            description = "Wait for qualification and return the created tasks (default true). Set false to return at once with queued=true.",
-          },
         },
         required = { "intention" },
       },

@@ -42,6 +42,7 @@ M.DIRECTIVE = table.concat({
   "- a new task or intention -> metronome_submit, with the intention verbatim",
   "- status, or where is it -> metronome_status",
   "- an answer the user gave to pending questions -> metronome_answer, with exactly those answers",
+  "metronome_submit waits for qualification and returns the created task ids. Report them and stop: the pipeline runs in the background. Never sleep, poll, or use code_execution/bash to wait for a task — questions arrive as prompts, and metronome_status answers instantly when the user asks.",
   "When metronome_submit or metronome_answer returns waiting_questions, ask the user those questions with the `question` tool, then call metronome_answer with the user's answers. Never invent an answer to keep moving.",
   "- retry a failed task -> metronome_retry",
   "- abandon or cancel a task -> metronome_abandon",

@@ -38,6 +38,8 @@ return function()
   eq(text:find("metronome_abandon", 1, true) ~= nil, true, "the directive names abandon")
   eq(text:find("`question` tool", 1, true) ~= nil, true, "the directive asks the user with the question tool")
   eq(text:find("Never invent an answer", 1, true) ~= nil, true, "the directive forbids inventing answers")
+  eq(text:find("Never sleep, poll", 1, true) ~= nil, true, "the directive forbids polling for a task")
+  eq(text:find("code_execution", 1, true) ~= nil, true, "the directive forbids code_execution polling")
   eq(text:find("ajoute une tache export CSV", 1, true) ~= nil, true, "the directive keeps the request")
 
   -- Hint -------------------------------------------------------------------
