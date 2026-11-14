@@ -1019,27 +1019,40 @@ function M.new(deps)
       -- turn. `{ session = sid }` opens it as a background session instead.
       ctx = background_ctx(M.resolve_ctx(input, ctx)),
     }
-    -- Qualification is a role turn: run the whole `drive` in the background so
-    -- the chat is free at once and the user can enqueue another demand. The
-    -- result lands in `last_submit`; questions are pushed back to the chat.
-    local function job()
-      local result
-      local ok, err = pcall(function()
-        result = drive(opts)
-      end)
-      if not ok then
-        log(paths, "submit error: " .. tostring(err))
-        result = { ok = false, error = tostring(err) }
+    -- Default: wait for qualification and answer with the created tasks, so
+    -- the agent never has to sleep-poll. The pipeline after qualification still
+    -- runs in the background. `wait = false` returns at once with queued=true.
+    if input.wait == false then
+      local function job()
+        local result
+        local ok, err = pcall(function()
+          result = drive(opts)
+        end)
+        if not ok then
+          log(paths, "submit error: " .. tostring(err))
+          result = { ok = false, error = tostring(err) }
+        end
+        runtime.last_submit = result
+        if type(result) == "table" and type(result.waiting_questions) == "table"
+          and #result.waiting_questions > 0 then
+          ask_in_chat(opts.ctx, result.waiting_questions)
+        end
+        return result
       end
-      runtime.last_submit = result
-      if type(result) == "table" and type(result.waiting_questions) == "table"
-        and #result.waiting_questions > 0 then
-        ask_in_chat(opts.ctx, result.waiting_questions)
-      end
-      return result
+      spawn(job)
+      return { ok = true, background = true, queued = true, intention = opts.intention }
     end
-    spawn(job)
-    return { ok = true, background = true, queued = true, intention = opts.intention }
+
+    local result
+    local ok, err = pcall(function()
+      result = drive(opts)
+    end)
+    if not ok then
+      log(paths, "submit error: " .. tostring(err))
+      return { ok = false, error = tostring(err) }
+    end
+    runtime.last_submit = result
+    return result
   end
 
   function runtime.status(input)

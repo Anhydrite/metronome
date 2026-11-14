@@ -85,11 +85,16 @@ return function()
   captured = nil
   local res = rt.submit({ intention = "add an icon" }, ctx)
   eq(type(res), "table", "submit returns a result table")
-  eq(res and res.background, true, "submit returns before qualification ends")
-  eq(rt.last_submit and rt.last_submit.error, "stop after capture",
-    "submit reaches the qualifier in the background")
+  eq(res and res.error, "stop after capture",
+    "submit waits for qualification and returns its result")
   eq(type(captured), "table", "qualify.run was called")
   eq(captured and captured.ctx, ctx, "submit forwards the positional ctx to qualify")
+
+  -- wait = false returns at once with queued = true -------------------------
+
+  captured = nil
+  local queued = rt.submit({ intention = "add an icon", wait = false }, ctx)
+  eq(queued and queued.queued, true, "wait=false returns at once with queued=true")
 
   -- input.ctx fallback ------------------------------------------------------
 

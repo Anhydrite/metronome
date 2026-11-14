@@ -16,7 +16,7 @@ function M.definitions()
   return {
     {
       name = "metronome_submit",
-      description = "Create an intent from an intention and start qualification.",
+      description = "Create an intent from an intention and start qualification. Blocks until qualification returns, then answers with the created tasks (or the questions the qualifier raised). The pipeline then runs in the background: do not poll with sleeps, call metronome_status only when you need it.",
       permission = "run",
       schema = {
         type = "object",
@@ -24,6 +24,10 @@ function M.definitions()
           intention = {
             type = "string",
             description = "The intention to deliver, captured verbatim.",
+          },
+          wait = {
+            type = "boolean",
+            description = "Wait for qualification and return the created tasks (default true). Set false to return at once with queued=true.",
           },
         },
         required = { "intention" },
