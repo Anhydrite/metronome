@@ -184,7 +184,8 @@ return function()
   -- Tool resolution ---------------------------------------------------------
 
   local seen_tools = nil
-  local capture_session = function(_, opts)
+  local capture_session = function(a, b)
+    local opts = b or a
     seen_tools = opts.tools
     return {
       id = function() return "task" end,
