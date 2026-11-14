@@ -187,6 +187,17 @@ return function()
   local verbose_line = render.text(render.row_line(progress_row, { quiet = false }))
   has(verbose_line, "ready", "a verbose row keeps the action detail")
 
+  -- A long title is cut so the status and the phase stay visible -----------
+  local long_title = string.rep("tres long nom de tache ", 4)
+  local long_row = render.rows({
+    task("T-1", long_title, "running", { phase = "implement" }),
+  })[1]
+  local long_line = render.text(render.row_line(long_row, { quiet = false }))
+  has(long_line, "running", "a long title does not hide the status")
+  has(long_line, "implement", "a long title does not hide the phase")
+  eq(render.fit("abcdefghij", 5):find("…", 1, true) ~= nil, true, "fit ends a cut string with an ellipsis")
+  eq(render.fit("abc", 5), "abc", "fit leaves a short string alone")
+
   local quiet_lines = render.lines(tasks, { quiet = true, frame = 1 })
   local quiet_text = {}
   for _, line in ipairs(quiet_lines) do

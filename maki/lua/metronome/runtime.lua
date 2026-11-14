@@ -1112,8 +1112,8 @@ function M.new(deps)
     if not task then
       return { ok = false, error = "unknown task: " .. tostring(input.id) }
     end
-    if task.status ~= "failed" and task.status ~= "stalled" then
-      return { ok = false, error = "task is not failed or stalled" }
+    if task.status ~= "failed" and task.status ~= "stalled" and task.status ~= "abandoned" then
+      return { ok = false, error = "task is not failed, stalled or abandoned" }
     end
     local moved, err = deps.state.transition(paths.root, input.id, "running", { phase = "implement" })
     if not moved then

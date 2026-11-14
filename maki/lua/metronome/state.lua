@@ -39,7 +39,7 @@ local TRANSITIONS = {
   deployed = {},
   failed = { running = true, abandoned = true },
   stalled = { running = true, failed = true, abandoned = true },
-  abandoned = {},
+  abandoned = { running = true },
 }
 
 function M.can_transition(from, to)

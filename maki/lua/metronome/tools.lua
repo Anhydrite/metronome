@@ -61,7 +61,7 @@ function M.definitions()
     },
     {
       name = "metronome_retry",
-      description = "Restart a failed task from its last stable phase.",
+      description = "Restart a failed, stalled or abandoned task from its last stable phase.",
       permission = "run",
       schema = {
         type = "object",

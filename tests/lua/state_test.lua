@@ -29,6 +29,7 @@ return function()
   eq(state.can_transition("draft", "merged"), false, "draft -> merged refused")
   eq(state.can_transition("deployed", "running"), false, "deployed -> running refused")
   eq(state.can_transition("abandoned", "draft"), false, "abandoned -> draft refused")
+  eq(state.can_transition("abandoned", "running"), true, "abandoned -> running allowed for retry")
   eq(state.can_transition("running", "running"), true, "same status is a no-op")
 
   eq(state.is_terminal("merged"), true, "merged is terminal")

@@ -197,7 +197,7 @@ function M.open(panel)
   panel.win = ui.open_win(panel.buf, {
     title = "Metronome",
     anchor = "NE",
-    width = "45%",
+    width = "60%",
     height = "60%",
     stack = false,
     cursor_line = true,

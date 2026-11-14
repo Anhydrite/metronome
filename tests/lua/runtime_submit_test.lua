@@ -253,6 +253,7 @@ return function()
   -- the tool's LuaCtx, which the turn cancelled at once (duration_ms 0). The
   -- ctx carried by the request must win.
   local runner_ctx
+  local retry_status = "failed"
   local deps4 = {
     config = {
       load = function()
@@ -278,7 +279,7 @@ return function()
     },
     state = {
       load = function()
-        return { tasks = { T1 = { id = "T1", status = "failed" } } }
+        return { tasks = { T1 = { id = "T1", status = retry_status } } }
       end,
       transition = function(_, id, status)
         return { id = id, status = status }
@@ -301,6 +302,13 @@ return function()
   eq(type(runner_ctx), "table", "the role runner receives a ctx table")
   eq(runner_ctx and runner_ctx.session, "S1",
     "the role runner receives the background session id, not the tool ctx")
+
+  -- Retry also revives an abandoned task -----------------------------------
+  retry_status = "abandoned"
+  runner_ctx = nil
+  rt4.retry({ id = "T1" }, { session = "S1" })
+  rt4.run_pending()
+  eq(type(runner_ctx), "table", "retry re-dispatches an abandoned task")
 
   -- Auto-deploy: the merger redeploys right after a green merge -------------
   local deploy_called = false

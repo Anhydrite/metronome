@@ -268,6 +268,51 @@ function M.summary_lines(rows)
   return lines, counts
 end
 
+-- Cut a string to at most `max` display cells, ending with an ellipsis. A long
+-- task title must never push the status and the phase off the panel.
+local function display_width(s)
+  if maki and maki.ui and type(maki.ui.display_width) == "function" then
+    local ok, width = pcall(maki.ui.display_width, s)
+    if ok and type(width) == "number" then
+      return width
+    end
+  end
+  return #s
+end
+
+function M.fit(text, max)
+  text = tostring(text or "")
+  if type(max) ~= "number" or max <= 0 then
+    return text
+  end
+  if display_width(text) <= max then
+    return text
+  end
+  local out = {}
+  local used = 0
+  local i = 1
+  while i <= #text do
+    local byte = text:byte(i) or 0
+    local len = 1
+    if byte >= 240 then
+      len = 4
+    elseif byte >= 224 then
+      len = 3
+    elseif byte >= 192 then
+      len = 2
+    end
+    local ch = text:sub(i, i + len - 1)
+    local width = display_width(ch)
+    if used + width > max - 1 then
+      break
+    end
+    out[#out + 1] = ch
+    used = used + width
+    i = i + len
+  end
+  return table.concat(out) .. "…"
+end
+
 function M.row_line(row, opts)
   opts = type(opts) == "table" and opts or {}
   local role = row.role and ("▸ " .. row.role) or "(waiting)"
@@ -281,7 +326,7 @@ function M.row_line(row, opts)
   local spans = {
     { row.short_id, "dim" },
     { "  " },
-    { row.title },
+    { M.fit(row.title, opts.title_max or 26) },
     { "  " },
     { tostring(row.status or ""), "keyword" },
   }
