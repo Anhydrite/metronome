@@ -734,7 +734,14 @@ function M.new(deps)
     end
     scheduler_running = true
     local job = scheduler_job
+    local real_spawn = deps.spawn == nil
     spawn_background(function()
+      -- Let the ending turn finish before opening a role session: a session
+      -- opened inside the TurnEnd callback is still tied to that turn and is
+      -- cancelled at once.
+      if real_spawn and maki.async and type(maki.async.sleep) == "function" then
+        pcall(maki.async.sleep, 500)
+      end
       local ok, err = pcall(function()
         while scheduler_dirty do
           scheduler_dirty = false
