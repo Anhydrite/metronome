@@ -623,7 +623,19 @@ function M.pr_create(opts)
     return nil, err
   end
   if not result.ok then
-    return fail("gh pr create", result)
+    local diag = M.classify("gh pr create", result)
+    -- A PR that already exists for the head branch is not a failure: opening
+    -- the PR is idempotent, so look the existing one up and return it through
+    -- the normal pr_view/normalize path. Only a lookup that itself fails (no
+    -- PR actually exists) is reported as an error.
+    if diag.cause == "pr_exists" and head ~= "" then
+      local existing, verr, vdiag = M.pr_view(head, opts)
+      if existing then
+        return existing
+      end
+      return nil, verr, vdiag
+    end
+    return nil, M.describe(diag), diag
   end
 
   local url = result.stdout:match("https?://[%w%._%-/~:%?#%[%]@!$&'()*+,;=]+")

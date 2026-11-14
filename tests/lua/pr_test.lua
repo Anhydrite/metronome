@@ -53,7 +53,20 @@ echo "unexpected: $*" >&2
 exit 2
 ]])
 
+  -- `pr create` refuses because a PR already exists; `pr view` finds it. The
+  -- PR number is deliberately different from the happy-path one so a test
+  -- cannot pass by accidentally reusing ok_gh's answer.
   local exists_gh = fake_gh("gh-exists", [[
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{"number":7,"url":"https://github.com/example/repo/pull/7","state":"OPEN"}'
+  exit 0
+fi
+echo 'a pull request for branch "metronome/x" already exists' >&2
+exit 1
+]])
+
+  -- Same refusal, but no PR can be found afterwards: this must stay an error.
+  local exists_noview_gh = fake_gh("gh-exists-noview", [[
 echo 'a pull request for branch "metronome/x" already exists' >&2
 exit 1
 ]])
@@ -174,18 +187,57 @@ exit 1
 
   -- Failures ----------------------------------------------------------------
 
-  local exists, xerr, xdiag = git.pr_create({
+  local exists, xerr = git.pr_create({
     title = "feat: add export",
     worktree = base,
     base = "main",
     head = "metronome/T-20261114-c001",
     gh = exists_gh,
   })
-  eq(exists, nil, "existing PR refused")
-  eq(type(xerr), "string", "existing PR explains itself")
-  has(xerr, "already exists", "existing PR message names the situation")
+  eq(xerr, nil, "an existing PR is not an error: " .. tostring(xerr))
+  eq(exists and exists.number, 7, "existing PR number returned")
+  eq(exists and exists.url, "https://github.com/example/repo/pull/7", "existing PR url returned")
+  eq(exists and exists.state, "open", "existing PR state returned")
+
+  has(read_log(), "pr view metronome/T-20261114-c001 --json number,url,state",
+    "the existing PR is looked up by the head branch")
+
+  -- The refusal is still classified as pr_exists: it is the signal that makes
+  -- pr_create look the PR up instead of failing.
+  local xdiag = git.classify("gh pr create", {
+    code = 1,
+    stderr = 'a pull request for branch "metronome/x" already exists',
+  })
   eq(xdiag and xdiag.cause, "pr_exists", "existing PR is classified pr_exists")
   eq(xdiag and xdiag.hint, "reuse the existing PR or push to a new branch", "pr_exists hint")
+
+  -- pr_open attaches the existing PR and moves on, instead of aborting.
+  local created3, cerr3 = state.create(root, { id = "T-20261114-c003", title = "existing pr", status = "reviewing" })
+  eq(cerr3, nil, "third task created: " .. tostring(cerr3))
+
+  local reopened, rerr = git.pr_open(state, root, "T-20261114-c003", {
+    title = "feat: add export",
+    worktree = base,
+    base = "main",
+    head = "metronome/T-20261114-c001",
+    gh = exists_gh,
+  })
+  eq(rerr, nil, "pr_open with an existing PR has no error: " .. tostring(rerr))
+  eq(reopened and reopened.number, 7, "pr_open returns the existing PR")
+  local reopened_task = state.load(root).tasks["T-20261114-c003"]
+  eq(reopened_task and reopened_task.pr and reopened_task.pr.number, 7, "pr_open stores the existing PR")
+  eq(reopened_task and reopened_task.status, "pr_open", "pr_open moves the task on")
+
+  -- pr_exists but nothing to look up: still an error, never a nil success.
+  local nofind, nferr = git.pr_create({
+    title = "feat: add export",
+    worktree = base,
+    base = "main",
+    head = "metronome/T-20261114-c001",
+    gh = exists_noview_gh,
+  })
+  eq(nofind, nil, "pr_exists with no retrievable PR is still an error")
+  eq(type(nferr), "string", "the failed lookup explains itself")
 
   local badjson, berr = git.pr_view("42", { gh = badjson_gh, worktree = base })
   eq(badjson, nil, "invalid JSON refused")
