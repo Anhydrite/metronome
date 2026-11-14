@@ -495,8 +495,8 @@ function M.handle_key(panel, key)
     if not row then
       return nil, "no task selected"
     end
-    if row.bucket ~= "failures" then
-      return nil, "task is not failed"
+    if row.status ~= "failed" and row.status ~= "stalled" and row.status ~= "abandoned" then
+      return nil, "task is not failed, stalled or abandoned"
     end
     return M.retry(panel, row.id)
   end
