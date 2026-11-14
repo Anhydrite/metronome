@@ -88,6 +88,15 @@ end
 -- must try each one until something decodes to findings.
 local function candidates(text)
   local out = {}
+  local seen = {}
+
+  local function push(slice)
+    if slice and slice ~= "" and not seen[slice] then
+      seen[slice] = true
+      out[#out + 1] = slice
+    end
+  end
+
   local pos = 1
   while true do
     local _, fence_end = text:find("```%s*[Jj][Ss][Oo][Nn]", pos)
@@ -96,24 +105,20 @@ local function candidates(text)
     end
     local close_start = text:find("```", fence_end + 1, true)
     if not close_start then
-      break
+      -- An unterminated fence must not hide a later, well-formed one.
+      pos = fence_end + 1
+    else
+      local body = text:sub(fence_end + 1, close_start - 1)
+      push(body:gsub("^%s+", ""):gsub("%s+$", ""))
+      pos = close_start + 3
     end
-    local body = text:sub(fence_end + 1, close_start - 1)
-    body = body:gsub("^%s+", ""):gsub("%s+$", "")
-    if body ~= "" then
-      out[#out + 1] = body
-    end
-    pos = close_start + 3
   end
 
   for i = 1, #text do
     local c = text:sub(i, i)
     if c == "{" or c == "[" then
       local close = c == "{" and "}" or "]"
-      local slice = balanced(text, i, c, close)
-      if slice then
-        out[#out + 1] = slice
-      end
+      push(balanced(text, i, c, close))
     end
   end
   return out
