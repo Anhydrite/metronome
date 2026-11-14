@@ -4,17 +4,37 @@
   "title": "Metronome journal event",
   "description": "One line of state.jsonl. The journal is append-only, so every event must be self-contained and replayable: replaying the whole file from the start must rebuild the same task set. A torn line is dropped on replay rather than failing the whole file.",
   "type": "object",
-  "required": ["kind", "task_id"],
+  "required": ["kind"],
   "additionalProperties": false,
   "properties": {
     "kind": {
       "type": "string",
-      "description": "What happened. task_created carries the initial task; status moves it; field patches fields; note appends prose; task_deleted hides the task on replay.",
-      "enum": ["task_created", "status", "field", "note", "task_deleted"]
+      "description": "What happened. task_created carries the initial task; status moves it; field patches fields; note appends prose; task_deleted hides the task on replay. deploy_pending records the base a merge produced; deploy_pending_cleared means a deployer drained it; deploy_lock_acquired/deploy_lock_released are the single-flight guard around the deployer.",
+      "enum": [
+        "task_created",
+        "status",
+        "field",
+        "note",
+        "task_deleted",
+        "deploy_pending",
+        "deploy_pending_cleared",
+        "deploy_lock_acquired",
+        "deploy_lock_released"
+      ]
     },
     "task_id": {
       "type": "string",
-      "description": "The task this event applies to.",
+      "description": "The task this event applies to. Required for task-scoped kinds; deploy events are store-scoped and must omit it.",
+      "minLength": 1
+    },
+    "base": {
+      "type": "string",
+      "description": "Present only on deploy_pending: the commit that merge produced and a deployer must drain.",
+      "minLength": 1
+    },
+    "owner": {
+      "type": "string",
+      "description": "Present on deploy_lock_acquired and deploy_lock_released: the deployer that holds, or held, the single-flight lock.",
       "minLength": 1
     },
     "at": {
@@ -66,6 +86,10 @@
   },
   "allOf": [
     {
+      "if": { "properties": { "kind": { "enum": ["task_created", "status", "field", "note", "task_deleted"] } }, "required": ["kind"] },
+      "then": { "required": ["task_id"] }
+    },
+    {
       "if": { "properties": { "kind": { "const": "task_created" } }, "required": ["kind"] },
       "then": { "required": ["task"] }
     },
@@ -80,6 +104,22 @@
     {
       "if": { "properties": { "kind": { "const": "note" } }, "required": ["kind"] },
       "then": { "required": ["text"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "deploy_pending" } }, "required": ["kind"] },
+      "then": { "required": ["base"], "not": { "required": ["task_id"] } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "deploy_lock_acquired" } }, "required": ["kind"] },
+      "then": { "required": ["owner"], "not": { "required": ["task_id"] } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "deploy_pending_cleared" } }, "required": ["kind"] },
+      "then": { "not": { "required": ["task_id"] } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "deploy_lock_released" } }, "required": ["kind"] },
+      "then": { "required": ["owner"], "not": { "required": ["task_id"] } }
     }
   ]
 }
