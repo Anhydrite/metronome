@@ -83,15 +83,16 @@ local function wire()
   -- GC is running"), including on `maki -r`.
   maki.log.info("metronome: tools and /metronome commands registered")
 
-  -- Resume interrupted work after a reload or a crash. The journal is the
-  -- truth: every task left in an active status is walked back to running and
-  -- re-dispatched. Deferred so the plugin finishes loading first, and run from
-  -- a one-shot task so no coroutine stays suspended.
+  -- Resume interrupted work after a reload or a crash. Deferred by a few
+  -- seconds: running it during plugin load blocks maki's startup, because the
+  -- TUI is not ready yet. The journal is the truth, so every active task is
+  -- walked back to running and re-dispatched.
   if type(maki.defer_fn) == "function" then
     maki.defer_fn(function()
       pcall(runtime.resume)
-    end, 0)
+    end, 3000)
   end
+
 end
 
 local wired, wire_err = pcall(wire)
