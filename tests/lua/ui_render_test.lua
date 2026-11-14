@@ -183,7 +183,7 @@ return function()
 
   local quiet_line = render.text(render.row_line(progress_row, { quiet = true }))
   has(quiet_line, render.spinner(3), "a quiet row shows the spinner")
-  eq(quiet_line:find("ready", 1, true), nil, "a quiet row hides the action detail")
+  has(quiet_line, "ready", "a quiet row keeps the task status")
   local verbose_line = render.text(render.row_line(progress_row, { quiet = false }))
   has(verbose_line, "ready", "a verbose row keeps the action detail")
 

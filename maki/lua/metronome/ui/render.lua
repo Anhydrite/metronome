@@ -271,22 +271,27 @@ end
 function M.row_line(row, opts)
   opts = type(opts) == "table" and opts or {}
   local role = row.role and ("▸ " .. row.role) or "(waiting)"
-  -- Quiet mode hides what the agent is doing on a running task. What needs the
-  -- human (a blocked question, a failure, a review to read) is not an action,
-  -- so it keeps its detail.
+  -- The status is always visible: the user asked to read a task's state from
+  -- the panel, not only its phase. Quiet mode hides what the agent is doing on
+  -- a running task (the phase) behind the spinner, never the status.
   local detail = row.detail
   if opts.quiet and row.bucket == "progress" then
     detail = row.spinner or M.spinner(0)
   end
-  return {
+  local spans = {
     { row.short_id, "dim" },
     { "  " },
     { row.title },
     { "  " },
-    { detail, "keyword" },
-    { "  " },
-    { role, "dim" },
+    { tostring(row.status or ""), "keyword" },
   }
+  if detail ~= nil and detail ~= "" and tostring(detail) ~= tostring(row.status) then
+    spans[#spans + 1] = { "  " }
+    spans[#spans + 1] = { detail, "dim" }
+  end
+  spans[#spans + 1] = { "  " }
+  spans[#spans + 1] = { role, "dim" }
+  return spans
 end
 
 -- The whole panel body: bell header, a spacer, then one line per task.
