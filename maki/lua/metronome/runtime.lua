@@ -689,10 +689,10 @@ function M.new(deps)
           local result = run_task(opts, task.id, paths, cfg, runner, session)
           results[#results + 1] = result
           if not result.ok then
-            log(paths, "task " .. task.id .. " failed: " .. tostring(result.error))
-            pcall(deps.state.transition, paths.root, task.id, "failed", {
-              reason = tostring(result.error or "task failed"),
-            })
+            local reason = tostring(result.error or "task failed")
+            log(paths, "task " .. task.id .. " failed: " .. reason)
+            pcall(deps.state.transition, paths.root, task.id, "failed", { reason = reason })
+            notify_failure(opts.ctx, task.id, reason)
           end
         end,
       })
@@ -837,25 +837,51 @@ function M.new(deps)
     local ok, sent = pcall(maki.session.prompt, table.concat(lines, "\n"), { session = sid })
     return ok and sent ~= nil
   end
+
+  -- A failure must reach the user, not only runtime.log: a task that fails
+  -- while the user is away would otherwise sit in `failed` forever with nobody
+  -- told. `notify` with `wake = true` starts a turn when the chat is idle; the
+  -- prompt is the fallback when notify is unavailable.
+  local function notify_failure(ctx, task_id, reason)
+    local sid = type(ctx) == "table" and ctx.session or ctx_session_id(ctx)
+    if not sid then
+      return false
+    end
+    local text = string.format(
+      "Metronome: task %s failed: %s. Call metronome_status for the detail, then metronome_retry to restart it.",
+      tostring(task_id), tostring(reason or "unknown error"))
+    if maki.session and type(maki.session.notify) == "function" then
+      local ok, sent = pcall(maki.session.notify, text, { session = sid, wake = true })
+      if ok and sent then
+        return true
+      end
+    end
+    if maki.session and type(maki.session.prompt) == "function" then
+      local ok, sent = pcall(maki.session.prompt, text, { session = sid })
+      return ok and sent ~= nil
+    end
+    return false
+  end
+
   local function schedule_job(opts, paths, cfg, runner, session)
-  scheduler_job = {
+    scheduler_job = {
       opts = opts,
       paths = paths,
       cfg = cfg,
       runner = runner,
       session = session,
-  }
-  scheduler_dirty = true
-  -- Spawn a drain task only when there is work, and let it end when the
-  -- queue is empty. A perpetual `sleep` loop keeps a coroutine suspended for
-  -- the whole life of the plugin, and maki/GC can panic on that state
-  -- ("Luau VM is suspended while GC is running"). A one-shot task per burst
-  -- of work has no idle suspended coroutine.
-  if not scheduler_running then
+    }
+    scheduler_dirty = true
+    -- Spawn a drain task only when there is work, and let it end when the
+    -- queue is empty. A perpetual `sleep` loop keeps a coroutine suspended for
+    -- the whole life of the plugin, and maki/GC can panic on that state
+    -- ("Luau VM is suspended while GC is running"). A one-shot task per burst
+    -- of work has no idle suspended coroutine.
+    if not scheduler_running then
       spawn(function()
         pcall(runtime.run_pending)
       end)
-  end
+    end
   end
 
   function runtime.has_pending()
@@ -1149,12 +1175,13 @@ function M.new(deps)
         pcall(deps.state.transition, paths.root, input.id, "failed", {
           reason = tostring(result),
         })
+        notify_failure(bg.ctx, input.id, tostring(result))
         return
       end
       if not result.ok then
-        pcall(deps.state.transition, paths.root, input.id, "failed", {
-          reason = tostring(result.error or "task failed"),
-        })
+        local reason = tostring(result.error or "task failed")
+        pcall(deps.state.transition, paths.root, input.id, "failed", { reason = reason })
+        notify_failure(bg.ctx, input.id, reason)
       end
       runtime.last_background = result
     end
@@ -1299,6 +1326,7 @@ function M.new(deps)
               or (type(result) == "table" and result.error)
               or "resume failed"
             pcall(deps.state.transition, paths.root, task.id, "failed", { reason = tostring(reason) })
+            notify_failure(opts.ctx, task.id, reason)
           end
           runtime.last_background = result
         end
