@@ -47,6 +47,9 @@ return function()
     paths = function()
       return paths
     end,
+    spawn = function(fn)
+      fn()
+    end,
     questions = {
       answer = function()
         return { applied = 1, answered = 1, tasks = { "T-20261114-0001" } }
@@ -170,6 +173,9 @@ return function()
     paths = function()
       return paths
     end,
+    spawn = function(fn)
+      fn()
+    end,
     runner = {}, git = {}, implement = {}, checks = {}, converge = {}, review = {}, merge = {},
     deploy = {}, calibrate = {}, fence = {}, mode = {},
   }
@@ -210,6 +216,9 @@ return function()
     paths = function()
       return paths
     end,
+    spawn = function(fn)
+      fn()
+    end,
     runner = {}, git = {}, qualify = {}, questions = {}, analyze = {},
     checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
     calibrate = {}, pipeline = {}, fence = {}, mode = {},
@@ -217,6 +226,8 @@ return function()
   local rt3 = runtime.new(deps3)
   local retried = rt3.retry({ id = "T1" }, ctx)
   eq(type(retried), "table", "retry returns a result")
-  eq(retried and retried.error, "stop after dispatch", "retry reports the dispatch result")
+  eq(retried and retried.background, true, "retry returns before the dispatch finishes")
+  eq(rt3.last_background and rt3.last_background.error, "stop after dispatch",
+    "retry reports the dispatch result on the background record")
   eq(implemented, true, "retry re-dispatches the task instead of only moving its status")
 end

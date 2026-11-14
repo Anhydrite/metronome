@@ -694,6 +694,59 @@ function M.new(deps)
     return { ok = true, results = results, deployed = deployed }
   end
 
+  -- Background scheduler -----------------------------------------------------
+  --
+  -- The pipeline must not block the chat: a submit returns as soon as the
+  -- tasks are qualified, and one background loop drains the ready queue. A
+  -- second submit while the loop runs only marks it dirty; the loop picks the
+  -- new tasks up before it exits, so max_parallel and file overlap stay under
+  -- the scheduler's control.
+  local scheduler_running = false
+  local scheduler_dirty = false
+
+  local function background_ctx(ctx)
+    local sid = type(ctx) == "table" and ctx.session_id or nil
+    if not sid and maki.session and type(maki.session.current) == "function" then
+      local ok, current = pcall(maki.session.current)
+      if ok then
+        sid = current
+      end
+    end
+    if type(sid) == "string" and sid ~= "" then
+      return { session = sid }
+    end
+    return ctx
+  end
+
+  local function spawn_background(fn)
+    local spawn = deps.spawn or (maki.async and maki.async.spawn)
+    if type(spawn) == "function" then
+      spawn(fn)
+    else
+      fn()
+    end
+  end
+
+  local function ensure_scheduler(opts, paths, cfg, runner, session)
+    scheduler_dirty = true
+    if scheduler_running then
+      return
+    end
+    scheduler_running = true
+    spawn_background(function()
+      local ok, err = pcall(function()
+        while scheduler_dirty do
+          scheduler_dirty = false
+          runtime.last_background = after_questions(opts, paths, cfg, runner, session)
+        end
+      end)
+      scheduler_running = false
+      if not ok then
+        log(paths, "background scheduler error: " .. tostring(err))
+      end
+    end)
+  end
+
   local function drive(opts)
     local cfg, cerr, paths = load_config(opts)
     if not cfg then
@@ -760,7 +813,13 @@ function M.new(deps)
       end
     end
 
-    return after_questions(opts, paths, cfg, runner, session)
+    if script then
+      -- The scripted e2e driver expects the whole run to finish before submit
+      -- returns; only a real run goes to the background.
+      return after_questions(opts, paths, cfg, runner, session)
+    end
+    ensure_scheduler({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
+    return { ok = true, background = true, tasks = applied.tasks }
   end
 
   -- Public runtime methods --------------------------------------------------
@@ -809,14 +868,10 @@ function M.new(deps)
   end
 
   function runtime.submit(input, ctx)
-    if runtime.running then
-      return { ok = false, error = "a Metronome run is already in progress" }
-    end
     local paths = p()
     if not fs.read(paths.config) then
       return { ok = false, error = "project is not bound; run /metronome init first" }
     end
-    runtime.running = true
     local opts = {
       intention = input.intention,
       answers = input.answers,
@@ -829,7 +884,6 @@ function M.new(deps)
     if not ok then
       log(paths, "submit error: " .. tostring(err))
     end
-    runtime.running = false
     if not ok then
       return { ok = false, error = tostring(err) }
     end
@@ -871,9 +925,8 @@ function M.new(deps)
     if not runner then
       return { ok = false, error = perr, applied = applied }
     end
-    local result = after_questions(opts, paths, cfg, runner, session)
-    result.applied = applied
-    return result
+    ensure_scheduler({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
+    return { ok = true, background = true, applied = applied }
   end
 
   function runtime.retry(input, ctx)
@@ -903,14 +956,24 @@ function M.new(deps)
     if not runner then
       return { ok = false, error = perr, task = moved }
     end
-    local result = run_task(opts, input.id, paths, cfg, runner, session)
-    if not result.ok then
-      pcall(deps.state.transition, paths.root, input.id, "failed", {
-        reason = tostring(result.error or "task failed"),
-      })
-    end
-    result.task = moved
-    return result
+    local bg = { ctx = background_ctx(opts.ctx) }
+    spawn_background(function()
+      local ok, result = pcall(run_task, bg, input.id, paths, cfg, runner, session)
+      if not ok then
+        log(paths, "retry error: " .. tostring(result))
+        pcall(deps.state.transition, paths.root, input.id, "failed", {
+          reason = tostring(result),
+        })
+        return
+      end
+      if not result.ok then
+        pcall(deps.state.transition, paths.root, input.id, "failed", {
+          reason = tostring(result.error or "task failed"),
+        })
+      end
+      runtime.last_background = result
+    end)
+    return { ok = true, background = true, task = moved }
   end
 
   function runtime.abandon(input)
