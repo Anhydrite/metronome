@@ -81,29 +81,42 @@ local function balanced(text, start, open, close)
   return nil
 end
 
--- Prefer whichever bracket opens first, so a bare array is not mistaken for
--- the first object inside it. If that candidate is unbalanced, the other one
--- still gets a chance.
-local function extract_candidate(text)
-  local object_start = text:find("{", 1, true)
-  local array_start = text:find("[", 1, true)
-  local candidates = {}
-  if object_start then
-    candidates[#candidates + 1] = { start = object_start, open = "{", close = "}" }
+-- Every place the answer might be: fenced ```json blocks first, because a
+-- fence is an explicit claim, then each balanced {...} or [...] starting at
+-- every brace in order of appearance. A reviewer that quotes a rule, a diff or
+-- a snippet of CSS puts braces in prose before the real answer, so the caller
+-- must try each one until something decodes to findings.
+local function candidates(text)
+  local out = {}
+  local pos = 1
+  while true do
+    local _, fence_end = text:find("```%s*[Jj][Ss][Oo][Nn]", pos)
+    if not fence_end then
+      break
+    end
+    local close_start = text:find("```", fence_end + 1, true)
+    if not close_start then
+      break
+    end
+    local body = text:sub(fence_end + 1, close_start - 1)
+    body = body:gsub("^%s+", ""):gsub("%s+$", "")
+    if body ~= "" then
+      out[#out + 1] = body
+    end
+    pos = close_start + 3
   end
-  if array_start then
-    candidates[#candidates + 1] = { start = array_start, open = "[", close = "]" }
-  end
-  table.sort(candidates, function(a, b)
-    return a.start < b.start
-  end)
-  for _, candidate in ipairs(candidates) do
-    local slice = balanced(text, candidate.start, candidate.open, candidate.close)
-    if slice then
-      return slice
+
+  for i = 1, #text do
+    local c = text:sub(i, i)
+    if c == "{" or c == "[" then
+      local close = c == "{" and "}" or "]"
+      local slice = balanced(text, i, c, close)
+      if slice then
+        out[#out + 1] = slice
+      end
     end
   end
-  return nil
+  return out
 end
 
 -- Normalise one finding to the five keys schemas/task.schema.json knows about.
@@ -153,34 +166,13 @@ local function normalize_finding(raw, index)
   return finding
 end
 
--- Parse the reviewer's answer. Accepts `{findings:[...]}` or a bare array,
--- fenced or surrounded by prose. Returns (findings, err).
-function M.parse_findings(text)
-  if type(text) ~= "string" then
-    return nil, "no text"
-  end
-
-  local slice = extract_candidate(text)
-  if not slice then
-    return nil, "invalid JSON: no JSON object found"
-  end
-
-  local ok, decoded, decode_err = pcall(maki.json.decode, slice)
-  if not ok then
-    return nil, "invalid JSON: " .. tostring(decoded)
-  end
-  if decoded == nil then
-    return nil, "invalid JSON: " .. tostring(decode_err)
-  end
-  if type(decoded) ~= "table" then
-    return nil, "invalid JSON: expected an object or an array"
-  end
-
-  -- The decoded table cannot tell an empty array from an empty object, so the
-  -- slice's first character decides. For an object answer, the character after
-  -- `"findings":` must be `[` for the same reason: `{"findings":{}}` is not a
-  -- findings array, and treating it as an empty one would approve a malformed
-  -- answer.
+-- The findings list inside one decoded candidate, or `false` when the candidate
+-- is valid JSON but not shaped like an answer. The decoded table cannot tell an
+-- empty array from an empty object, so the slice's first character decides. For
+-- an object answer, the character after `"findings":` must be `[` for the same
+-- reason: `{"findings":{}}` is not a findings array, and treating it as an empty
+-- one would approve a malformed answer.
+local function findings_of(slice, decoded)
   local first = slice:match("^%s*(.)")
   local list
   if first == "[" then
@@ -188,11 +180,11 @@ function M.parse_findings(text)
   else
     local opener = slice:match('"findings"%s*:%s*(%S)')
     if opener ~= "[" then
-      return nil, "invalid JSON: expected a findings array"
+      return nil, "invalid JSON: expected a findings array", false
     end
     list = decoded.findings
     if type(list) ~= "table" then
-      return nil, "invalid JSON: expected a findings array"
+      return nil, "invalid JSON: expected a findings array", false
     end
   end
 
@@ -200,11 +192,50 @@ function M.parse_findings(text)
   for i, raw in ipairs(list) do
     local finding, err = normalize_finding(raw, i)
     if not finding then
-      return nil, err
+      return nil, err, true
     end
     findings[i] = finding
   end
-  return findings
+  return findings, nil, true
+end
+
+-- Parse the reviewer's answer. Accepts `{findings:[...]}` or a bare array,
+-- fenced or surrounded by prose. Every candidate is tried in turn: a decodable
+-- findings answer wins, a candidate that is not shaped like an answer is
+-- skipped, and a candidate that decodes to findings with a bad value is an
+-- error rather than something to look past. Returns (findings, err).
+function M.parse_findings(text)
+  if type(text) ~= "string" then
+    return nil, "no text"
+  end
+
+  local slices = candidates(text)
+  if #slices == 0 then
+    return nil, "invalid JSON: no JSON object found"
+  end
+
+  local decode_err, shape_err
+  for _, slice in ipairs(slices) do
+    local ok, decoded, pcall_err = pcall(maki.json.decode, slice)
+    if not ok then
+      decode_err = decode_err or ("invalid JSON: " .. tostring(decoded))
+    elseif decoded == nil then
+      decode_err = decode_err or ("invalid JSON: " .. tostring(pcall_err))
+    elseif type(decoded) ~= "table" then
+      shape_err = shape_err or "invalid JSON: expected an object or an array"
+    else
+      local findings, err, shaped = findings_of(slice, decoded)
+      if shaped then
+        if findings then
+          return findings
+        end
+        return nil, err
+      end
+      shape_err = shape_err or err
+    end
+  end
+
+  return nil, shape_err or decode_err or "invalid JSON: no JSON object found"
 end
 
 -- Protected paths -------------------------------------------------------------

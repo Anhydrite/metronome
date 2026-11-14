@@ -148,6 +148,15 @@ return function()
   eq(type(fenced), "table", "parse_findings reads a fenced answer")
   eq(#fenced, 0, "an empty findings array is valid")
 
+  -- A brace in prose looks like the start of an object, but it is not JSON.
+  -- parse_findings must try the next candidate instead of giving up on the
+  -- first brace it sees.
+  local prose = review.parse_findings(
+    'The rule is body { background: var(--bg) } in the stylesheet.\n{"findings":[]}'
+  )
+  eq(type(prose), "table", "parse_findings skips a brace in prose")
+  eq(#prose, 0, "the JSON after a prose brace is found")
+
   local extra = review.parse_findings(
     '{"findings":[{"severity":"minor","message":"m","foo":"bar","file":"x"}]}'
   )
