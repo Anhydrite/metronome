@@ -480,4 +480,178 @@ function M.run(opts)
   return result
 end
 
+-- Drain ----------------------------------------------------------------------
+
+-- Merges arrive faster than deploys run, so a merge does not start a deployer:
+-- it records the base it produced in the pending flag (state.lua) and a single
+-- drainer drains it. Three rules make that safe:
+--
+--   * single-flight — the drainer takes the deploy lock first; a second drainer
+--     that finds the lock held does not queue and does not touch the flag. The
+--     holder will see the newer base and do the follow-up itself.
+--   * coalescing — the flag holds one base, and a merge overwrites it. Merges
+--     that land while a deploy runs only move the flag forward, so the drainer
+--     sees one newer base and runs exactly one follow-up, never one per merge.
+--   * draining — a base is cleared only after a runner actually ran for it, and
+--     only if the flag still holds that same base.
+--
+-- The flag records only a commit, so the drainer must be told which task that
+-- base belongs to. An injected `resolve` (the pipeline knows which merge
+-- produced the base) wins; then an explicit task/task_id. There is no guess:
+-- a base that maps to no task is a refusal, and the flag is left alone.
+local function resolve_pending_task(pending, opts)
+  local base = type(pending) == "table" and pending.base or nil
+
+  if type(opts.resolve) == "function" then
+    local called, value = pcall(opts.resolve, pending)
+    if not called then
+      return nil, "cannot resolve the pending base: " .. tostring(value)
+    end
+    if type(value) == "table" and is_non_empty(value.id) then
+      return value.id, nil
+    end
+    if is_non_empty(value) then
+      return value, nil
+    end
+    return nil, "no task for the pending base " .. tostring(base)
+  end
+
+  if type(opts.task) == "table" and is_non_empty(opts.task.id) then
+    return opts.task.id, nil
+  end
+  if is_non_empty(opts.task) then
+    return opts.task, nil
+  end
+  if is_non_empty(opts.task_id) then
+    return opts.task_id, nil
+  end
+
+  return nil, "no task for the pending base " .. tostring(base)
+end
+
+-- The work while the lock is held. Never releases the lock; the caller does.
+local function drain_locked(state, root, pending, opts)
+  local base = pending.base
+  local out = { base = base }
+
+  local id, rerr = resolve_pending_task(pending, opts)
+  if not id then
+    out.ok = false
+    out.error = rerr
+    out.deferred = true
+    return out
+  end
+  out.task_id = id
+
+  local run_opts = {}
+  for key, value in pairs(opts) do
+    run_opts[key] = value
+  end
+  run_opts.task = nil
+  run_opts.task_id = id
+  run_opts.resolve = nil
+
+  local result = M.run(run_opts)
+  out.ok = result.ok == true
+  out.error = result.error
+  out.deployed = result.deployed
+  out.needs_confirmation = result.needs_confirmation
+  out.log = result.log
+  out.run = result.run
+  out.deploy = result
+
+  -- A runner only runs after the guard and the plan: no `run` means the base
+  -- was never attempted (refused, unconfirmed, or blocked early), so the flag
+  -- must survive for the next drainer.
+  if result.run == nil then
+    out.deferred = true
+    return out
+  end
+
+  -- Coalescing: a merge during the run only moved the flag forward. Clear the
+  -- base we drained; if a newer one replaced it, leave it for the one follow-up.
+  local latest = state.deploy_pending(root)
+  if type(latest) ~= "table" or not is_non_empty(latest.base) then
+    out.drained = true
+    return out
+  end
+  if latest.base ~= base then
+    out.follow_up = true
+    out.follow_up_base = latest.base
+    return out
+  end
+
+  local cleared, cerr = state.clear_deploy_pending(root)
+  if cleared then
+    out.drained = true
+  else
+    out.clear_error = cerr
+  end
+  return out
+end
+
+local function drain_impl(opts)
+  local state = opts.state
+  local root = opts.root
+
+  if type(state) ~= "table" or type(state.load) ~= "function" then
+    return { ok = false, error = "drain needs a state module" }
+  end
+  if not is_non_empty(root) then
+    return { ok = false, error = "drain needs a state root" }
+  end
+  if type(state.acquire_deploy) ~= "function"
+    or type(state.release_deploy) ~= "function"
+    or type(state.deploy_pending) ~= "function"
+    or type(state.clear_deploy_pending) ~= "function" then
+    return { ok = false, error = "drain needs the deploy lock in state" }
+  end
+
+  local owner = is_non_empty(opts.owner) and opts.owner or "deployer"
+
+  -- Single-flight: the lock is taken before the flag is even read. A deployer
+  -- that loses the race reports the holder and leaves everything untouched.
+  local lock, lerr = state.acquire_deploy(root, owner, { force = opts.force })
+  if not lock then
+    return { ok = false, locked = true, single_flight = true, owner = owner, error = lerr }
+  end
+
+  local pending = state.deploy_pending(root)
+  local result
+  if type(pending) ~= "table" or not is_non_empty(pending.base) then
+    result = { ok = false, no_pending = true, error = "no deploy pending" }
+  else
+    local ran, value = pcall(drain_locked, state, root, pending, opts)
+    if ran and type(value) == "table" then
+      result = value
+    elseif ran then
+      result = { ok = false, error = "drain returned no result" }
+    else
+      result = { ok = false, error = tostring(value) }
+    end
+  end
+
+  local released, rerr = state.release_deploy(root, owner, { force = opts.force })
+  result.owner = owner
+  result.lock_released = released and true or false
+  if not released then
+    result.release_error = rerr
+  end
+  return result
+end
+
+-- Drain at most one base. The contract mirrors M.run: a result table, never a
+-- raise. `locked` means another deployer holds the lock, `no_pending` means
+-- there was nothing to do, `deferred` means the flag was left for a later
+-- drain, `drained` means the flag was cleared, and `follow_up` means a newer
+-- base arrived during the run and exactly one more drain is owed.
+function M.drain(opts)
+  opts = type(opts) == "table" and opts or {}
+  local called, result = pcall(drain_impl, opts)
+  if not called then
+    return { ok = false, error = tostring(result) }
+  end
+  return result
+end
+
 return M

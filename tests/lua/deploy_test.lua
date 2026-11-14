@@ -532,6 +532,252 @@ return function()
   eq(log_decoded.task_id, id_log, "the log json names the task")
   eq(log_decoded.ok, true, "the log json records the verdict")
 
+  -- drain ---------------------------------------------------------------------
+  --
+  -- A merge records a base in the pending flag; one deployer drains it. The
+  -- lock is single-flight, and merges that land during a run coalesce into a
+  -- single follow-up instead of one deploy per merge.
+
+  local function drain_opts(extra)
+    extra = extra or {}
+    local opts = opts_for("", extra)
+    if extra.task == nil and extra.task_id == nil then
+      opts.task = nil
+      opts.task_id = nil
+    end
+    return opts
+  end
+
+  -- No flag at all: nothing to drain, and the lock must not be left behind.
+  local empty_calls = 0
+  local drained_none = deploy.drain(drain_opts({
+    confirmed = true,
+    runner = function()
+      empty_calls = empty_calls + 1
+      return { ok = true, text = "should not run" }
+    end,
+  }))
+  eq(drained_none.ok, false, "a drain with no pending flag is not ok")
+  eq(drained_none.no_pending, true, "a drain with no pending flag says there is nothing to do")
+  eq(empty_calls, 0, "a drain with no pending flag does not call the runner")
+  eq(state.deploy_lock(root), nil, "a drain with no pending flag releases the lock")
+
+  eq(deploy.drain({ root = root }).error, "drain needs a state module",
+    "a drain without state is refused")
+
+  -- A guard refusal keeps the flag: the base was never attempted.
+  local id_drain_open = "T-20261114-dp21"
+  make_task(id_drain_open, { pr = OPEN_PR })
+  write_checks(id_drain_open, true)
+  state.set_deploy_pending(root, "base-open")
+  local refused_calls = 0
+  local refused_drain = deploy.drain(drain_opts({
+    confirmed = true,
+    resolve = function()
+      return id_drain_open
+    end,
+    runner = function()
+      refused_calls = refused_calls + 1
+      return { ok = true, text = "should not run" }
+    end,
+  }))
+  eq(refused_drain.ok, false, "a drain refused by the guard is not ok")
+  has(refused_drain.error, "pull request", "the refused drain names the guard that stopped it")
+  eq(refused_calls, 0, "the refused drain does not call the runner")
+  eq(refused_drain.deferred, true, "the refused drain defers the base")
+  eq(refused_drain.drained, nil, "the refused drain does not clear the flag")
+  eq(state.deploy_pending(root).base, "base-open", "the refused drain keeps the pending base")
+  eq(state.deploy_lock(root), nil, "the refused drain releases the lock")
+
+  -- The checks gate is still part of the drain.
+  local id_drain_red = "T-20261114-dp27"
+  make_task(id_drain_red)
+  write_checks(id_drain_red, false)
+  state.set_deploy_pending(root, "base-red")
+  local red_calls = 0
+  local red_drain = deploy.drain(drain_opts({
+    confirmed = true,
+    resolve = function()
+      return id_drain_red
+    end,
+    runner = function()
+      red_calls = red_calls + 1
+      return { ok = true, text = "should not run" }
+    end,
+  }))
+  eq(red_drain.ok, false, "a drain with red checks is not ok")
+  has(red_drain.error, "checks are not green", "the red drain names the checks gate")
+  eq(red_calls, 0, "the red drain does not call the runner")
+  eq(state.deploy_pending(root).base, "base-red", "the red drain keeps the pending base")
+  state.clear_deploy_pending(root)
+
+  -- An unconfirmed drain leaves the flag alone as well.
+  local id_drain_confirm = "T-20261114-dp28"
+  make_task(id_drain_confirm)
+  write_checks(id_drain_confirm, true)
+  state.set_deploy_pending(root, "base-confirm")
+  local confirm_drain_calls = 0
+  local unconfirmed_drain = deploy.drain(drain_opts({
+    resolve = function()
+      return id_drain_confirm
+    end,
+    runner = function()
+      confirm_drain_calls = confirm_drain_calls + 1
+      return { ok = true, text = "should not run" }
+    end,
+  }))
+  eq(unconfirmed_drain.needs_confirmation, true, "an unconfirmed drain asks for confirmation")
+  eq(confirm_drain_calls, 0, "an unconfirmed drain does not call the runner")
+  eq(state.deploy_pending(root).base, "base-confirm", "an unconfirmed drain keeps the pending base")
+  state.clear_deploy_pending(root)
+
+  -- Single-flight: a second deployer does not drain while the lock is held.
+  local id_drain_locked = "T-20261114-dp29"
+  make_task(id_drain_locked)
+  write_checks(id_drain_locked, true)
+  state.set_deploy_pending(root, "base-locked")
+  local other_lock, other_err = state.acquire_deploy(root, "deployer-other")
+  eq(other_lock ~= nil, true, "the other deployer took the lock: " .. tostring(other_err))
+  local locked_calls = 0
+  local locked = deploy.drain(drain_opts({
+    confirmed = true,
+    resolve = function()
+      return id_drain_locked
+    end,
+    runner = function()
+      locked_calls = locked_calls + 1
+      return { ok = true, text = "should not run" }
+    end,
+  }))
+  eq(locked.ok, false, "the second drainer is refused")
+  eq(locked.locked, true, "the second drainer reports the lock")
+  eq(locked.single_flight, true, "the second drainer reports single-flight")
+  has(locked.error, "deploy lock held by deployer-other", "the refusal names the holder")
+  eq(locked_calls, 0, "the second drainer does not call the runner")
+  eq(state.deploy_pending(root).base, "base-locked", "the second drainer leaves the flag alone")
+  eq(state.deploy_lock(root).owner, "deployer-other", "the second drainer leaves the lock alone")
+  eq(state.release_deploy(root, "deployer-other"), true, "the other deployer releases the lock")
+
+  -- The happy path: one base, one runner call, flag cleared, lock released.
+  local id_drain = "T-20261114-dp22"
+  make_task(id_drain)
+  write_checks(id_drain, true)
+  state.set_deploy_pending(root, "base-alpha")
+  local happy_calls = {}
+  local drained = deploy.drain(drain_opts({
+    confirmed = true,
+    resolve = function(pending)
+      return pending.base == "base-alpha" and id_drain or nil
+    end,
+    runner = function(request)
+      happy_calls[#happy_calls + 1] = request
+      return { ok = true, text = "drained\n", attempts = 1, cost = 0.01 }
+    end,
+  }))
+  eq(drained.ok, true, "a drain deploys: " .. tostring(drained.error))
+  eq(drained.drained, true, "a drain reports the flag was drained")
+  eq(drained.task_id, id_drain, "the drain reports the task it deployed")
+  eq(drained.base, "base-alpha", "the drain reports the base it drained")
+  eq(#happy_calls, 1, "the drain calls the runner once")
+  eq(happy_calls[1] and happy_calls[1].phase, "deploy", "the drained runner is the deployer")
+  has(happy_calls[1] and happy_calls[1].prompt, PLAN_STEP, "the drained prompt carries the plan")
+  eq(state.load(root).tasks[id_drain].status, "deployed", "the drained task is deployed")
+  eq(state.deploy_pending(root), nil, "a drained flag is cleared")
+  eq(state.deploy_lock(root), nil, "a drained lock is released")
+  eq(drained.follow_up, nil, "an uninterrupted drain owes no follow-up")
+
+  -- An explicit task id is enough when the caller already knows the task.
+  local id_drain_default = "T-20261114-dp23"
+  make_task(id_drain_default)
+  write_checks(id_drain_default, true)
+  state.set_deploy_pending(root, "base-beta")
+  local default_calls = 0
+  local default_drain = deploy.drain(drain_opts({
+    confirmed = true,
+    task_id = id_drain_default,
+    runner = function()
+      default_calls = default_calls + 1
+      return { ok = true, text = "default\n" }
+    end,
+  }))
+  eq(default_drain.ok, true, "a drain with an explicit task id deploys: "
+    .. tostring(default_drain.error))
+  eq(default_drain.task_id, id_drain_default, "the drain uses the explicit task id")
+  eq(default_calls, 1, "the explicit-task drain calls the runner once")
+  eq(state.deploy_pending(root), nil, "the explicit-task drain clears the flag")
+
+  -- An unresolvable base is deferred, never silently dropped.
+  state.set_deploy_pending(root, "orphan-base")
+  local orphan_calls = 0
+  local orphan = deploy.drain(drain_opts({
+    confirmed = true,
+    runner = function()
+      orphan_calls = orphan_calls + 1
+      return { ok = true, text = "should not run" }
+    end,
+  }))
+  eq(orphan.ok, false, "a drain with no matching task is refused")
+  has(orphan.error, "no task for the pending base", "the orphan refusal names the base")
+  eq(orphan_calls, 0, "the orphan drain does not call the runner")
+  eq(state.deploy_pending(root).base, "orphan-base", "the orphan drain keeps the flag")
+  eq(state.deploy_lock(root), nil, "the orphan drain releases the lock")
+  state.clear_deploy_pending(root)
+
+  -- Coalescing: two merges during the run collapse into one follow-up.
+  local id_coalesce = "T-20261114-dp24"
+  make_task(id_coalesce)
+  write_checks(id_coalesce, true)
+  local id_follow = "T-20261114-dp25"
+  make_task(id_follow)
+  write_checks(id_follow, true)
+  state.set_deploy_pending(root, "coalesce-1")
+  local coalesce_calls = 0
+  local coalesced = deploy.drain(drain_opts({
+    confirmed = true,
+    resolve = function(pending)
+      if pending.base == "coalesce-1" then
+        return id_coalesce
+      end
+      if pending.base == "coalesce-2" or pending.base == "coalesce-3" then
+        return id_follow
+      end
+      return nil
+    end,
+    runner = function()
+      coalesce_calls = coalesce_calls + 1
+      -- Two merges land while this deploy runs; each only moves the flag on.
+      state.set_deploy_pending(root, "coalesce-2")
+      state.set_deploy_pending(root, "coalesce-3")
+      return { ok = true, text = "first deploy\n" }
+    end,
+  }))
+  eq(coalesced.ok, true, "the first drain deploys: " .. tostring(coalesced.error))
+  eq(coalesce_calls, 1, "the first drain calls the runner once")
+  eq(coalesced.drained, nil, "a superseded base is not reported as drained")
+  eq(coalesced.follow_up, true, "a merge during the run asks for a follow-up")
+  eq(coalesced.follow_up_base, "coalesce-3", "the follow-up carries the latest base")
+  eq(state.deploy_pending(root).base, "coalesce-3",
+    "two merges coalesce into the one latest base")
+  eq(state.load(root).tasks[id_coalesce].status, "deployed", "the first task is deployed")
+
+  local follow_calls = 0
+  local follow = deploy.drain(drain_opts({
+    confirmed = true,
+    resolve = function(pending)
+      return pending.base == "coalesce-3" and id_follow or nil
+    end,
+    runner = function()
+      follow_calls = follow_calls + 1
+      return { ok = true, text = "follow-up deploy\n" }
+    end,
+  }))
+  eq(follow.ok, true, "the follow-up drain deploys: " .. tostring(follow.error))
+  eq(follow_calls, 1, "exactly one follow-up deploy runs for the coalesced merges")
+  eq(follow.drained, true, "the follow-up drains the flag")
+  eq(state.load(root).tasks[id_follow].status, "deployed", "the follow-up task is deployed")
+  eq(state.deploy_pending(root), nil, "the follow-up clears the flag")
+  eq(state.deploy_lock(root), nil, "the follow-up releases the lock")
+
   -- Cleanup -------------------------------------------------------------------
   --
   -- The temp dir stays: tests/run-lua.sh validates the journal it holds. The
