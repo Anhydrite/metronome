@@ -17,6 +17,8 @@
 -- Every function returns `(value, err)` and never raises. git, state, runner
 -- and the session options are injected, so the module is pure Lua and the whole
 -- turn is testable against a throwaway repository.
+--
+-- Restated: this module never opens the PR; a clean `approved` is the pipeline's cue to move to `pr_open`.
 
 local M = {}
 
