@@ -209,6 +209,28 @@ return function()
   eq(state.deploy_lock(deploy_root), nil, "released lock is gone")
   eq(state.release_deploy(deploy_root, "deployer-a"), nil, "releasing again fails")
 
+  -- One deployer at a time: a refused acquire is inert. It must write no
+  -- journal event and leave both the holder and the pending flag untouched, or
+  -- a second deployer could silently disturb a drain that is already running.
+  local flight_root = tmp_root("deploy-single-flight")
+  state.set_deploy_pending(flight_root, "cafed00d")
+  local first, first_err = state.acquire_deploy(flight_root, "deployer-first")
+  eq(first_err, nil, "the first deployer takes the lock: " .. tostring(first_err))
+  local events_before = state.load(flight_root).events
+
+  local second, second_err = state.acquire_deploy(flight_root, "deployer-second")
+  eq(second, nil, "a concurrent deployer is refused while the lock is held")
+  has(second_err, "deploy lock held by deployer-first", "the refusal names the holder")
+  eq(state.load(flight_root).events, events_before, "a refused acquire writes no journal event")
+  eq(state.deploy_lock(flight_root).owner, "deployer-first", "the refused deployer does not take the lock")
+  eq(state.deploy_pending(flight_root).base, "cafed00d", "the refused deployer leaves the pending flag alone")
+
+  eq(state.release_deploy(flight_root, "deployer-first"), true, "the holder releases after the refusal")
+  eq(state.deploy_lock(flight_root), nil, "the lock is free again")
+  local next_lock, next_err = state.acquire_deploy(flight_root, "deployer-second")
+  eq(next_lock and next_lock.owner, "deployer-second", "the lock is free once released: " .. tostring(next_err))
+  state.release_deploy(flight_root, "deployer-second")
+
   -- A lock left by a crashed deployer can be taken over explicitly.
   state.acquire_deploy(deploy_root, "deployer-crashed")
   local stole = state.acquire_deploy(deploy_root, "deployer-next", { force = true })

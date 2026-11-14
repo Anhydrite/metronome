@@ -334,6 +334,18 @@ return function()
   eq(deploy_called, false, "merge does not invoke deploy.run")
   eq(after3 and after3.status == "merged", true, "merge stops at merged, not deploying")
 
+  -- The flag is journal-backed and the merge holds no lock: a deployer in
+  -- another process must still see the pending base after a fresh reload, and
+  -- must be free to take the single-flight lock itself.
+  local reloaded = state.load(root)
+  eq(reloaded.tasks[id3] and reloaded.tasks[id3].status, "merged",
+    "state reload still reports the task as merged")
+  eq(reloaded.deploy and reloaded.deploy.pending and reloaded.deploy.pending.base, "main",
+    "the pending base survives a journal reload")
+  eq(reloaded.deploy and reloaded.deploy.pending and type(reloaded.deploy.pending.at), "string",
+    "the pending base records when it was set")
+  eq(state.deploy_lock(root), nil, "merge never takes the deploy lock")
+
   -- The merged branch is cleaned up: worktree removed, remote and local
   -- branches gone, so no branch is left behind forever.
   eq(res3 and res3.branch_cleanup and res3.branch_cleanup.ok, true, "run reports the branch cleanup")
