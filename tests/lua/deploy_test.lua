@@ -777,6 +777,70 @@ return function()
   eq(state.load(root).tasks[id_follow].status, "deployed", "the follow-up task is deployed")
   eq(state.deploy_pending(root), nil, "the follow-up clears the flag")
   eq(state.deploy_lock(root), nil, "the follow-up releases the lock")
+  eq(coalesce_calls + follow_calls, 2,
+    "two merges during a deploy mean exactly two deploys in total")
+
+  -- Nothing is left over: a third drainer has no base and must not deploy again.
+  local extra_calls = 0
+  local third = deploy.drain(drain_opts({
+    confirmed = true,
+    resolve = function()
+      return id_follow
+    end,
+    runner = function()
+      extra_calls = extra_calls + 1
+      return { ok = true, text = "should not run" }
+    end,
+  }))
+  eq(third.no_pending, true, "the coalesced base leaves nothing pending")
+  eq(extra_calls, 0, "the second deploy is the last one: the merges never produce N deploys")
+
+  -- One deployer at a time, from the outside: a second drainer that starts while
+  -- the first is inside its runner is refused, never calls the runner, and
+  -- leaves the flag for the deployer that already holds the lock.
+  local id_nested = "T-20261114-dp30"
+  make_task(id_nested)
+  write_checks(id_nested, true)
+  state.set_deploy_pending(root, "base-nested")
+  local nested_result = nil
+  local outer_calls = 0
+  local nested_calls = 0
+  local nested = deploy.drain(drain_opts({
+    confirmed = true,
+    owner = "deployer-first",
+    resolve = function(pending)
+      return pending.base == "base-nested" and id_nested or nil
+    end,
+    runner = function()
+      outer_calls = outer_calls + 1
+      if outer_calls == 1 then
+        nested_result = deploy.drain(drain_opts({
+          confirmed = true,
+          owner = "deployer-second",
+          resolve = function(pending)
+            return pending.base == "base-nested" and id_nested or nil
+          end,
+          runner = function()
+            nested_calls = nested_calls + 1
+            return { ok = true, text = "should not run" }
+          end,
+        }))
+      end
+      return { ok = true, text = "outer deploy\n" }
+    end,
+  }))
+  eq(nested.ok, true, "the first deployer completes: " .. tostring(nested.error))
+  eq(outer_calls, 1, "the first deployer calls the runner once")
+  eq(nested_result and nested_result.ok, false, "the concurrent drainer is refused")
+  eq(nested_result and nested_result.locked, true, "the concurrent drainer reports the lock")
+  eq(nested_result and nested_result.single_flight, true,
+    "the concurrent drainer reports single-flight")
+  has(nested_result and nested_result.error, "deploy lock held by deployer-first",
+    "the concurrent refusal names the holder")
+  eq(nested_calls, 0, "the concurrent drainer never calls the runner")
+  eq(state.load(root).tasks[id_nested].status, "deployed", "the first deployer still deploys the task")
+  eq(state.deploy_pending(root), nil, "the first deployer drains the base")
+  eq(state.deploy_lock(root), nil, "the first deployer releases the lock")
 
   -- Cleanup -------------------------------------------------------------------
   --
