@@ -830,15 +830,25 @@ function M.new(deps)
     local ok, sent = pcall(maki.session.prompt, table.concat(lines, "\n"), { session = sid })
     return ok and sent ~= nil
   end
-
-  local function schedule_job(opts, paths, cfg, runner, session)    scheduler_job = {
+  local function schedule_job(opts, paths, cfg, runner, session)
+  scheduler_job = {
       opts = opts,
       paths = paths,
       cfg = cfg,
       runner = runner,
       session = session,
-    }
-    scheduler_dirty = true
+  }
+  scheduler_dirty = true
+  -- Spawn a drain task only when there is work, and let it end when the
+  -- queue is empty. A perpetual `sleep` loop keeps a coroutine suspended for
+  -- the whole life of the plugin, and maki/GC can panic on that state
+  -- ("Luau VM is suspended while GC is running"). A one-shot task per burst
+  -- of work has no idle suspended coroutine.
+  if not scheduler_running then
+      spawn(function()
+        pcall(runtime.run_pending)
+      end)
+  end
   end
 
   function runtime.has_pending()

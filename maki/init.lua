@@ -76,21 +76,11 @@ local function wire()
   if not routed then
     maki.log.warn("metronome: natural-language mode not wired: " .. tostring(route_err))
   end
-  -- The pipeline runs from a top-level spawn loop, not from a tool handler:
-  -- a role session opened inside a turn is cancelled at once. The loop polls
-  -- the runtime and drains the queue when a submit or an answer queued work.
-  -- It runs even while the chat is streaming, so a demand keeps moving while
-  -- the user talks to the agent.
-  if maki.async and type(maki.async.spawn) == "function" then
-    maki.async.spawn(function()
-      while true do
-        maki.async.sleep(1000)
-        if type(runtime.has_pending) == "function" and runtime.has_pending() then
-          pcall(runtime.run_pending)
-        end
-      end
-    end)
-  end
+  -- The pipeline is drained by a one-shot spawn task created when work is
+  -- queued (`runtime.schedule_job`), never by a perpetual sleep loop: a loop
+  -- that sleeps forever leaves a coroutine suspended for the life of the
+  -- plugin, and maki/GC can panic on that state ("Luau VM is suspended while
+  -- GC is running"), including on `maki -r`.
   maki.log.info("metronome: tools and /metronome commands registered")
 end
 
