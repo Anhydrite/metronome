@@ -1,0 +1,85 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Anhydrite/metronome/main/schemas/event.schema.json",
+  "title": "Metronome journal event",
+  "description": "One line of state.jsonl. The journal is append-only, so every event must be self-contained and replayable: replaying the whole file from the start must rebuild the same task set. A torn line is dropped on replay rather than failing the whole file.",
+  "type": "object",
+  "required": ["kind", "task_id"],
+  "additionalProperties": false,
+  "properties": {
+    "kind": {
+      "type": "string",
+      "description": "What happened. task_created carries the initial task; status moves it; field patches fields; note appends prose.",
+      "enum": ["task_created", "status", "field", "note"]
+    },
+    "task_id": {
+      "type": "string",
+      "description": "The task this event applies to.",
+      "minLength": 1
+    },
+    "at": {
+      "type": "string",
+      "description": "When the event was written, ISO 8601 UTC.",
+      "format": "date-time"
+    },
+    "task": {
+      "type": "object",
+      "description": "Present only on task_created: the full initial task.",
+      "additionalProperties": true
+    },
+    "status": {
+      "type": "string",
+      "description": "Present only on status: the status the task moved to.",
+      "enum": [
+        "draft",
+        "qualifying",
+        "awaiting_answers",
+        "ready",
+        "running",
+        "verifying",
+        "reviewing",
+        "changes_requested",
+        "pr_open",
+        "merging",
+        "merged",
+        "deploying",
+        "deployed",
+        "failed",
+        "stalled",
+        "abandoned"
+      ]
+    },
+    "phase": {
+      "type": "string",
+      "description": "Optional on status: the pipeline stage the move belongs to.",
+      "enum": ["qualify", "analyze", "implement", "verify", "converge", "review", "merge", "deploy"]
+    },
+    "fields": {
+      "type": "object",
+      "description": "Present only on field: the fields to patch onto the task."
+    },
+    "text": {
+      "type": "string",
+      "description": "Present only on note: the prose to append.",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "task_created" } }, "required": ["kind"] },
+      "then": { "required": ["task"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "status" } }, "required": ["kind"] },
+      "then": { "required": ["status"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "field" } }, "required": ["kind"] },
+      "then": { "required": ["fields"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "note" } }, "required": ["kind"] },
+      "then": { "required": ["text"] }
+    }
+  ]
+}

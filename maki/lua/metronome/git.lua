@@ -1,0 +1,646 @@
+-- Git operations for Metronome.
+--
+-- Every task works in its own worktree, cut from a freshly fetched base, so
+-- two tasks never touch the same working tree. This module is the only place
+-- that shells out to git, which keeps the command shapes in one file and makes
+-- them testable against a throwaway repository.
+--
+-- All functions return `(value, err)` and never raise: a pipeline that dies on
+-- a git error cannot report what went wrong.
+
+local M = {}
+
+local function run(args, opts)
+  opts = opts or {}
+  local job_opts = {
+    cwd = opts.cwd,
+    tail = opts.tail or 200,
+  }
+  -- jobstart raises (rather than returning nil) when there is no active task
+  -- to own the job, which happens at plugin top level. Retrying with a plugin
+  -- scope keeps the same code usable from a tool handler, where the task scope
+  -- is right, and from a test or a startup hook.
+  local ok_start, job, err = pcall(maki.fn.jobstart, args, job_opts)
+  if not ok_start then
+    err = job
+    job = nil
+  end
+  if not job and tostring(err):find("no active task", 1, true) then
+    job_opts.scope = "plugin"
+    local ok_retry, retry_job, retry_err = pcall(maki.fn.jobstart, args, job_opts)
+    if ok_retry then
+      job, err = retry_job, retry_err
+    else
+      job, err = nil, retry_job
+    end
+  end
+  if not job then
+    return nil, "cannot start git: " .. tostring(err)
+  end
+  local result, werr = maki.fn.jobwait(job, opts.timeout_ms or 60000)
+  if not result then
+    return nil, "git did not finish: " .. tostring(werr)
+  end
+  return {
+    code = result.exit_code,
+    stdout = result.stdout or "",
+    stderr = result.stderr or "",
+    command = table.concat(args, " "),
+    ok = result.exit_code == 0,
+  }
+end
+
+M.run = run
+
+-- A git failure is reported with the command, the exit code and stderr: the
+-- caller needs to know which step failed, not just that something did.
+
+local function first_line(text)
+  for line in (text or ""):gmatch("[^\n]+") do
+    local trimmed = line:gsub("%s+$", "")
+    if trimmed:match("%S") then
+      return trimmed
+    end
+  end
+  return nil
+end
+
+-- Turn a failed command into a cause a caller can branch on. The causes are
+-- the four situations a task pipeline actually hits -- a stale worktree, a
+-- stale branch, a refused push, an unreachable remote -- plus auth and a
+-- catch-all, so a failure is never just "git failed".
+function M.classify(what, result)
+  result = result or {}
+  local stderr = result.stderr or ""
+  local stdout = result.stdout or ""
+  local haystack = stderr .. "\n" .. stdout
+  local function has(needle)
+    return haystack:find(needle, 1, true) ~= nil
+  end
+
+  local cause, message, hint
+  if what == "worktree add" then
+    if has("a branch named") then
+      cause = "branch_exists"
+      message = "the task branch already exists"
+      hint = "delete the stale branch or use a fresh task id"
+    elseif has("already registered") or has("already exists") then
+      cause = "worktree_exists"
+      message = "the worktree path is already present"
+      hint = "remove it with `git worktree remove --force <path>`"
+    end
+  elseif what == "push" or what == "fetch" then
+    -- A missing remote also makes git complain that it cannot read from it, so
+    -- this check must come before the push-rejection one.
+    if has("does not appear to be a git repository")
+      or has("Could not read from remote repository")
+      or has("No such remote") then
+      cause = "remote_missing"
+      message = "the remote is not reachable"
+      hint = "check the remote name/URL with `git remote -v`"
+    elseif what == "push" and (has("non-fast-forward") or has("[rejected]") or has("failed to push some refs")) then
+      cause = "push_rejected"
+      message = "the remote rejected the push"
+      hint = "fetch and rebase the task branch, then push again"
+    elseif has("Permission denied") or has("Authentication failed") or has("could not read Username") then
+      cause = "auth_failed"
+      message = "git could not authenticate with the remote"
+      hint = "check the credentials or SSH key for this remote"
+    end
+  elseif what == "gh pr merge" then
+    -- `gh pr merge` fails in four ways the pipeline can act on: the PR was
+    -- already merged (nothing to do), it cannot be merged (conflicts or a
+    -- protected branch), its required checks are not green, or `gh` is not
+    -- authenticated. Anything else falls through to the catch-all.
+    if has("already merged") then
+      cause = "already_merged"
+      message = "the pull request is already merged"
+      hint = "nothing to do"
+    elseif has("not mergeable") or has("conflicts") or has("cannot be merged") then
+      cause = "not_mergeable"
+      message = "the pull request cannot be merged"
+      hint = "rebase the branch and resolve conflicts"
+    elseif has("required status check") or has("checks") then
+      cause = "checks_failed"
+      message = "required checks are not green"
+      hint = "wait for or fix the required checks"
+    elseif has("not logged in") or has("authentication") or has("gh auth login") or has("HTTP 401") then
+      cause = "auth_failed"
+      message = "gh is not authenticated"
+      hint = "run `gh auth login`"
+    end
+  elseif what == "gh pr create" or what == "gh pr view" then
+    -- `gh` speaks its own dialect: a duplicate PR, a missing token and an
+    -- unreachable repository are the three the pipeline can actually act on.
+    if has("already exists") then
+      cause = "pr_exists"
+      message = "a pull request already exists for this branch"
+      hint = "reuse the existing PR or push to a new branch"
+    elseif has("not logged in") or has("authentication") or has("gh auth login") or has("HTTP 401") then
+      cause = "auth_failed"
+      message = "gh is not authenticated"
+      hint = "run `gh auth login`"
+    elseif has("Could not resolve to a Repository")
+      or has("not a git repository")
+      or has("no git remotes") then
+      cause = "remote_missing"
+      message = "the GitHub repository is not reachable"
+      hint = "check the git remote and that the repository exists"
+    end
+  end
+
+  if not cause then
+    cause = "git_error"
+    message = tostring(what) .. " failed"
+    hint = "inspect the command output and retry"
+  end
+
+  return {
+    cause = cause,
+    what = what,
+    code = result.code,
+    command = result.command,
+    message = message,
+    hint = hint,
+    detail = first_line(stderr) or first_line(stdout) or "no output",
+  }
+end
+
+-- One line a human can read in a log or a panel: what failed, why, and what to
+-- do about it.
+function M.describe(diag)
+  diag = diag or {}
+  return string.format("%s failed [%s]: %s — %s (exit %s: %s)",
+    tostring(diag.what), tostring(diag.cause), tostring(diag.message),
+    tostring(diag.hint), tostring(diag.code), tostring(diag.detail))
+end
+
+local function fail(what, result)
+  local diag = M.classify(what, result)
+  return nil, M.describe(diag), diag
+end
+
+-- Record a git failure on a task: the note first, so the reason survives even
+-- if the transition itself is refused, then the move to failed.
+function M.fail_task(state, root, task_id, diag, opts)
+  opts = opts or {}
+  diag = diag or {}
+  local text = string.format("git failure [%s]: %s — %s (%s)",
+    tostring(diag.cause), tostring(diag.message), tostring(diag.hint),
+    tostring(diag.detail))
+  local note_ok, note_err = state.append(root, {
+    kind = "note",
+    task_id = task_id,
+    text = text,
+  })
+  local task, terr = state.transition(root, task_id, "failed", { phase = opts.phase })
+  if task then
+    return task
+  end
+  if not note_ok then
+    return nil, string.format("note append failed: %s; transition failed: %s",
+      tostring(note_err), tostring(terr))
+  end
+  return nil, terr
+end
+
+-- Branch and message shapes -------------------------------------------------
+
+function M.branch_name(prefix, task_id)
+  return (prefix or "metronome/") .. tostring(task_id)
+end
+
+-- Conventional commits keep the history readable and let tooling group
+-- changes. The subject is trimmed to one line; the body keeps the rest.
+function M.conventional(kind, scope, subject, body)
+  local head = tostring(subject or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+  if head == "" then
+    return nil, "commit subject is empty"
+  end
+  local line
+  if scope and scope ~= "" then
+    line = string.format("%s(%s): %s", kind, scope, head)
+  else
+    line = string.format("%s: %s", kind, head)
+  end
+  if body and body ~= "" then
+    return line .. "\n\n" .. body
+  end
+  return line
+end
+
+-- Repository checks ---------------------------------------------------------
+
+function M.is_repo(path)
+  local result, err = run({ "git", "-C", path, "rev-parse", "--is-inside-work-tree" })
+  if not result then
+    return false, err
+  end
+  if not result.ok then
+    return false, "not a git repository: " .. tostring(path)
+  end
+  return true
+end
+
+function M.current_branch(path)
+  local result, err = run({ "git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD" })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("rev-parse HEAD", result)
+  end
+  return (result.stdout:gsub("%s+$", ""))
+end
+
+-- Fetch the base so a new task starts from what the remote has now, not from
+-- whatever this checkout happened to hold.
+function M.fetch(repo, remote)
+  local result, err = run({ "git", "-C", repo, "fetch", remote or "origin", "--prune" })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("fetch", result)
+  end
+  return true
+end
+
+-- Create an isolated worktree on a new branch, cut from the freshest base.
+--
+-- `opts.existing = true` checks out a branch that already exists instead of
+-- creating it. That is how a task re-attaches its worktree after one was
+-- removed: the branch survived the worktree, so there is no `-b` and no
+-- remote prefix.
+function M.worktree_add(repo, worktree, branch, base_ref, opts)
+  opts = opts or {}
+  local args
+  local base = base_ref or "HEAD"
+  if opts.remote and opts.remote ~= "" then
+    base = opts.remote .. "/" .. base
+  end
+  if opts.detach then
+    -- No branch and no `-b`: the post-merge checks run on a throwaway checkout
+    -- of the fresh base, which must never claim a branch name.
+    args = { "git", "-C", repo, "worktree", "add", "--detach", worktree, base }
+  elseif opts.existing then
+    args = { "git", "-C", repo, "worktree", "add", worktree, branch }
+  else
+    args = { "git", "-C", repo, "worktree", "add", "-b", branch, worktree, base }
+  end
+  local result, err = run(args)
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("worktree add", result)
+  end
+  return worktree
+end
+
+function M.worktree_remove(repo, worktree, opts)
+  opts = opts or {}
+  local args = { "git", "-C", repo, "worktree", "remove" }
+  if opts.force then
+    args[#args + 1] = "--force"
+  end
+  args[#args + 1] = worktree
+  local result, err = run(args)
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("worktree remove", result)
+  end
+  return true
+end
+
+-- Delete a merged task branch locally and on the remote.
+--
+-- A branch that is already gone is not an error: the merge is the fact, the
+-- cleanup is housekeeping. The result reports each side separately so the
+-- caller can surface a real failure (auth, protected branch) without turning a
+-- successful merge into a failed task.
+function M.delete_branch(repo, branch, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(repo) ~= "string" or repo == "" then
+    return nil, "delete_branch needs a repo"
+  end
+  if type(branch) ~= "string" or branch == "" then
+    return nil, "delete_branch needs a branch"
+  end
+  local remote = type(opts.remote) == "string" and opts.remote ~= "" and opts.remote or "origin"
+  local out = { ok = true, branch = branch, remote = remote }
+
+  local rres, rerr = run({ "git", "-C", repo, "push", remote, "--delete", branch },
+    { timeout_ms = opts.timeout_ms })
+  if not rres then
+    out.remote_error = rerr
+  elseif rres.ok then
+    out.remote_deleted = true
+  else
+    local text = tostring(rres.stdout or "") .. tostring(rres.stderr or "")
+    if text:find("remote ref does not exist", 1, true) then
+      out.remote_missing = true
+    else
+      out.remote_error = first_line(rres.stderr) or first_line(rres.stdout) or "cannot delete remote branch"
+    end
+  end
+
+  local lres, lerr = run({ "git", "-C", repo, "branch", "-D", branch },
+    { timeout_ms = opts.timeout_ms })
+  if not lres then
+    out.local_error = lerr
+  elseif lres.ok then
+    out.local_deleted = true
+  else
+    local text = tostring(lres.stdout or "") .. tostring(lres.stderr or "")
+    if text:find("not found", 1, true) then
+      out.local_missing = true
+    else
+      out.local_error = first_line(lres.stderr) or first_line(lres.stdout) or "cannot delete local branch"
+    end
+  end
+
+  return out
+end
+
+function M.worktree_list(repo)
+  local result, err = run({ "git", "-C", repo, "worktree", "list", "--porcelain" })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("worktree list", result)
+  end
+  local paths = {}
+  for line in result.stdout:gmatch("[^\n]+") do
+    local path = line:match("^worktree%s+(.+)$")
+    if path then
+      paths[#paths + 1] = path
+    end
+  end
+  return paths
+end
+
+-- Commit everything staged in the worktree.
+function M.commit(worktree, message)
+  if type(message) ~= "string" or message:match("^%s*$") then
+    return nil, "commit message is empty"
+  end
+  local added, aerr = run({ "git", "-C", worktree, "add", "-A" })
+  if not added then
+    return nil, aerr
+  end
+  if not added.ok then
+    return fail("git add", added)
+  end
+  local committed, cerr = run({ "git", "-C", worktree, "commit", "-m", message })
+  if not committed then
+    return nil, cerr
+  end
+  if not committed.ok then
+    -- An empty commit is a normal outcome for a no-op task, not a crash.
+    if committed.stdout:find("nothing to commit", 1, true) or committed.stderr:find("nothing to commit", 1, true) then
+      return nil, "nothing to commit"
+    end
+    return fail("git commit", committed)
+  end
+  return M.head_sha(worktree)
+end
+
+function M.head_sha(worktree)
+  local result, err = run({ "git", "-C", worktree, "rev-parse", "HEAD" })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("rev-parse HEAD", result)
+  end
+  return (result.stdout:gsub("%s+$", ""))
+end
+
+-- Send the worktree back to a recorded commit. A red check must restore both
+-- the commit and the files: moving HEAD alone would leave the failed turn's
+-- edits in place, which is exactly what the next turn must not inherit.
+function M.reset_hard(worktree, sha)
+  if type(sha) ~= "string" or not sha:match("^[0-9a-f]+$") or #sha < 7 or #sha > 40 then
+    return nil, "reset needs a commit sha"
+  end
+  local result, err = run({ "git", "-C", worktree, "reset", "--hard", sha })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("reset --hard", result)
+  end
+  return M.head_sha(worktree)
+end
+
+-- Rebase the task branch onto the freshest base. A conflict is not a crash:
+-- the unmerged files are named, the rebase is aborted so the worktree is left
+-- clean, and the caller gets a message it can act on. The branch head is
+-- untouched by a failed rebase, so a retry starts from the same commit.
+function M.rebase(worktree, upstream)
+  if type(worktree) ~= "string" or worktree == "" then
+    return nil, "rebase needs a worktree"
+  end
+  if type(upstream) ~= "string" or upstream == "" then
+    return nil, "rebase needs an upstream"
+  end
+  local result, err = run({ "git", "-C", worktree, "rebase", upstream })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    local conflicts = {}
+    local unmerged = run({ "git", "-C", worktree, "diff", "--name-only", "--diff-filter=U" })
+    if unmerged and unmerged.ok then
+      for line in unmerged.stdout:gmatch("[^\n]+") do
+        if line ~= "" then
+          conflicts[#conflicts + 1] = line
+        end
+      end
+    end
+    run({ "git", "-C", worktree, "rebase", "--abort" })
+    local files = #conflicts > 0 and table.concat(conflicts, ", ") or "unknown"
+    return nil, string.format("rebase failed (conflicts: %s): %s",
+      files, first_line(result.stderr) or "no output")
+  end
+  return M.head_sha(worktree)
+end
+
+function M.push(worktree, branch, opts)
+  opts = opts or {}
+  local args = { "git", "-C", worktree, "push", "-u", opts.remote or "origin", branch }
+  if opts.force then
+    args[#args + 1] = "--force-with-lease"
+  end
+  local result, err = run(args)
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("push", result)
+  end
+  return true
+end
+
+-- Files a branch would change against its base, so the scheduler can refuse
+-- overlapping work before it starts.
+--
+-- `opts.three_dot = true` asks for `<base>...HEAD`: the merge base compared to
+-- the branch head. That is the range convergence needs, because it ignores
+-- commits made on the base after the branch was cut.
+function M.changed_files(worktree, base_ref, opts)
+  opts = type(opts) == "table" and opts or {}
+  local range = base_ref or "HEAD"
+  if opts.three_dot then
+    range = range .. "...HEAD"
+  end
+  local result, err = run({
+    "git", "-C", worktree, "diff", "--name-only", range,
+  })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("diff --name-only", result)
+  end
+  local files = {}
+  for line in result.stdout:gmatch("[^\n]+") do
+    if line ~= "" then
+      files[#files + 1] = line
+    end
+  end
+  return files
+end
+
+-- Pull requests -------------------------------------------------------------
+--
+-- The PR is opened with `gh`, in the task worktree, and only the three fields
+-- the schema knows about are kept: a task stores `{ number, url, state }`, not
+-- the whole `gh` payload.
+
+local PR_STATES = { open = true, closed = true, merged = true }
+
+-- `gh` answers in its own vocabulary (OPEN/CLOSED/MERGED, sometimes a numeric
+-- string), so every PR goes through here before it reaches the state store:
+-- what lands on a task always satisfies schemas/task.schema.json.
+function M.normalize_pr(raw)
+  if type(raw) ~= "table" then
+    return nil, "pull request must be a table, got " .. type(raw)
+  end
+  local number = tonumber(raw.number)
+  if not number or number < 1 or math.floor(number) ~= number then
+    return nil, "pull request number must be an integer >= 1, got " .. tostring(raw.number)
+  end
+  local url = raw.url
+  if type(url) ~= "string" or not url:match("^https?://") then
+    return nil, "pull request url must start with http:// or https://, got " .. tostring(url)
+  end
+  local state = tostring(raw.state or "open"):lower()
+  if not PR_STATES[state] then
+    return nil, "pull request state must be open, closed or merged, got " .. tostring(raw.state)
+  end
+  return { number = number, url = url, state = state }
+end
+
+-- Read a PR back from GitHub. `ref` is a number, a branch or a URL -- `gh`
+-- accepts all three, and pr_create uses the URL it just printed.
+function M.pr_view(ref, opts)
+  opts = opts or {}
+  local result, err = run(
+    { opts.gh or "gh", "pr", "view", tostring(ref), "--json", "number,url,state" },
+    { cwd = opts.worktree, timeout_ms = opts.timeout_ms }
+  )
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("gh pr view", result)
+  end
+  local decoded_ok, decoded = pcall(maki.json.decode, result.stdout)
+  if not decoded_ok or type(decoded) ~= "table" then
+    return nil, "gh pr view returned invalid JSON: " .. result.stdout:sub(1, 200)
+  end
+  return M.normalize_pr(decoded)
+end
+
+-- Open a PR for the task branch, then read it back so the caller gets
+-- number/url/state rather than the URL `gh` happens to print.
+function M.pr_create(opts)
+  opts = opts or {}
+  local title = tostring(opts.title or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  -- Nothing is run for an empty title: `gh` would open a PR with a blank name,
+  -- which is worse than a refusal.
+  if title == "" then
+    return nil, "PR title is empty"
+  end
+
+  local args = { opts.gh or "gh", "pr", "create" }
+  local base = opts.base or ""
+  local head = opts.head or ""
+  if base ~= "" then
+    args[#args + 1] = "--base"
+    args[#args + 1] = base
+  end
+  if head ~= "" then
+    args[#args + 1] = "--head"
+    args[#args + 1] = head
+  end
+  args[#args + 1] = "--title"
+  args[#args + 1] = title
+  args[#args + 1] = "--body"
+  args[#args + 1] = opts.body or ""
+  if opts.draft then
+    args[#args + 1] = "--draft"
+  end
+
+  local result, err = run(args, { cwd = opts.worktree, timeout_ms = opts.timeout_ms })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("gh pr create", result)
+  end
+
+  local url = result.stdout:match("https?://[%w%._%-/~:%?#%[%]@!$&'()*+,;=]+")
+  if not url then
+    return nil, "gh pr create printed no pull request URL: " .. (first_line(result.stdout) or "no output")
+  end
+  return M.pr_view(url, opts)
+end
+
+-- Store the PR on the task. Normalising here too means a caller cannot write a
+-- PR that the schema would later reject.
+function M.pr_attach(state, root, task_id, pr)
+  local normalized, err = M.normalize_pr(pr)
+  if not normalized then
+    return nil, err
+  end
+  return state.set_fields(root, task_id, { pr = normalized })
+end
+
+-- The whole step: open the PR, record it on the task, then move the task.
+--
+-- The PR is stored before the move so a refused transition still leaves the
+-- work visible: the caller can retry the move without opening a second PR.
+function M.pr_open(state, root, task_id, opts)
+  opts = opts or {}
+  local pr, err = M.pr_create(opts)
+  if not pr then
+    return nil, err
+  end
+  local task, aerr = M.pr_attach(state, root, task_id, pr)
+  if not task then
+    return nil, aerr
+  end
+  local moved, terr = state.transition(root, task_id, "pr_open", { phase = opts.phase or "review" })
+  if not moved then
+    return nil, terr
+  end
+  return pr
+end
+
+return M

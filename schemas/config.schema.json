@@ -1,0 +1,154 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Anhydrite/metronome/main/schemas/config.schema.json",
+  "title": "Metronome project configuration",
+  "description": "The config.toml a project gets when /metronome init binds it. Validated before any pipeline run, so a typo or an unknown model fails at load time with a message that names the role.",
+  "type": "object",
+  "required": ["project", "roles"],
+  "additionalProperties": false,
+  "properties": {
+    "project": {
+      "type": "object",
+      "required": ["repo", "base_ref"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": {
+          "type": "string",
+          "description": "Absolute path to the git repository Metronome drives.",
+          "pattern": "^/"
+        },
+        "base_ref": {
+          "type": "string",
+          "description": "Branch every task starts from.",
+          "minLength": 1
+        },
+        "max_parallel": {
+          "type": "integer",
+          "description": "How many tasks may run at once.",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 2
+        }
+      }
+    },
+    "git": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branch_prefix": { "type": "string", "default": "metronome/" },
+        "commit_style": {
+          "type": "string",
+          "enum": ["conventional", "plain"],
+          "default": "conventional"
+        },
+        "pr_draft": { "type": "boolean", "default": false }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "description": "One entry per role the pipeline runs. Every role is required: a missing one stops the pipeline at load time rather than mid-run.",
+      "required": ["qualifier", "analyst", "implementer", "reviewer", "deployer"],
+      "additionalProperties": false,
+      "properties": {
+        "qualifier": { "$ref": "#/definitions/role" },
+        "analyst": { "$ref": "#/definitions/role" },
+        "implementer": { "$ref": "#/definitions/role" },
+        "reviewer": { "$ref": "#/definitions/role" },
+        "deployer": { "$ref": "#/definitions/role" }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "type": "array",
+          "description": "Commands that prove a task is done. A task's own checks override this.",
+          "items": { "type": "string", "minLength": 1 },
+          "default": []
+        },
+        "re_run_after_merge": { "type": "boolean", "default": true },
+        "timeout_secs": { "type": "integer", "minimum": 1, "default": 600 }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_rounds": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
+        "require_checks_green": { "type": "boolean", "default": true },
+        "protected_paths": {
+          "type": "array",
+          "description": "A diff touching any of these is a blocking finding: an agent must not rewrite its own rules.",
+          "items": { "type": "string", "minLength": 1 },
+          "default": ["review-rules.md", "AGENTS.md", ".metronome/", "deploy.md"]
+        }
+      }
+    },
+    "merge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_merge": { "type": "boolean", "default": false },
+        "method": { "type": "string", "enum": ["squash", "merge", "rebase"], "default": "squash" },
+        "auto_rebase": { "type": "boolean", "default": true }
+      }
+    },
+    "deploy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "auto_deploy": { "type": "boolean", "default": false },
+        "confirm": { "type": "boolean", "default": true },
+        "plan_file": { "type": "string", "default": "deploy.md" }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "variants": {
+          "type": "integer",
+          "description": "Best-of-N: run the task N times and keep the best diff.",
+          "minimum": 1,
+          "maximum": 3,
+          "default": 1
+        },
+        "stall_minutes": { "type": "integer", "minimum": 1, "default": 20 }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_task_cost_usd": { "type": "number", "minimum": 0, "default": 5.0 },
+        "timeout_minutes": { "type": "integer", "minimum": 1, "default": 30 },
+        "max_questions_per_round": { "type": "integer", "minimum": 1, "maximum": 50, "default": 15 }
+      }
+    }
+  },
+  "definitions": {
+    "role": {
+      "type": "object",
+      "required": ["model", "thinking"],
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model spec in provider/id form, as maki.model.available() lists them.",
+          "pattern": "^[a-z0-9_-]+/[a-z0-9_.-]+$"
+        },
+        "thinking": {
+          "type": "string",
+          "description": "Thinking level. A subagent is capped by its parent's level, so the Metronome agent must run at least this high.",
+          "enum": ["off", "adaptive", "minimal", "low", "medium", "high", "xhigh", "max"]
+        },
+        "tools": {
+          "type": "array",
+          "description": "Tool whitelist for the role. Omit for the audience default.",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

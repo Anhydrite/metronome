@@ -1,0 +1,7 @@
+[permissions]
+fs_read = true
+fs_write = true
+# The git tests run real git commands against a throwaway repo.
+run = true
+# The E2E driver reads its paths from the environment.
+env = true

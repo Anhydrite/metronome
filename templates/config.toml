@@ -1,0 +1,74 @@
+# Metronome project configuration.
+# Copied into the project state on /metronome init, then editable in place.
+# Validated by schemas/config.schema.json before any run.
+
+[project]
+repo = "/absolute/path/to/your/repo"
+base_ref = "master"
+max_parallel = 2
+
+[git]
+branch_prefix = "metronome/"
+commit_style = "conventional"
+pr_draft = false
+
+# One entry per role. Every role is required: a missing one stops the pipeline
+# at load time rather than mid-run. `thinking` is capped by the Metronome
+# agent's own level, so Metronome must run at least as high as the highest
+# role here.
+# chef de pupitre — turns an intention into task sheets.
+[roles.qualifier]
+model = "ocgo/deepseek-v4.1-flash"
+thinking = "high"
+
+# harmoniste — checks the sheets against each other before any code.
+[roles.analyst]
+model = "ocgo/deepseek-v4.1-flash"
+thinking = "medium"
+
+# instrumentiste — makes the change on the task branch.
+[roles.implementer]
+model = "opencode-go/kimi-k3"
+thinking = "max"
+
+# critique — reviews one exact commit.
+[roles.reviewer]
+model = "ocgo/deepseek-v4-pro"
+thinking = "high"
+
+# timbalier — runs the deployment plan.
+[roles.deployer]
+model = "ocgo/deepseek-v4.1-flash"
+thinking = "medium"
+
+[checks]
+# Commands that prove a task is done. A task's own checks override this.
+default = ["npm test"]
+re_run_after_merge = true
+timeout_secs = 600
+
+[review]
+max_rounds = 3
+require_checks_green = true
+# A diff touching any of these is a blocking finding: an agent must not be
+# able to rewrite its own rules.
+protected_paths = ["review-rules.md", "AGENTS.md", ".metronome/", "deploy.md"]
+
+[merge]
+auto_merge = false
+method = "squash"
+auto_rebase = true
+
+[deploy]
+auto_deploy = false
+confirm = true
+plan_file = "deploy.md"
+
+[quality]
+variants = 1
+stall_minutes = 20
+
+[limits]
+max_task_cost_usd = 5.0
+timeout_minutes = 30
+max_questions_per_round = 15
