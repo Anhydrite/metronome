@@ -701,12 +701,37 @@ function M.new(deps)
   -- second submit while the loop runs only marks it dirty; the loop picks the
   -- new tasks up before it exits, so max_parallel and file overlap stay under
   -- the scheduler's control.
+  --
+  -- A role session opened while the chat is streaming is cancelled at once, so
+  -- a tool-triggered job waits for TurnEnd; a slash command has no turn and
+  -- starts it directly.
   local scheduler_running = false
   local scheduler_dirty = false
   local scheduler_job = nil
+  local scheduler_extra = {}
+
+  -- The tool handler's ctx is a LuaCtx userdata: its session id is a method,
+  -- not a field. Reading it as a field made every tool-triggered job look like
+  -- a slash command and start inside the turn, where the role session is
+  -- cancelled at once.
+  local function ctx_session_id(ctx)
+    if ctx == nil then
+      return nil
+    end
+    local ok, sid = pcall(function()
+      if type(ctx.session_id) == "function" then
+        return ctx:session_id()
+      end
+      return ctx.session_id
+    end)
+    if ok and type(sid) == "string" and sid ~= "" then
+      return sid
+    end
+    return nil
+  end
 
   local function background_ctx(ctx)
-    local sid = type(ctx) == "table" and ctx.session_id or nil
+    local sid = ctx_session_id(ctx)
     if not sid and maki.session and type(maki.session.current) == "function" then
       local ok, current = pcall(maki.session.current)
       if ok then
@@ -736,17 +761,21 @@ function M.new(deps)
     local job = scheduler_job
     local real_spawn = deps.spawn == nil
     spawn_background(function()
-      -- Let the ending turn finish before opening a role session: a session
-      -- opened inside the TurnEnd callback is still tied to that turn and is
-      -- cancelled at once.
+      -- Let the ending turn finish before opening a role session.
       if real_spawn and maki.async and type(maki.async.sleep) == "function" then
         pcall(maki.async.sleep, 500)
       end
       local ok, err = pcall(function()
-        while scheduler_dirty do
-          scheduler_dirty = false
-          runtime.last_background = after_questions(
-            job.opts, job.paths, job.cfg, job.runner, job.session)
+        while #scheduler_extra > 0 or scheduler_dirty do
+          while #scheduler_extra > 0 do
+            local fn = table.remove(scheduler_extra, 1)
+            fn()
+          end
+          if scheduler_dirty then
+            scheduler_dirty = false
+            runtime.last_background = after_questions(
+              job.opts, job.paths, job.cfg, job.runner, job.session)
+          end
         end
       end)
       scheduler_running = false
@@ -756,11 +785,7 @@ function M.new(deps)
     end)
   end
 
-  -- A tool handler runs inside the chat turn, and a background session opened
-  -- while the chat is streaming is cancelled at once. So a tool-triggered
-  -- submit only records the job; the TurnEnd autocmd starts it once the chat
-  -- is idle. A slash command has no turn, so it starts it directly.
-  local function ensure_scheduler(opts, paths, cfg, runner, session)
+  local function schedule_job(opts, paths, cfg, runner, session)
     scheduler_job = {
       opts = opts,
       paths = paths,
@@ -771,7 +796,7 @@ function M.new(deps)
     scheduler_dirty = true
     local wait = deps.wait_turn_end
     if wait == nil then
-      wait = maki.api and type(maki.api.create_autocmd) == "function"
+      wait = opts.from_tool and maki.api and type(maki.api.create_autocmd) == "function"
     end
     if wait then
       return
@@ -850,7 +875,10 @@ function M.new(deps)
       -- returns; only a real run goes to the background.
       return after_questions(opts, paths, cfg, runner, session)
     end
-    ensure_scheduler({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
+    schedule_job({
+      ctx = background_ctx(opts.ctx),
+      from_tool = ctx_session_id(opts.ctx) ~= nil,
+    }, paths, cfg, runner, session)
     return { ok = true, background = true, tasks = applied.tasks }
   end
 
@@ -957,7 +985,10 @@ function M.new(deps)
     if not runner then
       return { ok = false, error = perr, applied = applied }
     end
-    ensure_scheduler({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
+    schedule_job({
+      ctx = background_ctx(opts.ctx),
+      from_tool = ctx_session_id(opts.ctx) ~= nil,
+    }, paths, cfg, runner, session)
     return { ok = true, background = true, applied = applied }
   end
 
@@ -988,8 +1019,11 @@ function M.new(deps)
     if not runner then
       return { ok = false, error = perr, task = moved }
     end
-    local bg = { ctx = background_ctx(opts.ctx) }
-    spawn_background(function()
+    local bg = {
+      ctx = background_ctx(opts.ctx),
+      from_tool = ctx_session_id(opts.ctx) ~= nil,
+    }
+    scheduler_extra[#scheduler_extra + 1] = function()
       local ok, result = pcall(run_task, bg, input.id, paths, cfg, runner, session)
       if not ok then
         log(paths, "retry error: " .. tostring(result))
@@ -1004,7 +1038,8 @@ function M.new(deps)
         })
       end
       runtime.last_background = result
-    end)
+    end
+    schedule_job(bg, paths, cfg, runner, session)
     return { ok = true, background = true, task = moved }
   end
 
