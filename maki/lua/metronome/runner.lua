@@ -124,6 +124,9 @@ function M.run(opts)
       thinking = opts.thinking,
       system = opts.system,
       tools = resolve_tools(opts.ctx, opts.tools),
+      -- A background run opens its sessions by chat id; `session` keeps them
+      -- alive across the tool call that spawned the scheduler.
+      scope = "session",
     })
 
     if not session then
