@@ -563,6 +563,13 @@ function M.new(deps)
       return { ok = false, error = "cannot open the pull request" }
     end
 
+    -- `auto_merge` is the project's switch. Off means the task stops at
+    -- `pr_open` with a PR a human can review and merge; on means the merger
+    -- takes it the rest of the way (and redeploys when `auto_deploy` is set).
+    if not (cfg.merge and cfg.merge.auto_merge) then
+      return { ok = true, task_id = task_id, sha = impl.sha, pr = pr, pr_open = true }
+    end
+
     local merged = deps.merge.run({
       task = task_id,
       worktree = worktree,

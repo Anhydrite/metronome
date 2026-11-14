@@ -299,6 +299,8 @@ return function()
 
   -- Auto-deploy: the merger redeploys right after a green merge -------------
   local deploy_called = false
+  local merge_called = false
+  local auto_merge_flag = true
   local tick_count = 0
   local deps5 = {
     config = {
@@ -306,7 +308,7 @@ return function()
         return {
           project = { repo = "/tmp/repo", base_ref = "main" },
           checks = { default = { "true" }, timeout_secs = 10 },
-          merge = { method = "squash" },
+          merge = { method = "squash", auto_merge = auto_merge_flag },
           deploy = { auto_deploy = true, plan_file = "deploy.md" },
         }
       end,
@@ -341,7 +343,12 @@ return function()
     converge = { run = function() return { ok = true } end },
     review = { review = function() return { ok = true, approved = true } end },
     git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
-    merge = { run = function() return { ok = true } end },
+    merge = {
+      run = function()
+        merge_called = true
+        return { ok = true }
+      end,
+    },
     deploy = {
       run = function()
         deploy_called = true
@@ -395,4 +402,15 @@ return function()
   rt5.submit({ intention = "x" }, { session = "S1" })
   rt5.run_pending()
   eq(deploy_called, true, "auto_deploy redeploys right after the merge")
+
+  -- auto_merge off: the task stops at pr_open and nothing merges or deploys --
+  auto_merge_flag = false
+  deploy_called = false
+  merge_called = false
+  tick_count = 0
+  local rt6 = runtime.new(deps5)
+  rt6.submit({ intention = "x" }, { session = "S1" })
+  rt6.run_pending()
+  eq(merge_called, false, "auto_merge off does not merge the pull request")
+  eq(deploy_called, false, "auto_merge off does not deploy")
 end
