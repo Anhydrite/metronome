@@ -109,9 +109,23 @@ function M.parse_line(line)
   return event
 end
 
--- Replay a journal into { tasks = { [id] = task }, events = n }.
+-- A fresh projection. `deploy` is the non-task-scoped part of the state: the
+-- base waiting to be deployed and the single-flight lock that says which
+-- deployer is currently draining it.
+local function new_state()
+  return { tasks = {}, events = 0, deploy = { pending = nil, lock = nil } }
+end
+
+-- Replay a journal into
+--   { tasks = { [id] = task }, events = n,
+--     deploy = { pending = { base, at } | nil, lock = { owner, at } | nil } }.
+--
+-- Deploy events carry no task_id: they are about the store, not a task, so
+-- they are handled before the task branch. That is also why a projection that
+-- predates this feature must be normalised (see M.load) rather than trusted
+-- to already have `deploy`.
 function M.replay(text)
-  local state = { tasks = {}, events = 0 }
+  local state = new_state()
   if not text then
     return state
   end
@@ -119,9 +133,18 @@ function M.replay(text)
     local event = M.parse_line(line)
     if event then
       state.events = state.events + 1
+      local kind = event.kind
       local id = event.task_id
-      if id then
-        if event.kind == "task_created" then
+      if kind == "deploy_pending" then
+        state.deploy.pending = { base = event.base, at = event.at }
+      elseif kind == "deploy_pending_cleared" then
+        state.deploy.pending = nil
+      elseif kind == "deploy_lock_acquired" then
+        state.deploy.lock = { owner = event.owner, at = event.at }
+      elseif kind == "deploy_lock_released" then
+        state.deploy.lock = nil
+      elseif id then
+        if kind == "task_created" then
           state.tasks[id] = event.task or { id = id }
           state.tasks[id].id = id
         elseif event.kind == "task_deleted" then
@@ -192,6 +215,29 @@ end
 -- that is behind — and serving it would silently lose the last event. The
 -- projection therefore carries the event count it was built from, and is only
 -- trusted when that count matches the journal.
+
+-- Fill in the shape a caller may rely on. A projection written before the
+-- deploy flag existed has no `deploy` key at all; serving it raw would make
+-- `state.deploy.pending` raise for every reader.
+local function normalize(state)
+  if type(state.tasks) ~= "table" then
+    state.tasks = {}
+  end
+  if type(state.events) ~= "number" then
+    state.events = 0
+  end
+  if type(state.deploy) ~= "table" then
+    state.deploy = {}
+  end
+  if type(state.deploy.pending) ~= "table" then
+    state.deploy.pending = nil
+  end
+  if type(state.deploy.lock) ~= "table" then
+    state.deploy.lock = nil
+  end
+  return state
+end
+
 function M.load(root)
   local p = M.paths(root)
   local journal = fs.read(p.journal)
@@ -203,13 +249,119 @@ function M.load(root)
     if ok and type(state) == "table" then
       -- No journal at all means the projection is all there is.
       if not replayed or state.events == replayed.events then
-        return state
+        return normalize(state)
       end
     end
   end
 
-  return replayed or { tasks = {}, events = 0 }
+  return normalize(replayed or new_state())
 end
+
+-- Deploy state ---------------------------------------------------------------
+--
+-- The deploy marker is deliberately not a task field. A merge records the base
+-- it just produced; the deployer, which may run in a different process, drains
+-- whatever is pending. Both facts are journal events, so they replay like any
+-- other, and a crash between appending and projecting loses nothing.
+--
+-- ``single-flight'' is the lock: one deployer at a time. The lock is advisory
+-- in the same way the append lock is (maki has no flock), but because acquires
+-- and releases are journal events, every process that replays sees the same
+-- holder. `force` covers the one case the journal cannot model: a deployer
+-- that died while still holding the lock.
+
+local function deploy_of(state)
+  return state.deploy or {}
+end
+
+-- The pending deploy, or nil. Read-only; safe without the lock.
+function M.deploy_pending(root)
+  return deploy_of(M.load(root)).pending
+end
+
+-- The current lock holder, or nil. Read-only; safe without the lock.
+function M.deploy_lock(root)
+  return deploy_of(M.load(root)).lock
+end
+
+-- Record `base` as the commit waiting to be deployed. A later merge simply
+-- overwrites it: there is exactly one thing to deploy.
+function M.set_deploy_pending(root, base)
+  if type(base) ~= "string" or base == "" then
+    return nil, "deploy pending needs a base"
+  end
+  local state, err = M.append(root, { kind = "deploy_pending", base = base })
+  if not state then
+    return nil, err
+  end
+  return deploy_of(state).pending
+end
+
+-- Drop the pending marker once a deployer has drained it. Refusing when there
+-- is nothing pending makes a double-drain visible instead of silent.
+function M.clear_deploy_pending(root)
+  local current = deploy_of(M.load(root)).pending
+  if not current then
+    return nil, "no deploy pending"
+  end
+  local state, err = M.append(root, { kind = "deploy_pending_cleared" })
+  if not state then
+    return nil, err
+  end
+  return true
+end
+
+-- Take the single-flight lock for `owner`.
+--
+-- Re-acquiring as the same owner is a no-op: that deployer already owns the
+-- right to run. Another owner is refused; `opts.force` takes over a lock left
+-- behind by a crashed deployer.
+function M.acquire_deploy(root, owner, opts)
+  if type(owner) ~= "string" or owner == "" then
+    return nil, "deploy lock needs an owner"
+  end
+  local held = deploy_of(M.load(root)).lock
+  if held and held.owner ~= owner then
+    if not (opts and opts.force) then
+      return nil, string.format(
+        "deploy lock held by %s since %s", tostring(held.owner), tostring(held.at)
+      )
+    end
+  elseif held and held.owner == owner then
+    return held
+  end
+  local state, err = M.append(root, { kind = "deploy_lock_acquired", owner = owner })
+  if not state then
+    return nil, err
+  end
+  return deploy_of(state).lock
+end
+
+-- Release the single-flight lock. Only the holder may release it unless
+-- `opts.force` is set, which is how a stale lock is cleared.
+function M.release_deploy(root, owner, opts)
+  local held = deploy_of(M.load(root)).lock
+  if not held then
+    return nil, "no deploy lock held"
+  end
+  if held.owner ~= owner and not (opts and opts.force) then
+    return nil, string.format(
+      "deploy lock held by %s since %s", tostring(held.owner), tostring(held.at)
+    )
+  end
+  local state, err = M.append(root, {
+    kind = "deploy_lock_released",
+    owner = held.owner,
+  })
+  if not state then
+    return nil, err
+  end
+  return true
+end
+
+-- Spell the single-flight pair out for callers that prefer the longer names.
+M.acquire_deploy_lock = M.acquire_deploy
+M.release_deploy_lock = M.release_deploy
 
 -- Task operations -----------------------------------------------------------
 

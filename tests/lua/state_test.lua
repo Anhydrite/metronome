@@ -167,6 +167,81 @@ return function()
   eq(after_torn.events, 3, "torn tail does not add an event")
   eq(after_torn.tasks["T-20261114-a3f2"].status, "ready", "torn tail does not lose state")
 
+  -- Deploy pending flag and single-flight lock -------------------------------
+
+  local deploy_root = tmp_root("deploy-pending")
+
+  local bad_base, bad_base_err = state.set_deploy_pending(deploy_root, "")
+  eq(bad_base, nil, "deploy pending without a base is refused")
+  eq(bad_base_err ~= nil, true, "empty base explains itself")
+
+  local pending, perr = state.set_deploy_pending(deploy_root, "cafebabe")
+  eq(perr, nil, "set_deploy_pending has no error")
+  eq(pending and pending.base, "cafebabe", "pending records the base")
+  eq(state.deploy_pending(deploy_root).base, "cafebabe", "pending is readable")
+
+  -- The flag is journal-backed: losing the projection must not lose it.
+  maki.fs.rm(state.paths(deploy_root).projection)
+  eq(state.deploy_pending(deploy_root).base, "cafebabe", "pending replays without the projection")
+
+  -- A second merge overwrites the base: there is only one thing to deploy.
+  state.set_deploy_pending(deploy_root, "deadbeef")
+  eq(state.deploy_pending(deploy_root).base, "deadbeef", "a newer base overwrites the pending one")
+
+  -- Single-flight: one deployer at a time.
+  local l1, l1err = state.acquire_deploy(deploy_root, "deployer-a")
+  eq(l1err, nil, "first acquire succeeds")
+  eq(l1 and l1.owner, "deployer-a", "lock names its owner")
+  eq(state.deploy_lock(deploy_root).owner, "deployer-a", "lock is readable")
+
+  local l2, l2err = state.acquire_deploy(deploy_root, "deployer-b")
+  eq(l2, nil, "a second deployer is refused")
+  eq(l2err and l2err:find("deployer-a", 1, true) ~= nil, true, "refusal names the holder")
+
+  local reentrant = state.acquire_deploy(deploy_root, "deployer-a")
+  eq(reentrant and reentrant.owner, "deployer-a", "the holder may re-acquire")
+
+  local wrong_release = state.release_deploy(deploy_root, "deployer-b")
+  eq(wrong_release, nil, "a non-holder cannot release")
+  eq(state.deploy_lock(deploy_root).owner, "deployer-a", "failed release leaves the lock intact")
+
+  eq(state.release_deploy(deploy_root, "deployer-a"), true, "the holder releases")
+  eq(state.deploy_lock(deploy_root), nil, "released lock is gone")
+  eq(state.release_deploy(deploy_root, "deployer-a"), nil, "releasing again fails")
+
+  -- A lock left by a crashed deployer can be taken over explicitly.
+  state.acquire_deploy(deploy_root, "deployer-crashed")
+  local stole = state.acquire_deploy(deploy_root, "deployer-next", { force = true })
+  eq(stole and stole.owner, "deployer-next", "force takes over a stale lock")
+  state.release_deploy(deploy_root, "deployer-next")
+
+  eq(state.clear_deploy_pending(deploy_root), true, "clear_deploy_pending drops the marker")
+  eq(state.deploy_pending(deploy_root), nil, "cleared pending is nil")
+  eq(state.clear_deploy_pending(deploy_root), nil, "clearing twice fails")
+
+  -- Crash/torn-write replay: the marker and the lock are rebuilt from the
+  -- journal alone, with a half-written tail dropped.
+  local deploy_crash = tmp_root("deploy-crash")
+  local deploy_crash_paths = state.paths(deploy_crash)
+  maki.fs.mkdir(deploy_crash, { parents = true })
+  maki.fs.write(deploy_crash_paths.journal, table.concat({
+    '{"kind":"deploy_pending","base":"0badf00d","at":"2026-11-14T10:00:00Z"}',
+    '{"kind":"deploy_lock_acquired","owner":"deployer-a","at":"2026-11-14T10:01:00Z"}',
+  }, "\n") .. "\n")
+  maki.fs.append(deploy_crash_paths.journal, '{"kind":"deploy_pending_cleared"')
+
+  local deploy_recovered = state.load(deploy_crash)
+  eq(deploy_recovered.deploy.pending and deploy_recovered.deploy.pending.base, "0badf00d", "pending survives a torn write")
+  eq(deploy_recovered.deploy.lock and deploy_recovered.deploy.lock.owner, "deployer-a", "lock survives a torn write")
+  eq(deploy_recovered.events, 2, "torn deploy tail is not counted")
+
+  -- Round trip through the real append path, on the root the schema check
+  -- validates: the deploy events must be legal journal events too.
+  state.set_deploy_pending(root, "feedface")
+  state.acquire_deploy(root, "deployer-roundtrip")
+  state.release_deploy(root, "deployer-roundtrip")
+  eq(state.deploy_pending(root).base, "feedface", "roundtrip root has a pending base")
+
   -- An empty root is not an error.
   local empty_root = tmp_root("empty")
   local empty = state.load(empty_root)
