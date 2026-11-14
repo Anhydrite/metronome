@@ -76,16 +76,18 @@ local function wire()
   if not routed then
     maki.log.warn("metronome: natural-language mode not wired: " .. tostring(route_err))
   end
-  -- A tool-triggered submit records the scheduler job but cannot open role
-  -- sessions while the chat is streaming. Start it when the turn ends.
-  if maki.api and type(maki.api.create_autocmd) == "function" then
-    pcall(maki.api.create_autocmd, "TurnEnd", {
-      callback = function()
-        if type(runtime.start_pending) == "function" then
-          pcall(runtime.start_pending)
+  -- The pipeline runs from a top-level spawn loop, not from a tool handler:
+  -- a role session opened inside a turn is cancelled at once. The loop polls
+  -- the runtime and drains the queue when a submit or an answer queued work.
+  if maki.async and type(maki.async.spawn) == "function" then
+    maki.async.spawn(function()
+      while true do
+        maki.async.sleep(1000)
+        if type(runtime.has_pending) == "function" and runtime.has_pending() then
+          pcall(runtime.run_pending)
         end
-      end,
-    })
+      end
+    end)
   end
   maki.log.info("metronome: tools and /metronome commands registered")
 end

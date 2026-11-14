@@ -697,23 +697,14 @@ function M.new(deps)
   -- Background scheduler -----------------------------------------------------
   --
   -- The pipeline must not block the chat: a submit returns as soon as the
-  -- tasks are qualified, and one background loop drains the ready queue. A
-  -- second submit while the loop runs only marks it dirty; the loop picks the
-  -- new tasks up before it exits, so max_parallel and file overlap stay under
-  -- the scheduler's control.
-  --
-  -- A role session opened while the chat is streaming is cancelled at once, so
-  -- a tool-triggered job waits for TurnEnd; a slash command has no turn and
-  -- starts it directly.
+  -- tasks are qualified. A top-level spawn loop (started by init.lua) polls
+  -- `has_pending` and calls `run_pending`, so role sessions are opened from a
+  -- true background task, not from a tool handler or an autocmd callback.
   local scheduler_running = false
   local scheduler_dirty = false
   local scheduler_job = nil
   local scheduler_extra = {}
 
-  -- The tool handler's ctx is a LuaCtx userdata: its session id is a method,
-  -- not a field. Reading it as a field made every tool-triggered job look like
-  -- a slash command and start inside the turn, where the role session is
-  -- cancelled at once.
   local function ctx_session_id(ctx)
     if ctx == nil then
       return nil
@@ -744,47 +735,6 @@ function M.new(deps)
     return ctx
   end
 
-  local function spawn_background(fn)
-    local spawn = deps.spawn or (maki.async and maki.async.spawn)
-    if type(spawn) == "function" then
-      spawn(fn)
-    else
-      fn()
-    end
-  end
-
-  local function start_scheduler()
-    if scheduler_running or not scheduler_job then
-      return
-    end
-    scheduler_running = true
-    local job = scheduler_job
-    local real_spawn = deps.spawn == nil
-    spawn_background(function()
-      -- Let the ending turn finish before opening a role session.
-      if real_spawn and maki.async and type(maki.async.sleep) == "function" then
-        pcall(maki.async.sleep, 500)
-      end
-      local ok, err = pcall(function()
-        while #scheduler_extra > 0 or scheduler_dirty do
-          while #scheduler_extra > 0 do
-            local fn = table.remove(scheduler_extra, 1)
-            fn()
-          end
-          if scheduler_dirty then
-            scheduler_dirty = false
-            runtime.last_background = after_questions(
-              job.opts, job.paths, job.cfg, job.runner, job.session)
-          end
-        end
-      end)
-      scheduler_running = false
-      if not ok then
-        log(job.paths, "background scheduler error: " .. tostring(err))
-      end
-    end)
-  end
-
   local function schedule_job(opts, paths, cfg, runner, session)
     scheduler_job = {
       opts = opts,
@@ -794,14 +744,35 @@ function M.new(deps)
       session = session,
     }
     scheduler_dirty = true
-    local wait = deps.wait_turn_end
-    if wait == nil then
-      wait = opts.from_tool and maki.api and type(maki.api.create_autocmd) == "function"
-    end
-    if wait then
+  end
+
+  function runtime.has_pending()
+    return (scheduler_dirty or #scheduler_extra > 0) and not scheduler_running
+  end
+
+  function runtime.run_pending()
+    if scheduler_running or not scheduler_job then
       return
     end
-    start_scheduler()
+    scheduler_running = true
+    local job = scheduler_job
+    local ok, err = pcall(function()
+      while #scheduler_extra > 0 or scheduler_dirty do
+        while #scheduler_extra > 0 do
+          local fn = table.remove(scheduler_extra, 1)
+          fn()
+        end
+        if scheduler_dirty then
+          scheduler_dirty = false
+          runtime.last_background = after_questions(
+            job.opts, job.paths, job.cfg, job.runner, job.session)
+        end
+      end
+    end)
+    scheduler_running = false
+    if not ok then
+      log(job.paths, "background scheduler error: " .. tostring(err))
+    end
   end
 
   local function drive(opts)
@@ -875,10 +846,7 @@ function M.new(deps)
       -- returns; only a real run goes to the background.
       return after_questions(opts, paths, cfg, runner, session)
     end
-    schedule_job({
-      ctx = background_ctx(opts.ctx),
-      from_tool = ctx_session_id(opts.ctx) ~= nil,
-    }, paths, cfg, runner, session)
+    schedule_job({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
     return { ok = true, background = true, tasks = applied.tasks }
   end
 
@@ -985,10 +953,7 @@ function M.new(deps)
     if not runner then
       return { ok = false, error = perr, applied = applied }
     end
-    schedule_job({
-      ctx = background_ctx(opts.ctx),
-      from_tool = ctx_session_id(opts.ctx) ~= nil,
-    }, paths, cfg, runner, session)
+    schedule_job({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
     return { ok = true, background = true, applied = applied }
   end
 
@@ -1019,10 +984,7 @@ function M.new(deps)
     if not runner then
       return { ok = false, error = perr, task = moved }
     end
-    local bg = {
-      ctx = background_ctx(opts.ctx),
-      from_tool = ctx_session_id(opts.ctx) ~= nil,
-    }
+    local bg = { ctx = background_ctx(opts.ctx) }
     scheduler_extra[#scheduler_extra + 1] = function()
       local ok, result = pcall(run_task, bg, input.id, paths, cfg, runner, session)
       if not ok then
@@ -1213,7 +1175,7 @@ function M.new(deps)
   end
 
   function runtime.start_pending()
-    start_scheduler()
+    runtime.run_pending()
   end
 
   return runtime

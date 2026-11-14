@@ -112,6 +112,7 @@ return function()
   -- Answering resumes the pipeline -----------------------------------------
 
   local ans = rt.answer({ answers = { q1 = "yes" } }, ctx)
+  rt.run_pending()
   eq(ans and ans.ok, true, "answer resumes the pipeline")
   eq(ans and ans.applied and ans.applied.applied, 1, "answer reports the applied count")
   eq(ticked, true, "answer runs the scheduler instead of leaving tasks in qualifying")
@@ -183,6 +184,7 @@ return function()
   }
   local rt2 = runtime.new(deps2)
   local res2 = rt2.submit({ intention = "x" }, ctx)
+  rt2.run_pending()
   eq(type(res2), "table", "submit with dependencies returns a result")
   eq(set_fields["T-2"] and set_fields["T-2"].depends_on and set_fields["T-2"].depends_on[1], "T-1",
     "dependency titles are remapped to task ids")
@@ -228,6 +230,7 @@ return function()
   }
   local rt3 = runtime.new(deps3)
   local retried = rt3.retry({ id = "T1" }, ctx)
+  rt3.run_pending()
   eq(type(retried), "table", "retry returns a result")
   eq(retried and retried.background, true, "retry returns before the dispatch finishes")
   eq(rt3.last_background and rt3.last_background.error, "stop after dispatch",

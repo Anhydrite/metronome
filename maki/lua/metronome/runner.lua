@@ -118,12 +118,16 @@ function M.run(opts)
     local dir = state_root and M.run_dir(state_root, task_id, phase, attempt) or nil
     local attempt_started = clock()
 
+    local tool_ctx = opts.ctx
+    if type(opts.ctx) == "table" and opts.ctx.session ~= nil then
+      tool_ctx = { session = opts.ctx.session }
+    end
     local session_opts = {
       name = "metronome-" .. tostring(opts.role or "role"),
       model_spec = opts.model_spec,
       thinking = opts.thinking,
       system = opts.system,
-      tools = resolve_tools(opts.ctx, opts.tools),
+      tools = resolve_tools(tool_ctx, opts.tools),
       -- A background run opens its sessions by chat id; `session` keeps them
       -- alive across the tool call that spawned the scheduler.
       scope = "session",
@@ -133,7 +137,7 @@ function M.run(opts)
       -- Without a ctx, maki.agent.session takes ONE table: the session id and
       -- every option together. Passing the options as a second argument would
       -- be ignored, and the session would fall back to the default scope.
-      local merged = { session = opts.ctx.session }
+      local merged = { session = opts.ctx.session, session_id = opts.ctx.session }
       for key, value in pairs(session_opts) do
         merged[key] = value
       end
