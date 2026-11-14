@@ -203,7 +203,14 @@ function M.prepare(opts)
   local reuse = false
   for _, path in ipairs(listed) do
     if path == worktree then
-      reuse = true
+      -- A registered path whose directory is gone is a stale registration: a
+      -- reset state root or a crashed run left it behind. Reusing it would
+      -- make every git call fail with "cannot change to <worktree>".
+      if fs.metadata(worktree) then
+        reuse = true
+      elseif type(opts.git.worktree_prune) == "function" then
+        opts.git.worktree_prune(opts.repo)
+      end
       break
     end
   end

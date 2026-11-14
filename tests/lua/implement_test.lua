@@ -192,6 +192,17 @@ return function()
   eq(git.current_branch(ctx3.worktree), "metronome/" .. id,
     "re-attached worktree is on the existing branch")
 
+  -- A checkout deleted behind git's back (a reset state root, a crashed run)
+  -- leaves a stale registration. prepare must prune it and re-add the branch
+  -- instead of reusing a path that no longer exists.
+  maki.fs.rm(ctx3.worktree, { recursive = true })
+  local ctx4, perr4 = implement.prepare(prep_opts)
+  eq(perr4, nil, "prepare prunes a stale worktree registration: " .. tostring(perr4))
+  eq(ctx4 and maki.fs.metadata(ctx4.worktree) ~= nil, true,
+    "prepare recreates the worktree directory")
+  eq(ctx4 and git.current_branch(ctx4.worktree), "metronome/" .. id,
+    "the recreated worktree is on the task branch")
+
   -- Checkpoints --------------------------------------------------------------
 
   local head = git.head_sha(ctx3.worktree)

@@ -298,6 +298,27 @@ function M.worktree_add(repo, worktree, branch, base_ref, opts)
   return worktree
 end
 
+-- Drop registrations whose directory no longer exists. A reset state root or a
+-- crashed run leaves `.git/worktrees/<id>` behind without the checkout, and
+-- `git worktree add` then refuses the path as "already registered" while
+-- `rev-parse` fails on the missing directory. Pruning is what lets a task
+-- re-attach after its worktree was removed.
+function M.worktree_prune(repo, opts)
+  opts = opts or {}
+  local args = { "git", "-C", repo, "worktree", "prune" }
+  if opts.dry_run then
+    args[#args + 1] = "--dry-run"
+  end
+  local result, err = run(args)
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("worktree prune", result)
+  end
+  return true
+end
+
 function M.worktree_remove(repo, worktree, opts)
   opts = opts or {}
   local args = { "git", "-C", repo, "worktree", "remove" }
