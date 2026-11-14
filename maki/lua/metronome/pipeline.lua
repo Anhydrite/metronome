@@ -28,6 +28,10 @@ local ACTIVE = {
   deploying = true,
 }
 
+-- `merged` is a completed state for scheduling: the work the scheduler hands
+-- out is over, and the deploy a merge still owes is drained separately by the
+-- deployer. A dependent may start once its dependency is `merged`, a merged
+-- task is never a candidate to start, and a merged task cannot stall.
 local DONE = {
   merged = true,
   deployed = true,
@@ -222,6 +226,118 @@ function M.schedule(tasks, running, opts)
   end
 
   return selected, skipped
+end
+
+-- Deploy selection ----------------------------------------------------------
+
+-- A merge records the base it produced and leaves the task at `merged`; a
+-- deployer drains that hand-off separately from the scheduler. The pending
+-- flag may reach the projection in more than one shape: `task.deploy_pending`
+-- as a boolean, a base string, or a table carrying `base`/`at`, or the merge
+-- result's table under `task.deploy.pending`. Only an explicit false or an
+-- empty flag means "nothing owed".
+local function deploy_flag(task)
+  if type(task) ~= "table" then
+    return nil
+  end
+  local flag = task.deploy_pending
+  if flag == nil and type(task.deploy) == "table" then
+    flag = task.deploy.pending
+  end
+  return flag
+end
+
+local function deploy_pending_set(task)
+  local flag = deploy_flag(task)
+  if type(flag) == "boolean" then
+    return flag
+  end
+  if type(flag) == "string" then
+    return is_non_empty(flag)
+  end
+  if type(flag) == "table" then
+    if flag.pending == false then
+      return false
+    end
+    return is_non_empty(flag.base) or flag.pending == true or is_non_empty(flag.at)
+  end
+  return false
+end
+
+local function deploy_pending_base(task)
+  local flag = deploy_flag(task)
+  if type(flag) == "string" then
+    return is_non_empty(flag) and flag or nil
+  end
+  if type(flag) == "table" and is_non_empty(flag.base) then
+    return flag.base
+  end
+  return nil
+end
+
+local function pending_base_opts(opts)
+  if is_non_empty(opts.pending_base) then
+    return opts.pending_base
+  end
+  if type(opts.pending) == "string" and is_non_empty(opts.pending) then
+    return opts.pending
+  end
+  if type(opts.pending) == "table" and is_non_empty(opts.pending.base) then
+    return opts.pending.base
+  end
+  return nil
+end
+
+-- The tasks a deployer may drain now: status `merged` and the deploy-pending
+-- flag set, sorted by id. `merged` is completed for the scheduler, so these
+-- tasks are never runnable and never stall; this is the only list they appear
+-- on. `opts.is_pending(task)` overrides how the flag is read. `opts.pending`
+-- (or `opts.pending_base`) is the store-level pending base and narrows the
+-- list to the task that names it, when the flag names a base at all.
+--
+-- Pure: no state, no fs, no runner. Returns `(list)`, or `(nil, err)` on bad
+-- input, like the rest of the module.
+function M.deployable(tasks, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(tasks) ~= "table" then
+    return nil, "tasks are required"
+  end
+  local is_pending = deploy_pending_set
+  if type(opts.is_pending) == "function" then
+    is_pending = opts.is_pending
+  end
+  local base = pending_base_opts(opts)
+
+  local selected = {}
+  for _, task in ipairs(M.collect(tasks)) do
+    if task.status == "merged" then
+      local called, pending = pcall(is_pending, task)
+      if not called then
+        return nil, "cannot read the deploy-pending flag of " .. tostring(task.id)
+      end
+      if pending then
+        local named = deploy_pending_base(task)
+        if not base or not named or named == base then
+          selected[#selected + 1] = task
+        end
+      end
+    end
+  end
+  table.sort(selected, function(a, b)
+    return a.id < b.id
+  end)
+  return selected
+end
+
+-- The single-flight selection: at most one task per call, so a drain loop that
+-- calls this cannot start two deploys at once. Returns `(task)` when one is
+-- owed, `(nil)` when none is, and `(nil, err)` on bad input.
+function M.next_deploy(tasks, opts)
+  local list, err = M.deployable(tasks, opts)
+  if not list then
+    return nil, err
+  end
+  return list[1]
 end
 
 -- Stall detection -----------------------------------------------------------
