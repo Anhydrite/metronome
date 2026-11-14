@@ -6,6 +6,10 @@
 -- declared checks are re-run on a throwaway checkout of the merged base: a
 -- merge that lands a red base is worse than a merge that never happened.
 --
+-- A successful merge stops at `merged`. The base it produced is written to the
+-- persistent deploy-pending flag for a deployer to drain; merge never triggers
+-- or waits for a deployment.
+--
 -- Every function returns `(value, err)` and never raises. git, state, checks
 -- and the session options are injected, so the module is pure Lua and the whole
 -- step is testable against a throwaway repository and a fake `gh`.
@@ -472,6 +476,35 @@ local function run_impl(opts)
     end
   end
 
+  -- Record the base this merge produced as the thing a deployer must drain.
+  -- Merge owns the merge and nothing else: it never triggers or waits for a
+  -- deploy, it hands the base off through the persistent deploy-pending flag
+  -- and returns at `merged`. Recording it before the transition means a task
+  -- that cannot be marked merged is retried rather than silently undeployed.
+  local pending = nil
+  if type(state.set_deploy_pending) ~= "function" then
+    return {
+      ok = false,
+      error = "state module cannot record a deploy-pending base",
+      rebase = rebase,
+      merge = merged,
+      checks = checks_result,
+      branch_cleanup = branch_cleanup,
+    }
+  end
+  local perr
+  pending, perr = state.set_deploy_pending(root, base)
+  if not pending then
+    return {
+      ok = false,
+      error = perr,
+      rebase = rebase,
+      merge = merged,
+      checks = checks_result,
+      branch_cleanup = branch_cleanup,
+    }
+  end
+
   local final, ferr = state.transition(root, id, "merged", { phase = "merge" })
   if not final then
     return {
@@ -481,10 +514,18 @@ local function run_impl(opts)
       merge = merged,
       checks = checks_result,
       branch_cleanup = branch_cleanup,
+      deploy_pending = pending,
     }
   end
 
-  return { ok = true, rebase = rebase, merge = merged, checks = checks_result, branch_cleanup = branch_cleanup }
+  return {
+    ok = true,
+    rebase = rebase,
+    merge = merged,
+    checks = checks_result,
+    branch_cleanup = branch_cleanup,
+    deploy_pending = pending,
+  }
 end
 
 -- A merge is a chain of injected calls; any one of them could raise. The

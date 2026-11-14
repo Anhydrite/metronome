@@ -289,6 +289,15 @@ return function()
   maki.fs.rm(failfile)
   maki.fs.write(log, "")
 
+  -- A deploy module is injected to prove the merge path never calls it.
+  local deploy_called = false
+  local deploy_spy = {
+    run = function()
+      deploy_called = true
+      return { ok = true }
+    end,
+  }
+
   local res3 = merge.run({
     task = task3,
     repo = repo,
@@ -298,6 +307,7 @@ return function()
     state = state,
     gh = gh,
     checks = checks,
+    deploy = deploy_spy,
     commands = { "true" },
     pr = 42,
     base = "main",
@@ -314,6 +324,15 @@ return function()
   eq(after3 and after3.pr and after3.pr.state, "merged", "task PR is merged")
   eq(after3 and after3.pr and after3.pr.number, 42, "task PR number is kept")
   eq(after3 and after3.pr and after3.pr.url, "https://github.com/example/shop/pull/42", "task PR url is kept")
+
+  -- The merge records the base for a deployer and returns at `merged`: it
+  -- never triggers or waits for a deploy itself.
+  local pending3 = state.deploy_pending(root)
+  eq(type(pending3), "table", "merge records a deploy-pending base")
+  eq(pending3 and pending3.base, "main", "the deploy-pending base is the merged base")
+  eq(res3 and res3.deploy_pending and res3.deploy_pending.base, "main", "the result reports the pending base")
+  eq(deploy_called, false, "merge does not invoke deploy.run")
+  eq(after3 and after3.status == "merged", true, "merge stops at merged, not deploying")
 
   -- The merged branch is cleaned up: worktree removed, remote and local
   -- branches gone, so no branch is left behind forever.
@@ -339,6 +358,7 @@ return function()
   local wt4, id4 = seed_branch()
   local task4 = seed_task(id4, wt4)
   maki.fs.write(failfile, "Pull request is not mergeable\n")
+  state.set_deploy_pending(root, "keepme")
 
   local res4 = merge.run({
     task = task4,
@@ -364,6 +384,7 @@ return function()
     end
   end
   eq(note_found, true, "journal note records the merge failure")
+  eq(state.deploy_pending(root).base, "keepme", "a failed merge does not overwrite the pending base")
   maki.fs.rm(failfile)
 
   -- run: post-merge checks red ------------------------------------------------
@@ -371,6 +392,7 @@ return function()
   local wt5, id5 = seed_branch()
   local task5 = seed_task(id5, wt5)
   maki.fs.rm(failfile)
+  state.set_deploy_pending(root, "keepme")
 
   local res5 = merge.run({
     task = task5,
@@ -390,6 +412,7 @@ return function()
 
   local after5 = state.load(root).tasks[id5]
   eq(after5 and after5.status, "failed", "task is failed after red post-merge checks")
+  eq(state.deploy_pending(root).base, "keepme", "red checks do not record a pending base")
 
   -- run: auto_rebase=false ----------------------------------------------------
 
