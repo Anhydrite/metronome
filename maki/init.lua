@@ -79,6 +79,8 @@ local function wire()
   -- The pipeline runs from a top-level spawn loop, not from a tool handler:
   -- a role session opened inside a turn is cancelled at once. The loop polls
   -- the runtime and drains the queue when a submit or an answer queued work.
+  -- It runs even while the chat is streaming, so a demand keeps moving while
+  -- the user talks to the agent.
   if maki.async and type(maki.async.spawn) == "function" then
     maki.async.spawn(function()
       while true do

@@ -445,7 +445,11 @@ function M.new(deps)
         thinking = request.thinking,
         tools = request.tools,
         state_root = opts.state_root or p(opts).runs,
-        ctx = opts.ctx,
+        -- The request carries the ctx of the task being run. The runner was
+        -- built once in `prepare`, before `background_ctx` turned the tool ctx
+        -- into a `{ session = sid }` table, so reading only the captured
+        -- `opts.ctx` would drop the session id and cancel the role session.
+        ctx = request.ctx or opts.ctx,
         max_attempts = opts.max_attempts or 3,
         deadline_secs = opts.deadline_secs,
       })
@@ -576,6 +580,37 @@ function M.new(deps)
     })
     if not merged.ok then
       return merged
+    end
+
+    -- The merger redeploys: once the PR is merged and the checks are green on
+    -- the merged base, run the deploy plan without asking. `auto_deploy` is
+    -- the project's switch; a project that wants a human gate keeps it off.
+    if cfg.deploy and cfg.deploy.auto_deploy then
+      local deployed = deps.deploy.run({
+        task = task_id,
+        root = paths.root,
+        state = state,
+        repo = paths.repo,
+        plan_path = fs.joinpath(paths.repo, cfg.deploy.plan_file or "deploy.md"),
+        runner = runner,
+        confirm = false,
+        confirmed = true,
+        session_opts = session.deployer,
+        state_root = paths.runs,
+        ctx = opts.ctx,
+        checks = deps.checks,
+      })
+      if not deployed.ok then
+        return {
+          ok = false,
+          error = "deploy failed: " .. tostring(deployed.error),
+          task_id = task_id,
+          pr = pr,
+          merged = merged,
+          deployed = deployed,
+        }
+      end
+      return { ok = true, task_id = task_id, sha = impl.sha, pr = pr, merged = merged, deployed = deployed }
     end
 
     return { ok = true, task_id = task_id, sha = impl.sha, pr = pr, merged = merged }
@@ -709,10 +744,18 @@ function M.new(deps)
     if ctx == nil then
       return nil
     end
+    -- A LuaCtx is userdata: index it through the method, never as a field.
     local ok, sid = pcall(function()
-      if type(ctx.session_id) == "function" then
-        return ctx:session_id()
-      end
+      return ctx:session_id()
+    end)
+    pcall(function()
+      maki.log.info("metronome ctx_session_id ok=" .. tostring(ok)
+        .. " sid=" .. tostring(sid))
+    end)
+    if ok and type(sid) == "string" and sid ~= "" then
+      return sid
+    end
+    ok, sid = pcall(function()
       return ctx.session_id
     end)
     if ok and type(sid) == "string" and sid ~= "" then
@@ -722,6 +765,12 @@ function M.new(deps)
   end
 
   local function background_ctx(ctx)
+    if type(ctx) == "table" then
+      -- Already a background context (`{ session = sid }`) or a caller-built
+      -- table (tests): keep it, never swap in whatever session is focused when
+      -- the scheduler drains the queue.
+      return ctx
+    end
     local sid = ctx_session_id(ctx)
     if not sid and maki.session and type(maki.session.current) == "function" then
       local ok, current = pcall(maki.session.current)
@@ -732,11 +781,50 @@ function M.new(deps)
     if type(sid) == "string" and sid ~= "" then
       return { session = sid }
     end
+    pcall(function()
+      maki.log.info("metronome background_ctx in=" .. type(ctx) .. " sid=nil")
+    end)
     return ctx
   end
 
-  local function schedule_job(opts, paths, cfg, runner, session)
-    scheduler_job = {
+  -- Run `fn` off the caller's turn. `deps.spawn` is the test seam; in maki a
+  -- background task is what lets submit return before qualification ends.
+  local function spawn(fn)
+    if type(deps.spawn) == "function" then
+      return deps.spawn(fn)
+    end
+    -- `maki.async.spawn` lives as long as the plugin; `maki.async.run` is tied
+    -- to the caller's task and is cancelled when the tool handler returns, so
+    -- the role session it opened dies at once. Use spawn.
+    if maki.async and type(maki.async.spawn) == "function" then
+      return maki.async.spawn(fn)
+    end
+    if maki.async and type(maki.async.run) == "function" then
+      return maki.async.run(fn)
+    end
+    return fn()
+  end
+
+  -- A background qualification cannot block on a tool result, so it pushes the
+  -- questions back into the chat: the agent relays them with the native
+  -- `question` tool and answers through `metronome_answer`.
+  local function ask_in_chat(ctx, questions)
+    if not (maki.session and type(maki.session.prompt) == "function") then
+      return false
+    end
+    local sid = type(ctx) == "table" and ctx.session or ctx_session_id(ctx)
+    local lines = {
+      "Metronome a qualifié une intention et a besoin de réponses.",
+      "Utilise l'outil `question` pour poser ces questions à l'utilisateur, puis appelle `metronome_answer` avec les réponses (la clé est entre parenthèses).",
+    }
+    for _, question in ipairs(questions) do
+      lines[#lines + 1] = string.format("- (%s) %s", tostring(question.id), tostring(question.text))
+    end
+    local ok, sent = pcall(maki.session.prompt, table.concat(lines, "\n"), { session = sid })
+    return ok and sent ~= nil
+  end
+
+  local function schedule_job(opts, paths, cfg, runner, session)    scheduler_job = {
       opts = opts,
       paths = paths,
       cfg = cfg,
@@ -832,12 +920,28 @@ function M.new(deps)
     end
 
     local round = deps.questions.round(deps.state, paths.root)
-    if round and #round.questions > 0 then
+    -- Only the questions raised by the tasks this submit just qualified block
+    -- it. A question still open on an older task must not stop a new, clean
+    -- intention from starting: the user asked to enqueue demands at any time.
+    local applied_ids = {}
+    for _, task in ipairs(applied.tasks or {}) do
+      applied_ids[task.id] = true
+    end
+    local own = {}
+    for _, question in ipairs((round and round.questions) or {}) do
+      for _, source in ipairs(question.sources or {}) do
+        if applied_ids[source.task_id] then
+          own[#own + 1] = question
+          break
+        end
+      end
+    end
+    if #own > 0 then
       local answers = (script and script.answers) or opts.answers or {}
       if next(answers) ~= nil then
         deps.questions.answer(deps.state, paths.root, answers)
       else
-        return { ok = true, waiting_questions = round.questions }
+        return { ok = true, waiting_questions = own, tasks = applied.tasks }
       end
     end
 
@@ -903,19 +1007,32 @@ function M.new(deps)
     local opts = {
       intention = input.intention,
       answers = input.answers,
-      ctx = M.resolve_ctx(input, ctx),
+      -- Qualify through a background ctx too: the qualifier is a role session,
+      -- and a role session opened with the tool's LuaCtx is cancelled with the
+      -- turn. `{ session = sid }` opens it as a background session instead.
+      ctx = background_ctx(M.resolve_ctx(input, ctx)),
     }
-    local result
-    local ok, err = pcall(function()
-      result = drive(opts)
-    end)
-    if not ok then
-      log(paths, "submit error: " .. tostring(err))
+    -- Qualification is a role turn: run the whole `drive` in the background so
+    -- the chat is free at once and the user can enqueue another demand. The
+    -- result lands in `last_submit`; questions are pushed back to the chat.
+    local function job()
+      local result
+      local ok, err = pcall(function()
+        result = drive(opts)
+      end)
+      if not ok then
+        log(paths, "submit error: " .. tostring(err))
+        result = { ok = false, error = tostring(err) }
+      end
+      runtime.last_submit = result
+      if type(result) == "table" and type(result.waiting_questions) == "table"
+        and #result.waiting_questions > 0 then
+        ask_in_chat(opts.ctx, result.waiting_questions)
+      end
+      return result
     end
-    if not ok then
-      return { ok = false, error = tostring(err) }
-    end
-    return result
+    spawn(job)
+    return { ok = true, background = true, queued = true, intention = opts.intention }
   end
 
   function runtime.status(input)
@@ -985,6 +1102,9 @@ function M.new(deps)
       return { ok = false, error = perr, task = moved }
     end
     local bg = { ctx = background_ctx(opts.ctx) }
+    pcall(function()
+      maki.log.info("metronome retry bg in=" .. type(opts.ctx) .. " out=" .. type(bg.ctx))
+    end)
     scheduler_extra[#scheduler_extra + 1] = function()
       local ok, result = pcall(run_task, bg, input.id, paths, cfg, runner, session)
       if not ok then

@@ -83,7 +83,16 @@ local function default_tools(ctx, tools)
   if type(tools) == "table" and #tools > 0 then
     req.only = tools
   end
-  local ok, defs = pcall(maki.agent.tools, ctx, req)
+  local ok, defs
+  if type(ctx) == "table" and type(ctx.session) == "string" then
+    -- A background ctx is `{ session = sid }`. Without a LuaCtx, the tool
+    -- resolver takes ONE table carrying the session id; passing it as a
+    -- separate ctx would fail and leave the role with no tools at all.
+    req.session = ctx.session
+    ok, defs = pcall(maki.agent.tools, req)
+  else
+    ok, defs = pcall(maki.agent.tools, ctx, req)
+  end
   if ok and defs then
     return defs
   end
@@ -118,6 +127,10 @@ function M.run(opts)
     local dir = state_root and M.run_dir(state_root, task_id, phase, attempt) or nil
     local attempt_started = clock()
 
+    pcall(function()
+      maki.log.info("metronome runner ctx type=" .. type(opts.ctx)
+        .. " session=" .. tostring(type(opts.ctx) == "table" and opts.ctx.session))
+    end)
     local tool_ctx = opts.ctx
     if type(opts.ctx) == "table" and opts.ctx.session ~= nil then
       tool_ctx = { session = opts.ctx.session }

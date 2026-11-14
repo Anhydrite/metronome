@@ -85,7 +85,9 @@ return function()
   captured = nil
   local res = rt.submit({ intention = "add an icon" }, ctx)
   eq(type(res), "table", "submit returns a result table")
-  eq(res and res.error, "stop after capture", "submit reaches the qualifier")
+  eq(res and res.background, true, "submit returns before qualification ends")
+  eq(rt.last_submit and rt.last_submit.error, "stop after capture",
+    "submit reaches the qualifier in the background")
   eq(type(captured), "table", "qualify.run was called")
   eq(captured and captured.ctx, ctx, "submit forwards the positional ctx to qualify")
 
@@ -101,7 +103,8 @@ return function()
   captured = nil
   local bare = rt.submit({ intention = "add an icon" })
   eq(type(bare), "table", "submit without a ctx returns a result table")
-  eq(bare and bare.error, "stop after capture", "submit without a ctx still reaches the qualifier")
+  eq(rt.last_submit and rt.last_submit.error, "stop after capture",
+    "submit without a ctx still reaches the qualifier")
 
   -- resolve_ctx is the pure seam -------------------------------------------
 
@@ -236,4 +239,160 @@ return function()
   eq(rt3.last_background and rt3.last_background.error, "stop after dispatch",
     "retry reports the dispatch result on the background record")
   eq(implemented, true, "retry re-dispatches the task instead of only moving its status")
+
+  -- The role runner receives the background ctx of the task it runs ---------
+  --
+  -- Regression: `real_runner` was built once in `prepare`, before
+  -- `background_ctx` turned the tool ctx into `{ session = sid }`, and read
+  -- only the captured `opts.ctx`. The implementer then opened its session with
+  -- the tool's LuaCtx, which the turn cancelled at once (duration_ms 0). The
+  -- ctx carried by the request must win.
+  local runner_ctx
+  local deps4 = {
+    config = {
+      load = function()
+        return { project = { repo = "/tmp/repo", base_ref = "main" } }
+      end,
+    },
+    roles = {
+      session_opts = function()
+        return { system = "", model_spec = "test/model", thinking = "low", tools = {} }
+      end,
+    },
+    runner = {
+      run = function(opts)
+        runner_ctx = opts.ctx
+        return { ok = false, error = "stop after capture" }
+      end,
+    },
+    implement = {
+      run = function(opts)
+        opts.runner({ role = "implementer", task_id = "T1", phase = "implement", ctx = opts.ctx })
+        return { ok = false, error = "stop after dispatch" }
+      end,
+    },
+    state = {
+      load = function()
+        return { tasks = { T1 = { id = "T1", status = "failed" } } }
+      end,
+      transition = function(_, id, status)
+        return { id = id, status = status }
+      end,
+    },
+    paths = function()
+      return paths
+    end,
+    spawn = function(fn)
+      fn()
+    end,
+    wait_turn_end = false,
+    qualify = {}, questions = {}, analyze = {},
+    checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
+    calibrate = {}, pipeline = {}, fence = {}, mode = {}, git = {},
+  }
+  local rt4 = runtime.new(deps4)
+  rt4.retry({ id = "T1" }, { session = "S1" })
+  rt4.run_pending()
+  eq(type(runner_ctx), "table", "the role runner receives a ctx table")
+  eq(runner_ctx and runner_ctx.session, "S1",
+    "the role runner receives the background session id, not the tool ctx")
+
+  -- Auto-deploy: the merger redeploys right after a green merge -------------
+  local deploy_called = false
+  local tick_count = 0
+  local deps5 = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash" },
+          deploy = { auto_deploy = true, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = {
+      session_opts = function()
+        return { system = "", model_spec = "m", thinking = "low", tools = {} }
+      end,
+    },
+    state = {
+      load = function()
+        return { tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } } }
+      end,
+      transition = function(_, id, status)
+        return { id = id, status = status }
+      end,
+    },
+    implement = {
+      run = function()
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function()
+        return {}
+      end,
+    },
+    checks = {
+      verify = function()
+        return { ok = true }
+      end,
+      write_report = function() end,
+    },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true } end },
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = { run = function() return { ok = true } end },
+    deploy = {
+      run = function()
+        deploy_called = true
+        return { ok = true, deployed = true }
+      end,
+    },
+    pipeline = {
+      tick = function(opts)
+        tick_count = tick_count + 1
+        if tick_count == 1 then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = tick_count == 1 and { "T1" } or {} }
+      end,
+    },
+    paths = function()
+      return paths
+    end,
+    spawn = function(fn)
+      fn()
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function()
+        return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } }
+      end,
+      next_id = function()
+        return "T1"
+      end,
+      apply = function()
+        return { ok = true, tasks = { { id = "T1", title = "t" } } }
+      end,
+    },
+    questions = {
+      round = function()
+        return { questions = {} }
+      end,
+      answer = function()
+        return {}
+      end,
+    },
+    analyze = {
+      gate = function()
+        return { ok = true }
+      end,
+    },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt5 = runtime.new(deps5)
+  rt5.submit({ intention = "x" }, { session = "S1" })
+  rt5.run_pending()
+  eq(deploy_called, true, "auto_deploy redeploys right after the merge")
 end
