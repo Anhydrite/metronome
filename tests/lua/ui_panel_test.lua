@@ -91,9 +91,14 @@ return function()
   }
 
   local retried = nil
+  local deleted = nil
   local runtime = {
     retry = function(input)
       retried = input.id
+      return { ok = true }
+    end,
+    delete = function(input)
+      deleted = input.id
       return { ok = true }
     end,
   }
@@ -290,6 +295,19 @@ return function()
   eq(retried, "T-20261114-c9d0", "r retries the selected abandoned task")
   tasks["T-20261114-c9d0"].status = "ready"
   panel_mod.refresh(panel)
+
+  -- d deletes the selected task --------------------------------------------
+  local selected_index
+  for i, row in ipairs(panel.rows) do
+    if row.id == "T-20261114-c9d0" then
+      selected_index = i
+    end
+  end
+  panel_mod.select(panel, selected_index)
+  deleted = nil
+  local delete_action = panel_mod.handle_key(panel, "d")
+  eq(delete_action and delete_action.action, "delete", "d deletes the selected task")
+  eq(deleted, "T-20261114-c9d0", "d deletes the selected task id")
 
   local answer_action = panel_mod.handle_key(panel, "a")
   eq(answer_action.action, "answer", "a asks to answer")

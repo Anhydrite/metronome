@@ -657,6 +657,12 @@ function M.pr_open(state, root, task_id, opts)
   if not task then
     return nil, aerr
   end
+  -- `attach_only` opens the PR and records it without moving the task to
+  -- `pr_open`: the pipeline opens the PR before review, then reviews the exact
+  -- SHA, and only then moves the task on.
+  if opts.attach_only then
+    return pr
+  end
   local moved, terr = state.transition(root, task_id, "pr_open", { phase = opts.phase or "review" })
   if not moved then
     return nil, terr

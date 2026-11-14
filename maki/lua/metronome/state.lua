@@ -124,6 +124,8 @@ function M.replay(text)
         if event.kind == "task_created" then
           state.tasks[id] = event.task or { id = id }
           state.tasks[id].id = id
+        elseif event.kind == "task_deleted" then
+          state.tasks[id] = nil
         elseif state.tasks[id] then
           local task = state.tasks[id]
           if event.kind == "status" then
@@ -231,6 +233,24 @@ function M.create(root, task)
     return nil, err
   end
   return new_state.tasks[task.id]
+end
+
+-- Remove a task from the projection. The journal stays append-only: a
+-- `task_deleted` event hides the task on replay, so the history is intact and
+-- a later `task_created` with the same id would bring it back.
+function M.delete(root, task_id)
+  if type(task_id) ~= "string" or task_id == "" then
+    return nil, "delete needs a task id"
+  end
+  local state = M.load(root)
+  if not (state.tasks and state.tasks[task_id]) then
+    return nil, "unknown task: " .. task_id
+  end
+  local new_state, err = M.append(root, { kind = "task_deleted", task_id = task_id })
+  if not new_state then
+    return nil, err
+  end
+  return true
 end
 
 function M.transition(root, task_id, to, extra)

@@ -19,7 +19,13 @@ M.BUCKETS = {
   { key = "failures", label = "failures", mark = "!", hint = "r to retry" },
   { key = "review", label = "review ready", mark = "~", hint = "Enter to read" },
   { key = "progress", label = "in progress", mark = ".", hint = "" },
+  { key = "done", label = "done", mark = "✓", hint = "d to delete" },
 }
+
+-- Statuses that still have work ahead. Everything else is finished or
+-- archived, so it must not spin: a spinner on a deployed or abandoned task
+-- told the user work was moving when nothing was.
+local TERMINAL = { deployed = true, merged = true, abandoned = true }
 
 local RANK = {}
 for i, bucket in ipairs(M.BUCKETS) do
@@ -112,6 +118,9 @@ function M.bucket(task)
   end
   if task.status == "failed" or task.status == "stalled" then
     return "failures"
+  end
+  if TERMINAL[task.status] then
+    return "done"
   end
   if task.status == "reviewing" or task.status == "changes_requested" or task.status == "pr_open" then
     return "review"
@@ -219,6 +228,7 @@ function M.rows(tasks, opts)
       detail = M.detail(task, bucket),
       role = M.role_for(task),
       spinner = M.spinner(frame),
+      active = not TERMINAL[task.status],
       waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
     }
   end
@@ -235,7 +245,7 @@ function M.rows(tasks, opts)
 end
 
 function M.counts(rows)
-  local counts = { questions = 0, failures = 0, review = 0, progress = 0 }
+  local counts = { questions = 0, failures = 0, review = 0, progress = 0, done = 0 }
   for _, row in ipairs(rows or {}) do
     if counts[row.bucket] ~= nil then
       counts[row.bucket] = counts[row.bucket] + 1
@@ -320,7 +330,7 @@ function M.row_line(row, opts)
   -- the panel, not only its phase. Quiet mode hides what the agent is doing on
   -- a running task (the phase) behind the spinner, never the status.
   local detail = row.detail
-  if opts.quiet and row.bucket == "progress" then
+  if opts.quiet and row.bucket == "progress" and row.active then
     detail = row.spinner or M.spinner(0)
   end
   local spans = {

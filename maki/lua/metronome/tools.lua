@@ -90,6 +90,21 @@ function M.definitions()
       },
     },
     {
+      name = "metronome_delete",
+      description = "Remove a task from the panel and status. The journal keeps the history; the task disappears from status and the panel.",
+      permission = "run",
+      schema = {
+        type = "object",
+        properties = {
+          id = {
+            type = "string",
+            description = "Task id to delete.",
+          },
+        },
+        required = { "id" },
+      },
+    },
+    {
       name = "metronome_calibrate",
       description = "Analyze the repository and generate review-rules.md.",
       permission = "run",

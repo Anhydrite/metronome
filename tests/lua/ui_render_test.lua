@@ -45,7 +45,7 @@ return function()
   eq(render.bucket(task("T-1", "a", "changes_requested")), "review", "changes_requested is review-ready")
   eq(render.bucket(task("T-1", "a", "pr_open")), "review", "pr_open is review-ready")
   eq(render.bucket(task("T-1", "a", "running")), "progress", "running is in progress")
-  eq(render.bucket(task("T-1", "a", "deployed")), "progress", "deployed is in progress")
+  eq(render.bucket(task("T-1", "a", "deployed")), "done", "deployed is done")
 
   -- urgency ----------------------------------------------------------------
 

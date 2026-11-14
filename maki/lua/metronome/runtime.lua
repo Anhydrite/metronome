@@ -531,6 +531,23 @@ function M.new(deps)
     state.transition(paths.root, task_id, "verifying", { phase = "verify" })
     state.transition(paths.root, task_id, "reviewing", { phase = "review" })
 
+    -- Open the pull request before the review: the reviewer reads the exact
+    -- SHA on a real PR, and a human can follow it while the review runs. The
+    -- task stays in `reviewing` until the review approves it.
+    local pr = deps.git.pr_open(state, paths.root, task_id, {
+      repo = paths.repo,
+      worktree = worktree,
+      base = cfg.project.base_ref,
+      head = impl.ctx.branch,
+      title = task.title,
+      body = "Metronome task " .. task_id,
+      gh = "gh",
+      attach_only = true,
+    })
+    if not pr then
+      return { ok = false, error = "cannot open the pull request" }
+    end
+
     local reviewed = deps.review.review({
       task = task_id,
       worktree = worktree,
@@ -547,21 +564,11 @@ function M.new(deps)
       fence = deps.fence,
     })
     if not reviewed.ok or not reviewed.approved then
-      return { ok = false, error = (reviewed and reviewed.error) or "review not approved", review = reviewed }
+      return { ok = false, error = (reviewed and reviewed.error) or "review not approved", review = reviewed, pr = pr }
     end
 
-    local pr = deps.git.pr_open(state, paths.root, task_id, {
-      repo = paths.repo,
-      worktree = worktree,
-      base = cfg.project.base_ref,
-      head = impl.ctx.branch,
-      title = task.title,
-      body = "Metronome task " .. task_id,
-      gh = "gh",
-    })
-    if not pr then
-      return { ok = false, error = "cannot open the pull request" }
-    end
+    -- The review passed on the exact SHA: move the task to `pr_open` now.
+    state.transition(paths.root, task_id, "pr_open", { phase = "review" })
 
     -- `auto_merge` is the project's switch. Off means the task stops at
     -- `pr_open` with a PR a human can review and merge; on means the merger
@@ -1164,6 +1171,18 @@ function M.new(deps)
     return { ok = true, task = moved }
   end
 
+  function runtime.delete(input)
+    local paths = p()
+    if type(deps.state.delete) ~= "function" then
+      return { ok = false, error = "state.delete is not wired" }
+    end
+    local ok, err = deps.state.delete(paths.root, input.id)
+    if not ok then
+      return { ok = false, error = err }
+    end
+    return { ok = true, deleted = input.id }
+  end
+
   function runtime.calibrate(input)
     local paths = p()
     local result, err = deps.calibrate.run({
@@ -1254,9 +1273,42 @@ function M.new(deps)
 
   function runtime.resume(_input)
     local paths = p()
-    local resumed, err = deps.pipeline.resume(deps.state, paths.root, { apply = true })
+    if not fs.read(paths.config) then
+      return { ok = true, resumed = {}, errors = {} }
+    end
+    local cfg, cerr = load_config(nil)
+    if not cfg then
+      return { ok = false, error = cerr }
+    end
+    local opts = { ctx = background_ctx(nil) }
+    local runner, session, _, perr = prepare(opts, cfg, paths)
+    if not runner then
+      return { ok = false, error = perr }
+    end
+
+    -- Walk each interrupted task back to `running` through legal transitions,
+    -- then re-dispatch it from its last checkpoint. Without the dispatch the
+    -- task only changes status and nothing drives it.
+    local resumed, err = deps.pipeline.resume(deps.state, paths.root, {
+      apply = true,
+      dispatch = function(task)
+        scheduler_extra[#scheduler_extra + 1] = function()
+          local ok, result = pcall(run_task, opts, task.id, paths, cfg, runner, session)
+          if not ok or not (type(result) == "table" and result.ok) then
+            local reason = (not ok and tostring(result))
+              or (type(result) == "table" and result.error)
+              or "resume failed"
+            pcall(deps.state.transition, paths.root, task.id, "failed", { reason = tostring(reason) })
+          end
+          runtime.last_background = result
+        end
+      end,
+    })
     if not resumed then
       return { ok = false, error = err }
+    end
+    if #scheduler_extra > 0 then
+      schedule_job(opts, paths, cfg, runner, session)
     end
     return { ok = true, resumed = resumed.resumed, errors = resumed.errors }
   end

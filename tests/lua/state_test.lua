@@ -96,6 +96,12 @@ return function()
   eq(dup, nil, "duplicate create returns nil")
   eq(derr ~= nil, true, "duplicate create explains itself")
 
+  -- delete hides a task on replay -------------------------------------------
+  state.create(root, { id = "T-20261114-dead", title = "to delete" })
+  eq(state.delete(root, "T-20261114-dead"), true, "delete removes a task")
+  eq(state.load(root).tasks["T-20261114-dead"], nil, "deleted task is gone from load")
+  eq(state.delete(root, "T-20261114-dead"), nil, "deleting an unknown task fails")
+
   local moved, merr = state.transition(root, "T-20261114-a3f2", "qualifying")
   eq(merr, nil, "legal transition has no error")
   eq(moved and moved.status, "qualifying", "status moved")

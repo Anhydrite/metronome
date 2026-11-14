@@ -120,6 +120,14 @@ M.COMMANDS = {
     end,
   },
   {
+    name = "delete",
+    description = "Remove a task from the panel and status (the journal keeps the history).",
+    usage = "/metronome delete <id>",
+    build = function(rest)
+      return need_id(rest, "delete")
+    end,
+  },
+  {
     name = "config",
     description = "Show the project configuration, or update it with key=value pairs.",
     usage = "/metronome config [key=value ...]",

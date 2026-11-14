@@ -9,8 +9,8 @@
   "properties": {
     "kind": {
       "type": "string",
-      "description": "What happened. task_created carries the initial task; status moves it; field patches fields; note appends prose.",
-      "enum": ["task_created", "status", "field", "note"]
+      "description": "What happened. task_created carries the initial task; status moves it; field patches fields; note appends prose; task_deleted hides the task on replay.",
+      "enum": ["task_created", "status", "field", "note", "task_deleted"]
     },
     "task_id": {
       "type": "string",

@@ -91,6 +91,7 @@ local PANEL_KEYS = {
   { "<Space>", "peek" },
   { "a", "answer" },
   { "r", "retry" },
+  { "d", "delete" },
   { "v", "verbose" },
   { "+", "rate up" },
   { "-", "rate down" },
@@ -385,6 +386,22 @@ function M.retry(panel, id)
   return { action = "retry", id = id }
 end
 
+function M.delete(panel, id)
+  local runtime = panel.deps.runtime
+  if type(runtime) ~= "table" or type(runtime.delete) ~= "function" then
+    return nil, "delete is not wired"
+  end
+  local ok, result = pcall(runtime.delete, { id = id })
+  if not ok then
+    return nil, tostring(result)
+  end
+  if type(result) == "table" and result.ok == false then
+    return nil, tostring(result.error or "delete failed")
+  end
+  M.refresh(panel)
+  return { action = "delete", id = id }
+end
+
 -- Peek without attaching: the task's own record, its pending questions, its
 -- notes and its findings. Nothing is focused and no transcript is moved.
 function M.peek(panel, id, opts)
@@ -499,6 +516,14 @@ function M.handle_key(panel, key)
       return nil, "task is not failed, stalled or abandoned"
     end
     return M.retry(panel, row.id)
+  end
+
+  if key == "d" then
+    local row = M.selected(panel)
+    if not row then
+      return nil, "no task selected"
+    end
+    return M.delete(panel, row.id)
   end
 
   if key == "a" then
