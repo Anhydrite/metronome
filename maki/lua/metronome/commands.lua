@@ -397,6 +397,10 @@ function M.register(runtime, register, flash, show_questions, show_text, ask_que
     nargs = "*",
     handler = function(opts)
       local result = M.run(runtime, opts)
+      if result.ok and (result.command == "submit" or result.command == "answer"
+        or result.command == "retry") and type(runtime.start_pending) == "function" then
+        pcall(runtime.start_pending)
+      end
       local text = result.ok and result.text or ("error: " .. tostring(result.error))
       local questions = not result.ok and type(result.result) == "table"
         and result.result.questions or nil

@@ -703,6 +703,7 @@ function M.new(deps)
   -- the scheduler's control.
   local scheduler_running = false
   local scheduler_dirty = false
+  local scheduler_job = nil
 
   local function background_ctx(ctx)
     local sid = type(ctx) == "table" and ctx.session_id or nil
@@ -727,24 +728,48 @@ function M.new(deps)
     end
   end
 
-  local function ensure_scheduler(opts, paths, cfg, runner, session)
-    scheduler_dirty = true
-    if scheduler_running then
+  local function start_scheduler()
+    if scheduler_running or not scheduler_job then
       return
     end
     scheduler_running = true
+    local job = scheduler_job
     spawn_background(function()
       local ok, err = pcall(function()
         while scheduler_dirty do
           scheduler_dirty = false
-          runtime.last_background = after_questions(opts, paths, cfg, runner, session)
+          runtime.last_background = after_questions(
+            job.opts, job.paths, job.cfg, job.runner, job.session)
         end
       end)
       scheduler_running = false
       if not ok then
-        log(paths, "background scheduler error: " .. tostring(err))
+        log(job.paths, "background scheduler error: " .. tostring(err))
       end
     end)
+  end
+
+  -- A tool handler runs inside the chat turn, and a background session opened
+  -- while the chat is streaming is cancelled at once. So a tool-triggered
+  -- submit only records the job; the TurnEnd autocmd starts it once the chat
+  -- is idle. A slash command has no turn, so it starts it directly.
+  local function ensure_scheduler(opts, paths, cfg, runner, session)
+    scheduler_job = {
+      opts = opts,
+      paths = paths,
+      cfg = cfg,
+      runner = runner,
+      session = session,
+    }
+    scheduler_dirty = true
+    local wait = deps.wait_turn_end
+    if wait == nil then
+      wait = maki.api and type(maki.api.create_autocmd) == "function"
+    end
+    if wait then
+      return
+    end
+    start_scheduler()
   end
 
   local function drive(opts)
@@ -1143,6 +1168,10 @@ function M.new(deps)
 
   function runtime.off(_input)
     return runtime.mode({ value = "off" })
+  end
+
+  function runtime.start_pending()
+    start_scheduler()
   end
 
   return runtime

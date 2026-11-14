@@ -50,6 +50,7 @@ return function()
     spawn = function(fn)
       fn()
     end,
+    wait_turn_end = false,
     questions = {
       answer = function()
         return { applied = 1, answered = 1, tasks = { "T-20261114-0001" } }
@@ -176,6 +177,7 @@ return function()
     spawn = function(fn)
       fn()
     end,
+    wait_turn_end = false,
     runner = {}, git = {}, implement = {}, checks = {}, converge = {}, review = {}, merge = {},
     deploy = {}, calibrate = {}, fence = {}, mode = {},
   }
@@ -219,6 +221,7 @@ return function()
     spawn = function(fn)
       fn()
     end,
+    wait_turn_end = false,
     runner = {}, git = {}, qualify = {}, questions = {}, analyze = {},
     checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
     calibrate = {}, pipeline = {}, fence = {}, mode = {},
