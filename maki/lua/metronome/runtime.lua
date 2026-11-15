@@ -623,85 +623,111 @@ function M.new(deps)
       return { ok = false, error = "unknown task: " .. tostring(task_id) }
     end
 
-    local impl = deps.implement.run({
-      task = task,
-      repo = paths.repo,
-      state = state,
-      root = paths.root,
-      git = deps.git,
-      worktree_root = paths.worktrees,
-      tasks_dir = paths.tasks,
-      remote = "origin",
-      base_ref = cfg.project.base_ref,
-      runner = runner,
-      session_opts = session.implementer,
-      state_root = paths.runs,
-      ctx = opts.ctx,
-      max_attempts = 1,
-      deadline_secs = opts.deadline_secs,
-    })
-    if not impl.ok then
+    -- One implementation turn plus everything that must hold before a review:
+    -- the rebase onto the fresh base, the declared checks and the convergence
+    -- diff. A fix round runs exactly the same sequence, with the reviewer's
+    -- findings as the prompt's work list, so a review never ends the task
+    -- while rounds remain.
+    local function implement_and_verify(feedback)
+      local impl = deps.implement.run({
+        task = task,
+        repo = paths.repo,
+        state = state,
+        root = paths.root,
+        git = deps.git,
+        worktree_root = paths.worktrees,
+        tasks_dir = paths.tasks,
+        remote = "origin",
+        base_ref = cfg.project.base_ref,
+        runner = runner,
+        session_opts = session.implementer,
+        state_root = paths.runs,
+        ctx = opts.ctx,
+        max_attempts = 1,
+        deadline_secs = opts.deadline_secs,
+        feedback = feedback,
+      })
+      if not impl.ok then
+        return nil, impl
+      end
+      local worktree = impl.ctx.worktree
+
+      -- The base can move while the implementer works (another task merges).
+      -- Rebase onto the fresh origin/base before the checks and the converge
+      -- diff, so the diff is measured against the base the PR will merge into.
+      -- A conflict sends the task back to implementation on the new base.
+      if deps.merge and type(deps.merge.rebase) == "function" then
+        local rebased, rebase_err, rebase_diag = deps.merge.rebase({
+          repo = paths.repo,
+          worktree = worktree,
+          remote = "origin",
+          base = cfg.project.base_ref,
+          git = deps.git,
+        })
+        if not rebased then
+          if type(rebase_diag) == "table" and rebase_diag.conflict then
+            return nil, {
+              ok = false,
+              conflict = true,
+              error = "rebase onto fresh base conflicted: " .. tostring(rebase_err),
+            }
+          end
+          return nil, { ok = false, error = "rebase before checks failed: " .. tostring(rebase_err) }
+        end
+      end
+
+      local checks = task.checks or cfg.checks.default
+      local verified = deps.checks.verify({
+        checks = checks,
+        worktree = worktree,
+        timeout_ms = (cfg.checks.timeout_secs or 600) * 1000,
+        rollback = false,
+      })
+      if not verified or not verified.ok then
+        return nil, { ok = false, error = (verified and verified.error) or "checks failed", impl = impl }
+      end
+      deps.checks.write_report(paths.root, task_id, verified, {})
+
+      -- The worktree is cut from origin/<base>, so the diff must be read
+      -- against the same ref. The local base branch is not advanced by a
+      -- GitHub merge.
+      local diff_base = "origin/" .. cfg.project.base_ref
+      local sheet = deps.implement.read_sheet(paths.root, task, { tasks_dir = paths.tasks })
+      local converged = deps.converge.run({
+        task = task,
+        worktree = worktree,
+        base = diff_base,
+        git = deps.git,
+        root = paths.root,
+        tasks_dir = paths.tasks,
+        sheet = sheet,
+        runner = runner,
+        session_opts = session.implementer,
+        state_root = paths.runs,
+        ctx = opts.ctx,
+      })
+      if not converged.ok then
+        return nil, converged
+      end
       return impl
     end
 
+    -- A retry after a review failure already has the findings on the task:
+    -- hand them to the implementer instead of asking it to guess again.
+    local initial_feedback = nil
+    if type(task.review) == "table" and type(task.review.findings) == "table"
+      and #task.review.findings > 0 then
+      initial_feedback = task.review.findings
+    end
+
+    local impl, impl_err = implement_and_verify(initial_feedback)
+    if not impl then
+      return impl_err
+    end
+
     local worktree = impl.ctx.worktree
-
-    -- The base can move while the implementer works (another task merges).
-    -- Rebase onto the fresh origin/base before the checks and the converge
-    -- diff, so the diff is measured against the base the PR will merge into.
-    -- A conflict sends the task back to implementation on the new base.
-    if deps.merge and type(deps.merge.rebase) == "function" then
-      local rebased, rebase_err, rebase_diag = deps.merge.rebase({
-        repo = paths.repo,
-        worktree = worktree,
-        remote = "origin",
-        base = cfg.project.base_ref,
-        git = deps.git,
-      })
-      if not rebased then
-        if type(rebase_diag) == "table" and rebase_diag.conflict then
-          return {
-            ok = false,
-            conflict = true,
-            error = "rebase onto fresh base conflicted: " .. tostring(rebase_err),
-          }
-        end
-        return { ok = false, error = "rebase before checks failed: " .. tostring(rebase_err) }
-      end
-    end
-
     local checks = task.checks or cfg.checks.default
-    local verified = deps.checks.verify({
-      checks = checks,
-      worktree = worktree,
-      timeout_ms = (cfg.checks.timeout_secs or 600) * 1000,
-      rollback = false,
-    })
-    if not verified or not verified.ok then
-      return { ok = false, error = (verified and verified.error) or "checks failed", impl = impl }
-    end
-    deps.checks.write_report(paths.root, task_id, verified, {})
-
-    local sheet = deps.implement.read_sheet(paths.root, task, { tasks_dir = paths.tasks })
-    -- The worktree is cut from origin/<base>, so the diff must be read against
-    -- the same ref. The local base branch is not advanced by a GitHub merge.
     local diff_base = "origin/" .. cfg.project.base_ref
-    local converged = deps.converge.run({
-      task = task,
-      worktree = worktree,
-      base = diff_base,
-      git = deps.git,
-      root = paths.root,
-      tasks_dir = paths.tasks,
-      sheet = sheet,
-      runner = runner,
-      session_opts = session.implementer,
-      state_root = paths.runs,
-      ctx = opts.ctx,
-    })
-    if not converged.ok then
-      return converged
-    end
 
     state.transition(paths.root, task_id, "verifying", { phase = "verify" })
     state.transition(paths.root, task_id, "reviewing", { phase = "review" })
@@ -723,7 +749,29 @@ function M.new(deps)
       return { ok = false, error = "cannot open the pull request" }
     end
 
-    local reviewed = deps.review.review({
+    -- A review that asks for changes is not a failure: it is the next round's
+    -- work. The loop re-implements with the findings, re-runs the checks and
+    -- the convergence diff, then reviews again, up to `review.max_rounds`.
+    -- Only an exhausted bound escalates, and only a real error (a dead
+    -- reviewer, an invalid answer) ends the task before that.
+    local function fix(result)
+      local findings = type(result) == "table" and result.findings or nil
+      local moved, merr = state.transition(paths.root, task_id, "running", { phase = "implement" })
+      if not moved then
+        return { ok = false, error = merr or "cannot resume after review" }
+      end
+      log(paths, string.format("task %s: review round %s requested changes, re-implementing",
+        task_id, tostring(result and result.round or "?")))
+      local again, err = implement_and_verify(findings)
+      if not again then
+        return { ok = false, error = (err and err.error) or "fix failed" }
+      end
+      state.transition(paths.root, task_id, "verifying", { phase = "verify" })
+      state.transition(paths.root, task_id, "reviewing", { phase = "review" })
+      return true
+    end
+
+    local review_opts = {
       task = task_id,
       worktree = worktree,
       base = diff_base,
@@ -737,10 +785,26 @@ function M.new(deps)
       ctx = opts.ctx,
       session_opts = session.reviewer,
       fence = deps.fence,
-    })
-    if not reviewed.ok or not reviewed.approved then
-      return { ok = false, error = (reviewed and reviewed.error) or "review not approved", review = reviewed, pr = pr }
+      max_rounds = (cfg.review and cfg.review.max_rounds) or 3,
+      fix = fix,
+    }
+    local reviewed
+    if type(deps.review.loop) == "function" then
+      reviewed = deps.review.loop(review_opts)
+    else
+      reviewed = deps.review.review(review_opts)
     end
+    if not reviewed.ok or not reviewed.approved then
+      local reason = (reviewed and reviewed.error) or "review not approved"
+      if type(reviewed) == "table" and reviewed.escalated then
+        reason = string.format("review escalated after %s round(s)", tostring(reviewed.round or "?"))
+      end
+      return { ok = false, error = reason, review = reviewed, pr = pr }
+    end
+
+    -- The SHA the reviewer approved is the one that ships, not the first
+    -- round's: a fix round moved the branch.
+    local approved_sha = (reviewed and reviewed.sha) or impl.sha
 
     -- The review passed on the exact SHA: move the task to `pr_open` now.
     state.transition(paths.root, task_id, "pr_open", { phase = "review" })
@@ -749,7 +813,7 @@ function M.new(deps)
     -- `pr_open` with a PR a human can review and merge; on means the merger
     -- takes it the rest of the way (and redeploys when `auto_deploy` is set).
     if not (cfg.merge and cfg.merge.auto_merge) then
-      return { ok = true, task_id = task_id, sha = impl.sha, pr = pr, pr_open = true }
+      return { ok = true, task_id = task_id, sha = approved_sha, pr = pr, pr_open = true }
     end
 
     local merged, merge_err = with_merge_gate(function()
@@ -821,10 +885,10 @@ function M.new(deps)
           deployed = deployed,
         }
       end
-      return { ok = true, task_id = task_id, sha = impl.sha, pr = pr, merged = merged, deployed = deployed }
+      return { ok = true, task_id = task_id, sha = approved_sha, pr = pr, merged = merged, deployed = deployed }
     end
 
-    return { ok = true, task_id = task_id, sha = impl.sha, pr = pr, merged = merged }
+    return { ok = true, task_id = task_id, sha = approved_sha, pr = pr, merged = merged }
   end
 
   -- Drive every ready task --------------------------------------------------

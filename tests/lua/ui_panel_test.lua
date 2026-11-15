@@ -208,13 +208,31 @@ return function()
   eq(opened[1].opts.cursor_line, true, "the panel highlights the cursor row")
   eq(opened[1].opts.title, "Metronome", "the panel is titled Metronome")
   eq(type(opened[1].opts.footer), "table", "the panel has a footer")
-  eq(#opened[1].opts.footer, 8, "the footer lists every action key")
-  eq(opened[1].opts.footer[7][1], "v", "the footer offers the verbose toggle")
+  eq(#opened[1].opts.footer, 9, "the footer lists every action key")
+  eq(opened[1].opts.footer[8][1], "v", "the footer offers the verbose toggle")
   eq(opened[1].buf ~= nil, true, "the window shows the panel buffer")
   eq(#opened[1].buf.lines > 0, true, "the buffer is filled before the window opens")
   eq(#panel.rows, 4, "open loads every task")
   eq(panel.cursor, 1, "the cursor starts on the first row")
-  eq(opened[1].cursor, 1, "the window cursor starts on the first row")
+  -- The highlighted line is the selection, so it must start on the first task,
+  -- never on the bell header above it.
+  eq(opened[1].cursor, panel.row_line[1], "the window cursor starts on the first task row")
+  eq(opened[1].cursor > 1, true, "the window cursor is not on the header")
+
+  -- A task with no phase must not print a JSON null as a userdata.
+  local peek_state = {
+    tasks = {
+      T1 = { id = "T1", title = "no phase", status = "ready", phase = maki.NIL, depends_on = {} },
+    },
+  }
+  local peek_panel = panel_mod.new({
+    render = render, state = { load = function() return peek_state end }, root = "/tmp/x",
+    ui = { buf = function() return fake_buf() end, open_win = function() return fake_win() end },
+  })
+  local peek_text = panel_mod.peek_text(peek_panel, "T1")
+  eq(type(peek_text), "string", "peek_text renders a task without a phase")
+  eq(peek_text:find("userdata", 1, true), nil, "a null phase is not printed as userdata")
+  eq(peek_text:find("phase:", 1, true), nil, "a task without a phase omits the phase")
 
   -- Key bindings: the focused window must not swallow every key.
   local bound_keys = {}

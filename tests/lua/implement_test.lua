@@ -165,6 +165,20 @@ return function()
   eq(free_prompt:find("Stay inside the declared files", 1, true), nil,
     "an undeclared file set does not claim a scope it does not have")
 
+  -- A fix turn carries the reviewer's findings as the work list.
+  local fix_prompt = implement.render_prompt(task, sheet_text, ctx, {
+    feedback = {
+      { severity = "major", message = "contrast too low", path = "public/styles.css", line = 21 },
+      { severity = "minor", message = "hardcoded red" },
+    },
+  })
+  has(fix_prompt, "## Review feedback", "a fix turn has a feedback section")
+  has(fix_prompt, "[major] public/styles.css:21 — contrast too low",
+    "the finding names its severity, location and message")
+  has(fix_prompt, "[minor] hardcoded red", "a finding without a path still reads")
+  eq(prompt:find("## Review feedback", 1, true), nil,
+    "a first turn carries no feedback section")
+
   -- Prepare ------------------------------------------------------------------
 
   local prep_opts = {

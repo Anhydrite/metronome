@@ -38,6 +38,35 @@ local function ui_of(panel)
   return { buf = maki.ui.buf, open_win = maki.ui.open_win }
 end
 
+-- The panel takes 60% of the terminal, the left column 40 cells and the
+-- separator 3. Everything the right column draws must fit in what is left, or
+-- the layout silently clips the role, the branch and the tail of a PERT graph.
+local function widths_of(panel)
+  local ui = panel.deps.ui
+  local size = (type(ui) == "table" and ui.terminal_size) or maki.ui.terminal_size
+  if type(size) ~= "function" then
+    return nil, nil
+  end
+  local ok, w = pcall(size)
+  if not ok then
+    return nil, nil
+  end
+  -- `maki.ui.terminal_size()` returns `{cols, rows}`; a plain number is
+  -- accepted too so a test fake can stay one value.
+  if type(w) == "table" then
+    w = tonumber(w.cols) or tonumber(w[1])
+  end
+  if type(w) ~= "number" or w <= 0 then
+    return nil, nil
+  end
+  local panel_w = math.floor(w * 0.6)
+  local left_w = math.min(40, math.max(24, math.floor(panel_w * 0.4)))
+  -- The window width counts its two border cells, and the separator between
+  -- the columns is three cells (" │ "). Everything the right column draws must
+  -- fit in what is left, or the last character is swallowed by the border.
+  return left_w, math.max(20, panel_w - left_w - 5)
+end
+
 local function task_of(panel)
   if type(panel.deps.task) == "table" then
     return panel.deps.task
@@ -164,10 +193,13 @@ function M.refresh(panel)
   end
   local lines, rows, counts, row_lines, groups, selected
   if type(panel.render.panes) == "function" then
+    local left_width, right_width = widths_of(panel)
     lines, rows, counts, row_lines, groups, selected = panel.render.panes(state.tasks, {
       quiet = panel.quiet,
       frame = panel.frame,
       selected_intent = panel.intent_index,
+      left_width = left_width,
+      right_width = right_width,
     })
     panel.groups = groups
     if selected then
@@ -231,6 +263,7 @@ function M.open(panel)
     stack = false,
     cursor_line = true,
     footer = {
+      { "j/k", "move" },
       { "Enter", "focus" },
       { "Space", "peek" },
       { "a", "answer" },
@@ -246,7 +279,8 @@ function M.open(panel)
   -- `refresh` ran before the window existed, so the initial cursor row was
   -- never applied. Set it now that the window can take it.
   if type(panel.win.set_cursor) == "function" then
-    panel.win:set_cursor(panel.cursor)
+    local line = (panel.row_line and panel.row_line[panel.cursor]) or panel.cursor
+    panel.win:set_cursor(line)
   end
 
   if type(panel.buf.on) == "function" then
@@ -502,7 +536,9 @@ function M.peek(panel, id, opts)
     id = task.id,
     title = task.title,
     status = task.status,
-    phase = task.phase,
+    -- A missing phase replays as JSON null, which is a userdata in Lua and
+    -- would print as "userdata: 0x0".
+    phase = type(task.phase) == "string" and task.phase ~= "" and task.phase or nil,
     intent = type(task.intent) == "string" and task.intent or nil,
     origin = type(task.origin) == "string" and task.origin ~= "" and task.origin or nil,
     failure_reason = type(task.failure_reason) == "string" and task.failure_reason or nil,

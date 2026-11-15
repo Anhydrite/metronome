@@ -162,6 +162,26 @@ function M.render_prompt(task, sheet, ctx, opts)
     line("- " .. tostring(check))
   end
   line("")
+  -- A fix turn: the reviewer gated the previous commit, and these findings are
+  -- the work. They are data from an untrusted model, so they are quoted, not
+  -- obeyed as instructions.
+  local feedback = type(opts.feedback) == "table" and opts.feedback or nil
+  if feedback and #feedback > 0 then
+    line("## Review feedback")
+    line("")
+    line("The reviewer requested changes on the previous commit. Fix exactly these findings, then commit:")
+    line("")
+    for _, finding in ipairs(feedback) do
+      local severity = tostring(finding.severity or "finding")
+      local where = tostring(finding.path or "")
+      if type(finding.line) == "number" then
+        where = where .. ":" .. tostring(finding.line)
+      end
+      local message = tostring(finding.message or "")
+      line(string.format("- [%s] %s%s", severity, where ~= "" and (where .. " — ") or "", message))
+    end
+    line("")
+  end
   line("## Rules")
   line("")
   if #files > 0 then

@@ -255,6 +255,42 @@ return function()
     "a half-merged request is partial")
   eq(rs({}), "empty", "an empty request says so")
 
+  -- a task with no phase must not print a JSON null as a userdata
+  local no_phase = render.rows({ { id = "T-1", title = "t", status = "ready", phase = maki.NIL } })
+  eq(render.detail(no_phase[1], "progress"), "ready", "a null phase falls back to the status")
+  eq(render.text(render.row_line(no_phase[1], {})):find("userdata", 1, true), nil,
+    "a row never prints userdata")
+
+  -- a request blocked on a question says so, ahead of any other state
+  eq(rs({ { status = "awaiting_answers", blocked = true }, { status = "running" } }), "questions",
+    "a blocked request reads questions")
+
+  -- fit_spans: the right column is a fixed width, so a long line is cut here
+  local clipped = render.fit_spans({ { "abcdef", "dim" }, { "ghij", "ok" } }, 6)
+  local clipped_text = render.text(clipped)
+  eq(render.width_of(clipped_text) <= 6, true, "fit_spans respects the width")
+  has(clipped_text, "…", "a clipped line ends with an ellipsis")
+  eq(render.text(render.fit_spans({ { "abc", "dim" } }, 10)), "abc", "a short line is untouched")
+
+  -- A realistic long row is clipped with an ellipsis, never left to spill.
+  local long_rows = render.rows({
+    { id = "T-20261115-0201", title = "page statique /about", status = "awaiting_answers",
+      intent = "about", depends_on = {},
+      questions = { { id = "q1", text = "contenu ?" } } },
+  })
+  local long_line = render.row_line(long_rows[1], {})
+  local cut = render.fit_spans(long_line, 77)
+  local cut_text = render.text(cut)
+  eq(render.width_of(cut_text) <= 77, true, "a long row fits the right column")
+  has(cut_text, "…", "a clipped row ends with an ellipsis")
+
+  -- panes clips the right column to opts.right_width
+  local narrow = render.panes(pane_tasks, { selected_intent = 2, right_width = 18 })
+  for _, line in ipairs(narrow) do
+    eq(render.width_of(render.text(line)) <= 40 + 3 + 18, true,
+      "every pane line fits the left column, the separator and the right width")
+  end
+
   -- group_counts agrees with the word: one classification, two renderings.
   local gc = render.group_counts({
     { status = "merged" }, { status = "running" },

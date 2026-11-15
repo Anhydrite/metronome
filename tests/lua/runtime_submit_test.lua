@@ -886,4 +886,102 @@ auto_deploy = false
   eq(bad_base and bad_base.ok, false, "a base branch missing on origin is refused")
   has(tostring(bad_base and bad_base.error), "nope", "the refusal names the branch")
   eq(asked_pattern, "nope", "the branch is checked against origin")
+
+  -- A review that asks for changes is the next round's work ---------------
+  --
+  -- The runtime must call the bounded review loop with a fix callback, hand
+  -- the findings to the implementer, and ship the SHA the reviewer approved,
+  -- not the first round's.
+  local impl_calls = 0
+  local second_feedback = nil
+  local loop_opts = nil
+  local transitions = {}
+  local dispatched_review = false
+  local deps_review = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function()
+        return { tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } } }
+      end,
+      transition = function(_, id, status)
+        transitions[#transitions + 1] = status
+        return { id = id, status = status }
+      end,
+    },
+    implement = {
+      run = function(opts)
+        impl_calls = impl_calls + 1
+        if impl_calls == 2 then
+          second_feedback = opts.feedback
+        end
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "s" .. impl_calls }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = {
+      loop = function(opts)
+        loop_opts = opts
+        local first = {
+          ok = false, changes_requested = true, round = 1, sha = "s1",
+          findings = { { severity = "major", message = "contrast too low", path = "a.css", line = 21 } },
+        }
+        local fixed = opts.fix(first)
+        eq(fixed, true, "the fix callback reports success")
+        return { ok = true, approved = true, round = 2, sha = "s2" }
+      end,
+    },
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = { run = function() return { ok = true } end },
+    deploy = { run = function() return { ok = true } end },
+    pipeline = {
+      tick = function(opts)
+        if not dispatched_review then
+          dispatched_review = true
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_review = runtime.new(deps_review)
+  rt_review.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_review.run_pending()
+  eq(type(loop_opts), "table", "the runtime uses the bounded review loop")
+  eq(loop_opts and loop_opts.max_rounds, 3, "the loop gets the configured round bound")
+  eq(impl_calls, 2, "a changes_requested review triggers a second implementation turn")
+  eq(type(second_feedback), "table", "the fix turn receives the findings")
+  eq(second_feedback and second_feedback[1] and second_feedback[1].message, "contrast too low",
+    "the findings reach the implementer verbatim")
+  local saw_running = false
+  for _, status in ipairs(transitions) do
+    if status == "running" then
+      saw_running = true
+    end
+  end
+  eq(saw_running, true, "a fix round moves the task back to running")
 end

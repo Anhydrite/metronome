@@ -167,7 +167,12 @@ function M.detail(task, bucket)
     end
     return tostring(task.status or "reviewing")
   end
-  return tostring(task.phase or task.status or "waiting")
+  -- A task with no phase replays as JSON null, which is a userdata in Lua:
+  -- only a real string may reach the row.
+  if type(task.phase) == "string" and task.phase ~= "" then
+    return task.phase
+  end
+  return tostring(task.status or "waiting")
 end
 
 function M.role_for(task)
@@ -424,6 +429,7 @@ function M.rows(tasks, opts)
         spinner = M.spinner(frame),
         active = not TERMINAL[task.status],
         waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
+        blocked = #M.pending_questions(task) > 0 or task.status == "awaiting_answers",
         intent = M.request_of(task),
         depends_on = M.short_deps(task.depends_on),
         depends_on_ids = type(task.depends_on) == "table" and task.depends_on or {},
@@ -587,8 +593,9 @@ end
 -- (topological, layer by layer), and the 1-based line each row starts on.
 -- `node_line` is what lets the panel keep its cursor on a task even though a
 -- line may hold several nodes.
-function M.pert(rows)
+function M.pert(rows, opts)
   rows = rows or {}
+  opts = type(opts) == "table" and opts or {}
   local by_id = {}
   for _, row in ipairs(rows) do
     by_id[row.id] = row
@@ -697,6 +704,11 @@ function M.pert(rows)
   local NODE_W = 5
   local COL_W = 12
   local width = (max_layer + 1) * COL_W
+  -- The graph is drawn on a canvas; a graph wider than the column is clipped
+  -- here, never by the window border.
+  if type(opts.right_width) == "number" and opts.right_width > 0 then
+    width = math.min(width, opts.right_width)
+  end
   local height = math.max(next_row, 1)
   local canvas = {}
   for r = 0, height - 1 do
@@ -859,9 +871,12 @@ end
 -- not started. One classification, used by the request word and by the icons
 -- so the two can never disagree.
 function M.group_counts(rows)
-  local c = { total = 0, done = 0, running = 0, failed = 0, todo = 0 }
+  local c = { total = 0, done = 0, running = 0, failed = 0, todo = 0, blocked = 0 }
   for _, row in ipairs(rows or {}) do
     c.total = c.total + 1
+    if row.blocked then
+      c.blocked = c.blocked + 1
+    end
     local s = row.status
     if s == "merged" or s == "deployed" then
       c.done = c.done + 1
@@ -887,8 +902,11 @@ function M.request_status(rows)
   if c.total == 0 then
     return "empty", "dim"
   end
+  if c.blocked > 0 then
+    return "questions", "run"
+  end
   if c.failed > 0 then
-    return "failed", "error"
+    return "failed", "bad"
   end
   if c.running > 0 then
     return "running", "keyword"
@@ -939,6 +957,47 @@ local function display_width(s)
     end
   end
   return #s
+end
+
+-- The display width of a string, in terminal cells. Exposed so a test can
+-- assert that a rendered line fits the column it was given.
+function M.width_of(text)
+  return display_width(tostring(text or ""))
+end
+
+-- Clip a styled line to `max` display cells. The panel's right column is a
+-- fixed width, so a long status, role or branch must be cut here rather than
+-- spill over the window border.
+function M.fit_spans(spans, max)
+  if type(max) ~= "number" or max <= 0 then
+    return spans
+  end
+  local total = 0
+  for _, span in ipairs(spans or {}) do
+    total = total + display_width(tostring(span[1] or ""))
+  end
+  if total <= max then
+    return spans
+  end
+  local out = {}
+  local used = 0
+  for _, span in ipairs(spans or {}) do
+    local text = tostring(span[1] or "")
+    local w = display_width(text)
+    if used + w > max - 1 then
+      local room = max - 1 - used
+      if room > 0 then
+        -- `M.fit` already ends a cut string with an ellipsis.
+        out[#out + 1] = { M.fit(text, room), span[2] }
+      else
+        out[#out + 1] = { "…", "dim" }
+      end
+      return out
+    end
+    out[#out + 1] = span
+    used = used + w
+  end
+  return out
 end
 
 function M.fit(text, max)
@@ -1132,7 +1191,7 @@ function M.panes(tasks, opts)
 
     -- The PERT graph: the dependency schema of the request, drawn left to
     -- right with the arrows the DAG actually has.
-    local pert_lines, order = M.pert(group.rows)
+    local pert_lines, order = M.pert(group.rows, opts)
     if #pert_lines > 0 then
       right[#right + 1] = {
         spans = { { "PERT", "bold" }, { "  " .. #group.rows .. " nodes", "dim" } },
@@ -1194,7 +1253,11 @@ function M.panes(tasks, opts)
     spans[#spans + 1] = { " │ ", "dim" }
     local r = right[i]
     if r then
-      for _, span in ipairs(r.spans) do
+      local rspans = r.spans
+      if type(opts.right_width) == "number" and opts.right_width > 0 then
+        rspans = M.fit_spans(rspans, opts.right_width)
+      end
+      for _, span in ipairs(rspans) do
         spans[#spans + 1] = span
       end
     end
