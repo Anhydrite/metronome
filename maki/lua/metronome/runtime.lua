@@ -607,6 +607,7 @@ function M.new(deps)
         repo = paths.repo,
         plan_path = fs.joinpath(paths.repo, cfg.deploy.plan_file or "deploy.md"),
         runner = runner,
+        script = true,
         confirm = false,
         confirmed = true,
         session_opts = session.deployer,
@@ -729,6 +730,7 @@ function M.new(deps)
         repo = paths.repo,
         plan_path = fs.joinpath(paths.repo, cfg.deploy.plan_file or "deploy.md"),
         runner = runner,
+        script = true,
         confirm = false,
         confirmed = true,
         session_opts = session.deployer,
@@ -924,6 +926,62 @@ function M.new(deps)
       return { ok = false, error = perr }
     end
 
+    -- Fast lane. A short, unambiguous intention does not need a qualifier
+    -- session: the qualifier's only jobs here would be to restate the ask and
+    -- invent files/checks, and both are guesses the implementer can make
+    -- better once it has the worktree. Create one task with no declared files
+    -- (the implementer picks the minimal set) and the project's default checks,
+    -- then let the normal scheduler run implement -> checks -> converge ->
+    -- review -> PR -> merge. `analyze` is skipped for free: its gate only
+    -- selects `qualifying` tasks, and this task goes straight to `ready`.
+    local function short_intention(text)
+      if type(text) ~= "string" then
+        return false
+      end
+      local trimmed = text:gsub("^%s+", ""):gsub("%s+$", "")
+      if trimmed == "" or trimmed:find("?", 1, true) then
+        return false
+      end
+      -- More than one sentence is a sign the ask needs decomposing.
+      if trimmed:find("%.%s+%S") then
+        return false
+      end
+      local words = 0
+      for _ in trimmed:gmatch("%S+") do
+        words = words + 1
+      end
+      return words <= 25
+    end
+
+    -- `fast = false` explicitly forces the qualifier, which is what the
+    -- contract tests use; `fast = true` forces the fast lane; nil lets the
+    -- short-intention heuristic decide.
+    if opts.fast == true or (opts.fast ~= false and short_intention(opts.intention)) then
+      local date = os.date("!%Y%m%d")
+      local first_id = deps.qualify.next_id(deps.state.load(paths.root), date)
+      local first_hex = tonumber(first_id:match("([0-9a-f]+)$") or "", 16) or 1
+      local default_checks = (cfg.checks and cfg.checks.default) or {}
+      local applied, apply_err = deps.qualify.apply(deps.state, paths.root, {
+        ok = true,
+        tasks = { {
+          title = opts.intention,
+          intent = opts.intention,
+          files = {},
+          checks = default_checks,
+        } },
+      }, {
+        tasks_dir = paths.tasks,
+        id_factory = function(index)
+          return string.format("T-%s-%04x", date, first_hex + index - 1)
+        end,
+      })
+      if not applied then
+        return { ok = false, error = apply_err }
+      end
+      schedule_job({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
+      return { ok = true, background = true, fast = true, tasks = applied.tasks }
+    end
+
     local qualified = deps.qualify.run({
       intention = opts.intention,
       runner = runner,
@@ -1057,6 +1115,7 @@ function M.new(deps)
     local opts = {
       intention = input.intention,
       answers = input.answers,
+      fast = input.fast,
       -- Qualify through a background ctx too: the qualifier is a role session,
       -- and a role session opened with the tool's LuaCtx is cancelled with the
       -- turn. `{ session = sid }` opens it as a background session instead.

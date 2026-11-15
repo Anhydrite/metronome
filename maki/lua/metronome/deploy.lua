@@ -343,6 +343,66 @@ local function fail_task(state, root, id, err)
   return nil
 end
 
+-- Deterministic plan execution ------------------------------------------------
+
+-- A plan whose steps are fenced ```sh blocks does not need a model to run it:
+-- the blocks are the exact commands, in order. Extracting them makes the
+-- common deploy a few seconds instead of a full agent turn. A plan with no sh
+-- block falls back to the agent, which is the only way to follow prose.
+function M.plan_script(text)
+  if type(text) ~= "string" then
+    return nil, "no plan text"
+  end
+  local blocks = {}
+  for body in text:gmatch("```[sS][hH]%s*\n(.-)\n%s*```") do
+    if trim(body) ~= "" then
+      blocks[#blocks + 1] = body
+    end
+  end
+  if #blocks == 0 then
+    return nil, "plan has no sh block"
+  end
+  return table.concat(blocks, "\n"), nil
+end
+
+-- Run the extracted commands with bash, in the repository, and stop on the
+-- first non-zero exit. `set -e` makes a failed step stop the rest; the output
+-- is kept for the deploy log.
+function M.run_script(script, opts)
+  opts = type(opts) == "table" and opts or {}
+  local body = "set -e\n" .. tostring(script)
+  local args = { "bash", "-lc", body }
+  local job_opts = { cwd = opts.cwd, tail = 400 }
+  local ok_start, job, err = pcall(maki.fn.jobstart, args, job_opts)
+  if not ok_start then
+    err = job
+    job = nil
+  end
+  if not job and tostring(err):find("no active task", 1, true) then
+    job_opts.scope = "plugin"
+    local ok_retry, retry_job, retry_err = pcall(maki.fn.jobstart, args, job_opts)
+    if ok_retry then
+      job, err = retry_job, retry_err
+    else
+      job, err = nil, retry_job
+    end
+  end
+  if not job then
+    return { ok = false, error = "cannot start deploy script: " .. tostring(err) }
+  end
+  local result, werr = maki.fn.jobwait(job, opts.timeout_ms or 120000)
+  if not result then
+    return { ok = false, error = "deploy script did not finish: " .. tostring(werr) }
+  end
+  local code = type(result) == "table" and result.exit_code or result
+  local text = type(result) == "table"
+    and ((result.stdout or "") .. (result.stderr or "")) or ""
+  if code ~= 0 then
+    return { ok = false, error = "deploy script exited " .. tostring(code), text = text }
+  end
+  return { ok = true, text = text, attempts = 1, cost = 0 }
+end
+
 local function run_impl(opts)
   local state = opts.state
   local root = opts.root
@@ -394,7 +454,7 @@ local function run_impl(opts)
     return { ok = false, needs_confirmation = true, task_id = id, plan = plan }
   end
 
-  if type(opts.runner) ~= "function" then
+  if opts.script ~= true and type(opts.runner) ~= "function" then
     return { ok = false, error = "run needs a runner function", task_id = id }
   end
 
@@ -410,23 +470,30 @@ local function run_impl(opts)
   local sheet = read_sheet(task, root, opts)
   local prompt = M.prompt(task, plan, checks_text, sheet, opts)
 
-  local session_opts = type(opts.session_opts) == "table" and opts.session_opts or {}
-  local called, run = pcall(opts.runner, {
-    role = "deployer",
-    task_id = id,
-    phase = "deploy",
-    prompt = prompt,
-    system = session_opts.system,
-    model_spec = session_opts.model_spec,
-    thinking = session_opts.thinking,
-    tools = session_opts.tools,
-    state_root = opts.state_root,
-    ctx = opts.ctx,
-  })
-  if not called then
-    run = { ok = false, error = tostring(run) }
-  elseif type(run) ~= "table" then
-    run = { ok = false, error = "runner returned no result" }
+  local run
+  local script = opts.script == true and M.plan_script(plan) or nil
+  if script then
+    run = M.run_script(script, { cwd = opts.repo, timeout_ms = opts.timeout_ms })
+  else
+    local session_opts = type(opts.session_opts) == "table" and opts.session_opts or {}
+    local called
+    called, run = pcall(opts.runner, {
+      role = "deployer",
+      task_id = id,
+      phase = "deploy",
+      prompt = prompt,
+      system = session_opts.system,
+      model_spec = session_opts.model_spec,
+      thinking = session_opts.thinking,
+      tools = session_opts.tools,
+      state_root = opts.state_root,
+      ctx = opts.ctx,
+    })
+    if not called then
+      run = { ok = false, error = tostring(run) }
+    elseif type(run) ~= "table" then
+      run = { ok = false, error = "runner returned no result" }
+    end
   end
 
   if not run.ok then

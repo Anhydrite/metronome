@@ -162,6 +162,17 @@ return function()
   has(merr, "missing deploy plan", "the plan error names the problem")
   has(merr, "absent.md", "the plan error names the path")
 
+  -- plan_script: fenced sh blocks are the exact commands, in order ----------
+
+  local script, serr = deploy.plan_script(
+    "# Deploy\n\n```sh\ngit fetch origin\n```\n\nprose\n\n```sh\nnode check.js all\n```\n")
+  eq(serr, nil, "plan_script extracts fenced sh blocks: " .. tostring(serr))
+  has(script, "git fetch origin", "the first block is kept")
+  has(script, "node check.js all", "the second block is kept")
+  local no_script, nserr = deploy.plan_script("# Deploy\n\nprose only\n")
+  eq(no_script, nil, "a plan with no sh block has no script")
+  has(nserr, "no sh block", "the script error explains why")
+
   local empty_path = maki.fs.joinpath(base, "empty.md")
   maki.fs.write(empty_path, "   \n")
   local empty, eerr = deploy.plan({ plan_path = empty_path })

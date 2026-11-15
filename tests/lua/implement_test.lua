@@ -142,6 +142,18 @@ return function()
   has(prompt, "## Rules", "prompt has the rules section")
   has(prompt, "Stay inside the declared files", "prompt states the scope rule")
 
+  -- An undeclared file set is the fast lane: the implementer chooses the files.
+  local free_task = {}
+  for k, v in pairs(task) do
+    free_task[k] = v
+  end
+  free_task.files = {}
+  local free_prompt = implement.render_prompt(free_task, sheet_text, ctx, {})
+  has(free_prompt, "choose the files the change genuinely needs",
+    "prompt lets the implementer choose files when none are declared")
+  eq(free_prompt:find("Stay inside the declared files", 1, true), nil,
+    "an undeclared file set does not claim a scope it does not have")
+
   -- Prepare ------------------------------------------------------------------
 
   local prep_opts = {

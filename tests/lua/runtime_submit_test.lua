@@ -83,30 +83,50 @@ return function()
 
   local ctx = { marker = "positional" }
   captured = nil
-  local res = rt.submit({ intention = "add an icon" }, ctx)
+  local res = rt.submit({ intention = "add an icon", fast = false }, ctx)
   eq(type(res), "table", "submit returns a result table")
   eq(res and res.error, "stop after capture",
     "submit waits for qualification and returns its result")
   eq(type(captured), "table", "qualify.run was called")
   eq(captured and captured.ctx, ctx, "submit forwards the positional ctx to qualify")
 
+  -- Fast lane: a short, unambiguous intention skips the qualifier ----------
+
+  local fast_applied
+  deps.qualify.next_id = function()
+    return "T-fast"
+  end
+  deps.qualify.apply = function(_, _, result)
+    fast_applied = result
+    return { ok = true, tasks = { { id = "T-fast", title = result.tasks[1].title } } }
+  end
+  captured = nil
+  local fast = rt.submit({ intention = "add a red button" }, ctx)
+  eq(fast and fast.fast, true, "short intention uses the fast lane")
+  eq(captured, nil, "fast lane does not call the qualifier")
+  eq(fast_applied and fast_applied.tasks and #fast_applied.tasks, 1, "fast lane creates one task")
+  eq(fast_applied and fast_applied.tasks[1].files and #fast_applied.tasks[1].files, 0,
+    "fast task declares no files, the implementer chooses them")
+  eq(fast_applied and fast_applied.tasks[1].checks and #fast_applied.tasks[1].checks, 0,
+    "fast task uses the project default checks")
+
   -- wait = false returns at once with queued = true -------------------------
 
   captured = nil
-  local queued = rt.submit({ intention = "add an icon", wait = false }, ctx)
+  local queued = rt.submit({ intention = "add an icon", wait = false, fast = false }, ctx)
   eq(queued and queued.queued, true, "wait=false returns at once with queued=true")
 
   -- input.ctx fallback ------------------------------------------------------
 
   local input_ctx = { marker = "input" }
   captured = nil
-  rt.submit({ intention = "add an icon", ctx = input_ctx })
+  rt.submit({ intention = "add an icon", ctx = input_ctx, fast = false })
   eq(captured and captured.ctx, input_ctx, "submit falls back to input.ctx")
 
   -- No ctx at all must not crash -------------------------------------------
 
   captured = nil
-  local bare = rt.submit({ intention = "add an icon" })
+  local bare = rt.submit({ intention = "add an icon", fast = false })
   eq(type(bare), "table", "submit without a ctx returns a result table")
   eq(rt.last_submit and rt.last_submit.error, "stop after capture",
     "submit without a ctx still reaches the qualifier")
@@ -191,7 +211,7 @@ return function()
     deploy = {}, calibrate = {}, fence = {}, mode = {},
   }
   local rt2 = runtime.new(deps2)
-  local res2 = rt2.submit({ intention = "x" }, ctx)
+  local res2 = rt2.submit({ intention = "x", fast = false }, ctx)
   rt2.run_pending()
   eq(type(res2), "table", "submit with dependencies returns a result")
   eq(set_fields["T-2"] and set_fields["T-2"].depends_on and set_fields["T-2"].depends_on[1], "T-1",
@@ -412,7 +432,7 @@ return function()
     calibrate = {}, fence = {}, mode = {},
   }
   local rt5 = runtime.new(deps5)
-  rt5.submit({ intention = "x" }, { session = "S1" })
+  rt5.submit({ intention = "x", fast = false }, { session = "S1" })
   rt5.run_pending()
   eq(deploy_called, true, "auto_deploy redeploys right after the merge")
 
@@ -422,7 +442,7 @@ return function()
   merge_called = false
   tick_count = 0
   local rt6 = runtime.new(deps5)
-  rt6.submit({ intention = "x" }, { session = "S1" })
+  rt6.submit({ intention = "x", fast = false }, { session = "S1" })
   rt6.run_pending()
   eq(merge_called, false, "auto_merge off does not merge the pull request")
   eq(deploy_called, false, "auto_merge off does not deploy")
