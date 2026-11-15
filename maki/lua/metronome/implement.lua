@@ -41,9 +41,51 @@ function M.worktree_path(root, task_id, opts)
   return fs.joinpath(base, tostring(task_id))
 end
 
+-- Accents are folded rather than dropped so a French title keeps its words:
+-- "Tarte aux pommes à 4,5 €" becomes "tarte-aux-pommes-a-4-5", not a chain of
+-- dashes. The table is applied literally, one key at a time, so the multi-byte
+-- UTF-8 sequences are matched as they are written.
+local ACCENTS = {
+  ["à"] = "a", ["â"] = "a", ["ä"] = "a", ["á"] = "a", ["ã"] = "a", ["å"] = "a",
+  ["ç"] = "c",
+  ["é"] = "e", ["è"] = "e", ["ê"] = "e", ["ë"] = "e",
+  ["î"] = "i", ["ï"] = "i", ["í"] = "i",
+  ["ô"] = "o", ["ö"] = "o", ["ó"] = "o", ["õ"] = "o",
+  ["ù"] = "u", ["û"] = "u", ["ü"] = "u", ["ú"] = "u",
+  ["ÿ"] = "y", ["ñ"] = "n", ["œ"] = "oe", ["æ"] = "ae",
+}
+
+-- A branch name a human can read: the feature, not the ticket number. Lowercase
+-- ASCII words joined by single dashes, cut at `max_len` so the name stays
+-- short enough to type.
+function M.slug(text, max_len)
+  local s = tostring(text or ""):lower()
+  for from, to in pairs(ACCENTS) do
+    s = s:gsub(from, to)
+  end
+  s = s:gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+  local limit = tonumber(max_len) or 48
+  if #s > limit then
+    s = s:sub(1, limit):gsub("%-+$", "")
+  end
+  return s
+end
+
+-- The branch is named after the task, with the task's short id kept as a
+-- suffix: two tasks with the same title must never share a branch, and the id
+-- is what the journal, the worktree and the PR all point at.
 function M.branch_for(task_id, opts)
   opts = opts or {}
-  return (opts.branch_prefix or "metronome/") .. tostring(task_id)
+  local prefix = opts.branch_prefix or "metronome/"
+  local slug = M.slug(opts.title)
+  if slug == "" then
+    return prefix .. tostring(task_id)
+  end
+  local short = tostring(task_id):match("([0-9a-fA-F]+)$")
+  if short then
+    slug = slug .. "-" .. short
+  end
+  return prefix .. slug
 end
 
 function M.sheet_path(root, task_id, opts)
@@ -199,7 +241,11 @@ function M.prepare(opts)
   end
 
   local worktree = M.worktree_path(opts.root, task_id, opts)
-  local branch = M.branch_for(task_id, opts)
+  -- A task that already has a branch keeps it: a retry must re-attach the
+  -- branch its checkpoints and pull request point at, never invent a new one
+  -- because the title was edited.
+  local branch = is_non_empty(task.branch) and task.branch
+    or M.branch_for(task_id, { branch_prefix = opts.branch_prefix, title = task.title })
 
   local listed, lerr = opts.git.worktree_list(opts.repo)
   if not listed then
