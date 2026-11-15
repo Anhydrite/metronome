@@ -150,8 +150,27 @@ return function()
   has(g_joined, '"export CSV"', "the panel shows the intention")
   has(g_joined, '"login"', "the panel shows the other intention")
   has(g_joined, "2 tasks", "the header counts the tasks the intention produced")
-  has(g_joined, "← T-…0001", "a row shows its dependency")
   has(g_joined, "⎇ auth-core-0001", "a row shows its branch")
+  has(g_joined, "└─▶ T-…0002", "a dependent task is indented under its dependency")
+
+  -- the dependency tree is the schema --------------------------------------
+  local tree_rows = render.rows({
+    { id = "T-20261115-0101", title = "root", status = "ready", depends_on = {} },
+    { id = "T-20261115-0102", title = "child", status = "ready", depends_on = { "T-20261115-0101" } },
+    { id = "T-20261115-0103", title = "grandchild", status = "ready", depends_on = { "T-20261115-0102" } },
+    { id = "T-20261115-0104", title = "multi", status = "ready", depends_on = { "T-20261115-0101", "T-20261115-0102" } },
+  })
+  local tree = render.tree(tree_rows)
+  eq(#tree, 4, "the tree holds every row")
+  eq(tree[1].row.id, "T-20261115-0101", "the root comes first")
+  eq(tree[1].prefix, "", "the root sits at the left margin")
+  eq(tree[2].row.id, "T-20261115-0102", "the first child follows")
+  eq(tree[2].prefix, "├─▶ ", "a non-last child uses a branch")
+  eq(tree[3].row.id, "T-20261115-0103", "the grandchild follows its parent")
+  eq(tree[3].prefix, "│  └─▶ ", "a grandchild keeps the ancestor bar")
+  eq(tree[4].row.id, "T-20261115-0104", "the last child closes the branch")
+  eq(tree[4].prefix, "└─▶ ", "the last child uses the closing branch")
+  eq(tree[4].extra_deps, "T-…0102", "a second dependency is kept as an extra edge")
 
   -- an intentionless task is rendered flat, with no header
   local flat = render.lines({ task("T-20261115-0004", "legacy", "ready") })

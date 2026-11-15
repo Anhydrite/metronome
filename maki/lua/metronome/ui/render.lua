@@ -269,6 +269,7 @@ function M.rows(tasks, opts)
         waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
         intent = type(task.intent) == "string" and task.intent or "",
         depends_on = M.short_deps(task.depends_on),
+        depends_on_ids = type(task.depends_on) == "table" and task.depends_on or {},
         branch = type(task.branch) == "string" and task.branch ~= "" and task.branch or nil,
       }
     end
@@ -315,10 +316,95 @@ function M.groups(rows)
   return order
 end
 
--- The header above an intention's tasks: what the user asked, verbatim, and
--- how many tasks it produced. `total` counts every task of that intention,
--- including the finished ones the panel hides, so the split is visible even
--- when some of its tasks are done.
+-- A dependency tree for one intention's rows. A task is drawn under the first
+-- of its dependencies that is present in the group; any other dependency is
+-- kept as an extra edge on the row. Roots (no dependency in the group) start at
+-- the left margin. The result is the schema the panel shows: indentation and
+-- `├─▶`/`└─▶` say who waits for whom, in the order the work will run.
+--
+-- Returns a list of `{ row, prefix, depth, extra_deps }` in display order.
+-- `seen` guards a malformed graph: a cycle must not hang the panel.
+function M.tree(rows)
+  local by_id = {}
+  for _, row in ipairs(rows or {}) do
+    by_id[row.id] = row
+  end
+
+  local children = {}
+  local parent_of = {}
+  for _, row in ipairs(rows or {}) do
+    for _, dep in ipairs(row.depends_on_ids or {}) do
+      if by_id[dep] and dep ~= row.id then
+        parent_of[row.id] = dep
+        children[dep] = children[dep] or {}
+        children[dep][#children[dep] + 1] = row
+        break
+      end
+    end
+  end
+
+  local function order(a, b)
+    if a.urgency ~= b.urgency then
+      return a.urgency < b.urgency
+    end
+    if a.title ~= b.title then
+      return a.title < b.title
+    end
+    return a.id < b.id
+  end
+  for _, list in pairs(children) do
+    table.sort(list, order)
+  end
+
+  local roots = {}
+  for _, row in ipairs(rows or {}) do
+    if not parent_of[row.id] then
+      roots[#roots + 1] = row
+    end
+  end
+  table.sort(roots, order)
+
+  local out = {}
+  local seen = {}
+  local function walk(row, line_prefix, child_prefix, depth)
+    if seen[row.id] then
+      return
+    end
+    seen[row.id] = true
+    local extra = {}
+    for _, dep in ipairs(row.depends_on_ids or {}) do
+      if dep ~= parent_of[row.id] then
+        local short = short_dep(dep)
+        if short then
+          extra[#extra + 1] = short
+        end
+      end
+    end
+    out[#out + 1] = {
+      row = row,
+      prefix = line_prefix,
+      depth = depth,
+      extra_deps = #extra > 0 and table.concat(extra, ",") or nil,
+    }
+    local kids = children[row.id] or {}
+    for i, kid in ipairs(kids) do
+      local last = i == #kids
+      local branch = last and "└─▶ " or "├─▶ "
+      local next_child = child_prefix .. (last and "   " or "│  ")
+      walk(kid, child_prefix .. branch, next_child, depth + 1)
+    end
+  end
+  for _, root in ipairs(roots) do
+    walk(root, "", "", 0)
+  end
+  -- A cycle leaves rows unreached; draw them flat rather than hide them.
+  for _, row in ipairs(rows or {}) do
+    if not seen[row.id] then
+      walk(row, "", "", 0)
+    end
+  end
+  return out
+end
 function M.intent_line(group, opts, total)
   opts = type(opts) == "table" and opts or {}
   local text = M.fit(group.intent, opts.intent_max or 70)
@@ -424,21 +510,25 @@ function M.row_line(row, opts)
   if opts.quiet and row.bucket == "progress" and row.active then
     detail = row.spinner or M.spinner(0)
   end
-  local spans = {
-    { row.short_id, "dim" },
-    { "  " },
-    { M.fit(row.title, opts.title_max or 26) },
-    { "  " },
-    { tostring(row.status or ""), "keyword" },
-  }
+  local spans = {}
+  if row.prefix and row.prefix ~= "" then
+    spans[#spans + 1] = { row.prefix, "dim" }
+  end
+  spans[#spans + 1] = { row.short_id, "dim" }
+  spans[#spans + 1] = { "  " }
+  spans[#spans + 1] = { M.fit(row.title, opts.title_max or 26) }
+  spans[#spans + 1] = { "  " }
+  spans[#spans + 1] = { tostring(row.status or ""), "keyword" }
   if detail ~= nil and detail ~= "" and tostring(detail) ~= tostring(row.status) then
     spans[#spans + 1] = { "  " }
     spans[#spans + 1] = { detail, "dim" }
   end
   spans[#spans + 1] = { "  " }
   spans[#spans + 1] = { role, "dim" }
-  if row.depends_on then
-    spans[#spans + 1] = { "  ← " .. row.depends_on, "dim" }
+  if row.extra_deps then
+    -- The tree already draws the primary dependency; this is the other edge a
+    -- task also waits on.
+    spans[#spans + 1] = { "  ← " .. row.extra_deps, "dim" }
   end
   if row.branch then
     -- The branch is what a human checks out; the `metronome/` prefix is noise
@@ -480,7 +570,10 @@ function M.lines(tasks, opts)
       if group.intent ~= "" then
         lines[#lines + 1] = M.intent_line(group, opts, total[group.intent])
       end
-      for _, row in ipairs(group.rows) do
+      for _, entry in ipairs(M.tree(group.rows)) do
+        local row = entry.row
+        row.prefix = entry.prefix
+        row.extra_deps = entry.extra_deps
         lines[#lines + 1] = M.row_line(row, opts)
         display[#display + 1] = row
         row_lines[#display] = #lines
