@@ -133,7 +133,7 @@ function M.definitions()
     {
       name = "metronome_archive",
       description = "List the snapshots kept for deleted tasks: id, title, status, archived_at and the snapshot path.",
-      permission = "read",
+      permission = "fs_read",
       schema = { type = "object", properties = {} },
     },
     {

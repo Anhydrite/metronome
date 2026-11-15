@@ -67,6 +67,19 @@ return function()
     end
   end
 
+  -- maki refuses an unknown permission and wire() then fails, taking every
+  -- tool and /metronome down with it. Keep this list in sync with maki's
+  -- register_tool error message.
+  local valid_permissions = {
+    fs_read = true, fs_write = true, net = true, run = true, env = true,
+    agent = true, session_read = true, session_write = true,
+    session_settings = true, input = true,
+  }
+  for _, def in ipairs(defs) do
+    eq(valid_permissions[def.permission], true,
+      def.name .. " declares a permission maki accepts (" .. tostring(def.permission) .. ")")
+  end
+
   eq(required_has(map.metronome_submit.schema, "intention"), true, "submit requires intention")
   eq(required_has(map.metronome_answer.schema, "answers"), true, "answer requires answers")
   eq(required_has(map.metronome_retry.schema, "id"), true, "retry requires id")
