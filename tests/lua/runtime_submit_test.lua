@@ -1132,7 +1132,9 @@ auto_deploy = false
     merge = {
       rebase = function()
         rebase_attempts = rebase_attempts + 1
-        if rebase_attempts == 1 then
+        -- The base moves twice while the task is redone: both conflicts must be
+        -- repaired, not just the first.
+        if rebase_attempts <= 2 then
           return nil, "rebase failed (conflicts: public/styles.css)", { conflict = "public/styles.css" }
         end
         return { ok = true, sha = "rebsha" }
@@ -1165,9 +1167,9 @@ auto_deploy = false
   local rt_conflict = runtime.new(deps_conflict)
   rt_conflict.submit({ intention = "x", fast = false }, { session = "S1" })
   rt_conflict.run_pending()
-  eq(resets, 1, "a rebase conflict resets the branch to the fresh base")
-  eq(impl_attempts, 2, "the work is redone once on the fresh base")
-  eq(rebase_attempts, 2, "the rebase is retried after the reset")
+  eq(resets, 2, "each rebase conflict resets the branch to the fresh base")
+  eq(impl_attempts, 3, "the work is redone after each conflict")
+  eq(rebase_attempts, 3, "the rebase is retried after each reset")
 
   -- A task that already repaired one conflict can repair the next ----------
   --

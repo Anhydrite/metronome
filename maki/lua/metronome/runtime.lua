@@ -649,7 +649,12 @@ function M.new(deps)
     -- diff. A fix round runs exactly the same sequence, with the reviewer's
     -- findings as the prompt's work list, so a review never ends the task
     -- while rounds remain.
-    local function implement_and_verify(feedback, repaired)
+    -- Repairs are counted in the chain as well as in the journal: the base can
+    -- move more than once while the task is redone, and `task` is the table
+    -- loaded at the start of the run, so its counter never moves on its own.
+    local repairs = conflict_repairs(task)
+
+    local function implement_and_verify(feedback)
       local impl = deps.implement.run({
         task = task,
         repo = paths.repo,
@@ -691,7 +696,7 @@ function M.new(deps)
             -- That is repairable without a human: move the branch back to the
             -- fresh base and redo the work there, once. A second conflict is
             -- a real failure and goes to the user.
-            if not repaired and conflict_repairs(task) < MAX_CONFLICT_REPAIRS
+            if repairs < MAX_CONFLICT_REPAIRS
               and type(deps.git.reset_hard) == "function" then
               -- `reset_hard` takes a sha, never a ref: resolve the fresh base
               -- first, or the reset is refused and the repair silently does
@@ -702,9 +707,10 @@ function M.new(deps)
               if reset then
                 log(paths, "task " .. task_id .. " conflicted with the fresh base on "
                   .. tostring(rebase_diag.conflict) .. "; redoing it on the fresh base")
+                repairs = repairs + 1
                 pcall(state.set_fields, paths.root, task_id, {
                   conflict_retried = true,
-                  conflict_retries = conflict_repairs(task) + 1,
+                  conflict_retries = repairs,
                 })
                 pcall(state.transition, paths.root, task_id, "failed", {
                   reason = "rebase conflict on the fresh base, redoing it: "
@@ -716,7 +722,7 @@ function M.new(deps)
                 if type(deps.git.push) == "function" then
                   deps.git.push(worktree, impl.ctx.branch, { remote = "origin", force = true })
                 end
-                return implement_and_verify(feedback, true)
+                return implement_and_verify(feedback)
               end
             end
             return nil, {
