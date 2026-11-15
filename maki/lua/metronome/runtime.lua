@@ -340,7 +340,25 @@ function M.new(deps)
     if not cfg then
       return nil, table.concat(errors or { "cannot load config" }, "; ")
     end
+    -- The project is the repo the config names, never the directory the plugin
+    -- happens to be loaded in. Branches, worktrees and pull requests belong to
+    -- that repo: a Metronome session started in the plugin's own checkout must
+    -- still work on the shop.
+    local repo = cfg.project and cfg.project.repo
+    if type(repo) == "string" and repo ~= "" and repo ~= paths.repo then
+      paths = M.paths({ repo = repo, root = paths.root })
+    end
     return cfg, nil, paths
+  end
+
+  -- Paths whose `repo` is the project's, for the calls that touch git. Falls
+  -- back to the working directory when the project is not bound yet.
+  local function project_paths(opts)
+    local cfg, _, paths = load_config(opts)
+    if paths then
+      return paths, cfg
+    end
+    return p(opts), nil
   end
 
   -- The config already on disk, shaped like the init answers. An update keeps
@@ -1331,7 +1349,7 @@ function M.new(deps)
 
   function runtime.retry(input, ctx)
     input = type(input) == "table" and input or {}
-    local paths = p()
+    local paths = project_paths()
     local loaded = deps.state.load(paths.root)
     local task = loaded and loaded.tasks and loaded.tasks[input.id]
     if not task then
@@ -1396,7 +1414,7 @@ function M.new(deps)
   -- stopped task is restartable with `retry`.
   function runtime.stop(input)
     input = type(input) == "table" and input or {}
-    local paths = p()
+    local paths = project_paths()
     local loaded = deps.state.load(paths.root)
     local task = loaded and loaded.tasks and loaded.tasks[input.id]
     if not task then
@@ -1421,7 +1439,7 @@ function M.new(deps)
   end
 
   function runtime.abandon(input)
-    local paths = p()
+    local paths = project_paths()
     close_open_pr(paths, input.id)
     local moved, err = deps.state.transition(paths.root, input.id, "abandoned", { reason = "abandoned by the user" })
     if not moved then
@@ -1431,7 +1449,7 @@ function M.new(deps)
   end
 
   function runtime.delete(input)
-    local paths = p()
+    local paths = project_paths()
     if type(deps.state.delete) ~= "function" then
       return { ok = false, error = "state.delete is not wired" }
     end
@@ -1471,7 +1489,7 @@ function M.new(deps)
   }
 
   function runtime.prune(_input)
-    local paths = p()
+    local paths = project_paths()
     local cfg, cerr = load_config(nil)
     if not cfg then
       return { ok = false, error = cerr }
@@ -1544,7 +1562,7 @@ function M.new(deps)
   end
 
   function runtime.calibrate(input)
-    local paths = p()
+    local paths = project_paths()
     local result, err = deps.calibrate.run({
       repo = paths.repo,
       root = paths.root,
@@ -1561,7 +1579,7 @@ function M.new(deps)
   -- the checks or the merge/deploy policy. The agent uses this to configure
   -- Metronome itself while the mode guard blocks write/edit/bash.
   function runtime.config(input)
-    local paths = p()
+    local paths = project_paths()
     local current, current_err = current_answers(paths)
     if current_err then
       return { ok = false, error = "existing config is invalid: " .. current_err }
@@ -1673,7 +1691,7 @@ function M.new(deps)
   end
 
   function runtime.resume(_input)
-    local paths = p()
+    local paths = project_paths()
     if not fs.read(paths.config) then
       return { ok = true, resumed = {}, errors = {} }
     end

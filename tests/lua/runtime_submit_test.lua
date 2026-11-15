@@ -730,6 +730,7 @@ return function()
   eq(record.status, "merged", "the repaired task merges")
   -- Prune: an open PR or a branch whose task is dead is an orphan -----------
   local prune_closed, prune_deleted = {}, {}
+  local prune_repo = nil
   local prune_deps = {
     config = {
       load = function()
@@ -749,7 +750,8 @@ return function()
       end,
     },
     git = {
-      list_open_prs = function()
+      list_open_prs = function(opts)
+        prune_repo = opts and opts.repo
         return {
           { number = 10, head = "metronome/live", url = "u", title = "live" },
           { number = 11, head = "metronome/dead", url = "u", title = "dead" },
@@ -769,7 +771,10 @@ return function()
         return { ok = true }
       end,
     },
-    paths = function() return paths end,
+    paths = function()
+      -- The plugin is loaded in another checkout; the project is the config's.
+      return { root = paths.root, config = paths.config, repo = "/plugin/repo" }
+    end,
     spawn = function(fn) fn() end,
     wait_turn_end = false,
     runner = {}, qualify = {}, questions = {}, analyze = {}, implement = {},
@@ -779,6 +784,8 @@ return function()
   local rt11 = runtime.new(prune_deps)
   local pruned = rt11.prune({})
   eq(pruned and pruned.ok, true, "prune succeeds")
+  eq(prune_repo, "/tmp/repo",
+    "git runs on the project repo from the config, not the plugin checkout")
   eq(#pruned.closed, 1, "prune closes the PR of a dead task")
   eq(pruned.closed[1] and pruned.closed[1].number, 11, "the dead task's PR is the one closed")
   eq(#pruned.kept, 1, "prune keeps the PR of a live task")
