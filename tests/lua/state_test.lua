@@ -98,8 +98,18 @@ return function()
 
   -- delete hides a task on replay -------------------------------------------
   state.create(root, { id = "T-20261114-dead", title = "to delete" })
+  local dead_task = state.load(root).tasks["T-20261114-dead"]
+  local archive_path = state.archive(root, dead_task, { sheet = "# to delete\n" })
+  eq(type(archive_path), "string", "archive writes a snapshot")
+  local archived = state.archived(root)
+  eq(#archived, 1, "archived lists the snapshot")
+  eq(archived[1].id, "T-20261114-dead", "archived names the task")
+  eq(archived[1].title, "to delete", "archived keeps the title")
+  local snapshot = maki.json.decode(maki.fs.read(archive_path))
+  eq(snapshot and snapshot.sheet, "# to delete\n", "archive keeps the sheet text")
   eq(state.delete(root, "T-20261114-dead"), true, "delete removes a task")
   eq(state.load(root).tasks["T-20261114-dead"], nil, "deleted task is gone from load")
+  eq(#state.archived(root), 1, "the archive survives the delete")
   eq(state.delete(root, "T-20261114-dead"), nil, "deleting an unknown task fails")
 
   local moved, merr = state.transition(root, "T-20261114-a3f2", "qualifying")

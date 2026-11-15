@@ -82,6 +82,7 @@ function M.paths(root)
     journal = fs.joinpath(root, "state.jsonl"),
     projection = fs.joinpath(root, "state.json"),
     lock = fs.joinpath(root, "state.lock"),
+    archive = fs.joinpath(root, "archive"),
   }
 end
 
@@ -403,6 +404,63 @@ function M.delete(root, task_id)
     return nil, err
   end
   return true
+end
+
+-- Archive ---------------------------------------------------------------------
+
+-- A deleted task keeps a self-contained snapshot under `archive/`. The journal
+-- already records every event, but the projection hides the task and a human
+-- should not have to replay the journal to recover what it was. The snapshot
+-- carries the task record and, when the caller passes it, the sheet text.
+function M.archive(root, task, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(task) ~= "table" or type(task.id) ~= "string" or task.id == "" then
+    return nil, "archive needs a task with an id"
+  end
+  local p = M.ensure(root)
+  fs.mkdir(p.archive, { parents = true })
+  local snapshot = {
+    archived_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+    task = task,
+    sheet = type(opts.sheet) == "string" and opts.sheet or nil,
+  }
+  local path = fs.joinpath(p.archive, task.id .. ".json")
+  local ok, err = fs.write(path, json.encode(snapshot))
+  if not ok then
+    return nil, err or "cannot write archive"
+  end
+  return path
+end
+
+-- List the archived snapshots, newest first. A corrupt snapshot is skipped,
+-- not raised: an archive that cannot be read must not break the panel.
+function M.archived(root)
+  local p = M.ensure(root)
+  local entries = fs.dir(p.archive)
+  if not entries then
+    return {}
+  end
+  local list = {}
+  for _, entry in ipairs(entries) do
+    local name = entry.name or entry[1]
+    if type(name) == "string" and name:match("%.json$") then
+      local text = fs.read(fs.joinpath(p.archive, name))
+      local ok, snapshot = pcall(json.decode, text or "")
+      if ok and type(snapshot) == "table" and type(snapshot.task) == "table" then
+        list[#list + 1] = {
+          id = snapshot.task.id,
+          title = snapshot.task.title,
+          status = snapshot.task.status,
+          archived_at = snapshot.archived_at,
+          path = fs.joinpath(p.archive, name),
+        }
+      end
+    end
+  end
+  table.sort(list, function(a, b)
+    return (a.archived_at or "") > (b.archived_at or "")
+  end)
+  return list
 end
 
 function M.transition(root, task_id, to, extra)

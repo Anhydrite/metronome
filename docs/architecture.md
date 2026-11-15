@@ -27,8 +27,8 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `runtime.lua` | The production runtime the tools and commands call: paths, init, config (read and merge-update), submit, status, answer, retry, abandon, calibrate, panel, resume, feedback, mode. |
 | `mode.lua` | Persist the on/off routing flag, contribute a routing prompt hint evaluated before every run, and guard the main session from `write`/`edit`/`bash` while the mode is on. |
 | `fence.lua` | Wrap untrusted output in sentinels and escape forged sentinels. |
-| `tools.lua` | The eight agent tools, as thin adapters over an injected runtime. |
-| `commands.lua` | The thirteen `/metronome` subcommands, parsed and forwarded to the runtime. |
+| `tools.lua` | The twelve agent tools, as thin adapters over an injected runtime. |
+| `commands.lua` | The seventeen `/metronome` subcommands, parsed and forwarded to the runtime. |
 | `ui/panel.lua` | Floating panel lifecycle, key routing, peek/reply, event-driven refresh, quiet mode and its spinner loop. |
 | `ui/render.lua` | Pure attention-bell ordering, row rendering and the quiet-mode spinner. |
 
@@ -48,6 +48,7 @@ checks/<id>.json the last checks report
 runs/<id>/...    transcripts, prompts and logs per run
 review-rules.md  the calibrated review rules
 deploy.md        the deployment plan
+archive/<id>.json  snapshot of a deleted task (record + sheet)
 ```
 
 `state.jsonl` is the truth. A torn last line is dropped on replay, so a crash costs at most the event being written. `state.json` carries the event count it was built from and is trusted only when that count matches the journal.

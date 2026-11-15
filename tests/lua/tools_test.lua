@@ -17,6 +17,7 @@ return function()
     "metronome_prune",
     "metronome_stop",
     "metronome_delete",
+    "metronome_archive",
     "metronome_calibrate",
     "metronome_config",
     "metronome_panel",
@@ -42,7 +43,7 @@ return function()
 
   local defs = tools.definitions()
   eq(type(defs), "table", "definitions returns a table")
-  eq(#defs, 11, "definitions returns every spec")
+  eq(#defs, 12, "definitions returns every spec")
 
   for i, name in ipairs(NAMES) do
     eq(defs[i] and defs[i].name, name, "definition " .. i .. " is " .. name)
@@ -180,7 +181,7 @@ return function()
   local handlers = tools.handlers(runtime)
   local count = 0
   for _ in pairs(handlers) do count = count + 1 end
-  eq(count, 11, "handlers exposes every tool")
+  eq(count, 12, "handlers exposes every tool")
   for _, name in ipairs(NAMES) do
     eq(type(handlers[name]), "function", "handler exists for " .. name)
   end
@@ -198,8 +199,8 @@ return function()
   end
 
   local names = tools.register(runtime, fake_register)
-  eq(#names, 11, "register returns every name")
-  eq(#registered, 11, "register registers every spec")
+  eq(#names, 12, "register returns every name")
+  eq(#registered, 12, "register registers every spec")
   for i, name in ipairs(NAMES) do
     eq(names[i], name, "registered name " .. i .. " is " .. name)
     eq(registered[i] and registered[i].name, name, "registered spec " .. i .. " is " .. name)

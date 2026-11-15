@@ -1455,17 +1455,51 @@ function M.new(deps)
     end
     local loaded = deps.state.load(paths.root)
     local task = loaded and loaded.tasks and loaded.tasks[input.id]
-    close_open_pr(paths, input.id)
-    -- The task disappears from the panel: its branch has no reader left.
-    if task and type(task.branch) == "string" and task.branch ~= ""
-      and type(deps.git.delete_branch) == "function" then
-      pcall(deps.git.delete_branch, paths.repo, task.branch, { remote = "origin" })
+    if not task then
+      return { ok = false, error = "unknown task: " .. tostring(input.id) }
     end
+    -- Archive first: the snapshot must exist even if the journal is pruned
+    -- later, and it must not depend on the slow network cleanup below.
+    local archived = nil
+    if type(deps.state.archive) == "function" then
+      local sheet = nil
+      if is_non_empty(paths.tasks) then
+        sheet = fs.read(fs.joinpath(paths.tasks, task.id .. ".md"))
+      end
+      local path = deps.state.archive(paths.root, task, { sheet = sheet })
+      archived = path
+    end
+    -- Hide the task now. The panel reads the projection, so it updates as
+    -- soon as this returns, without waiting for GitHub.
     local ok, err = deps.state.delete(paths.root, input.id)
     if not ok then
       return { ok = false, error = err }
     end
-    return { ok = true, deleted = input.id }
+    -- The slow part is the network: closing the PR and deleting the remote
+    -- branch. It runs off the caller's turn; if it fails, the journal already
+    -- says the task is gone and `prune` repairs the leftover.
+    local branch = type(task.branch) == "string" and task.branch or nil
+    local pr = type(task.pr) == "table" and task.pr or nil
+    spawn(function()
+      if pr and pr.state == "open" and type(deps.git.pr_close) == "function" then
+        pcall(deps.git.pr_close, pr.number or pr.url, { gh = "gh" })
+      end
+      if is_non_empty(branch) and type(deps.git.delete_branch) == "function" then
+        pcall(deps.git.delete_branch, paths.repo, branch, { remote = "origin" })
+      end
+    end)
+    return { ok = true, deleted = input.id, archived = archived }
+  end
+
+  -- The archive a delete leaves behind: a self-contained snapshot per task,
+  -- readable without replaying the journal.
+  function runtime.archive(input)
+    local paths = project_paths()
+    if type(deps.state.archived) ~= "function" then
+      return { ok = false, error = "state.archived is not wired" }
+    end
+    local list = deps.state.archived(paths.root)
+    return { ok = true, archived = list, count = #list }
   end
 
   -- Reconcile GitHub with the journal: an open PR or a remote branch whose

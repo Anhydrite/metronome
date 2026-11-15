@@ -49,7 +49,8 @@ All commands are subcommands of one `/metronome` dispatcher.
 | `/metronome abandon <id>` | Archive a task. |
 | `/metronome prune` | Reconcile GitHub with the journal: close orphan PRs, delete stale branches. |
 | `/metronome stop <id>` | Cancel an in-flight task and park it as abandoned. |
-| `/metronome delete <id>` | Remove a task from the panel and status (history stays in the journal). |
+| `/metronome delete <id>` | Remove a task from the panel and status; a snapshot is kept in the archive and the slow cleanup runs in the background. |
+| `/metronome archive` | List the snapshots kept for deleted tasks. |
 | `/metronome config [key=value ...]` | Show the project configuration, or update it in place. |
 | `/metronome panel` | Open, close or toggle the live panel. |
 | `/metronome resume` | Restart tasks interrupted by a reload. |
@@ -57,7 +58,7 @@ All commands are subcommands of one `/metronome` dispatcher.
 | `/metronome on` | Natural-language routing: a plain request calls the matching tool. |
 | `/metronome off` | Turn natural-language routing off. |
 
-The same surface is exposed to the agent as eleven tools: `metronome_submit`, `metronome_status`, `metronome_answer`, `metronome_retry`, `metronome_abandon`, `metronome_prune`, `metronome_stop`, `metronome_delete`, `metronome_calibrate`, `metronome_config`, `metronome_panel`. `metronome_config` reads the config and, with `answers`, updates it in place — merged with the config on disk, so changing one model does not reset the checks or the merge/deploy policy.
+The same surface is exposed to the agent as twelve tools: `metronome_submit`, `metronome_status`, `metronome_answer`, `metronome_retry`, `metronome_abandon`, `metronome_prune`, `metronome_stop`, `metronome_delete`, `metronome_archive`, `metronome_calibrate`, `metronome_config`, `metronome_panel`. `metronome_config` reads the config and, with `answers`, updates it in place — merged with the config on disk, so changing one model does not reset the checks or the merge/deploy policy.
 
 ### Natural-language mode
 

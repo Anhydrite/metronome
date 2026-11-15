@@ -592,10 +592,47 @@ return function()
   has(tostring(idle and idle.error), "not running", "the refusal says why")
 
   -- delete: the branch goes with the task, nobody will read it ---------------
+  local archived_task = nil
+  stop_deps.state.archive = function(_, task, opts)
+    archived_task = { task = task, opts = opts }
+    return "/tmp/archive/T1.json"
+  end
+  stop_deps.state.archived = function() return { { id = "T1" } } end
   stop_status = "deployed"
   local removed = rt8.delete({ id = "T1" })
   eq(removed and removed.ok, true, "delete removes the task")
+  eq(archived_task and archived_task.task.id, "T1", "delete archives the task before hiding it")
+  eq(removed and removed.archived, "/tmp/archive/T1.json", "delete reports the archive path")
   eq(deleted_branch, "metronome/t1", "delete removes the task branch")
+
+  -- delete returns before the network cleanup: the spawn is deferred ---------
+  local deferred = nil
+  local bg_deleted, bg_closed = nil, nil
+  stop_deps.spawn = function(fn)
+    deferred = fn
+    return {}
+  end
+  stop_deps.git.delete_branch = function(_, branch)
+    bg_deleted = branch
+    return { ok = true }
+  end
+  stop_deps.git.pr_close = function(ref)
+    bg_closed = ref
+    return { closed = true }
+  end
+  local rt9 = runtime.new(stop_deps)
+  local bg_removed = rt9.delete({ id = "T1" })
+  eq(bg_removed and bg_removed.ok, true, "delete returns while the cleanup is queued")
+  eq(bg_deleted, nil, "the branch is not deleted on the caller's turn")
+  eq(bg_closed, nil, "the pull request is not closed on the caller's turn")
+  eq(type(deferred), "function", "the cleanup was handed to the spawn")
+  deferred()
+  eq(bg_deleted, "metronome/t1", "the deferred cleanup deletes the branch")
+  eq(bg_closed, 7, "the deferred cleanup closes the pull request")
+
+  local archive_list = rt9.archive({})
+  eq(archive_list and archive_list.ok, true, "archive lists the snapshots")
+  eq(archive_list and archive_list.count, 1, "archive counts the snapshots")
   -- Resume drains the queue even when nothing was active --------------------
   -- A task that was `ready` when the host died has no session to revive; it
   -- must still start, without waiting for the next submit.

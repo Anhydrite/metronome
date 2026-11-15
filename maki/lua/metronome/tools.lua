@@ -117,7 +117,7 @@ function M.definitions()
     },
     {
       name = "metronome_delete",
-      description = "Remove a task from the panel and status. The journal keeps the history; the task disappears from status and the panel.",
+      description = "Remove a task from the panel and status. A snapshot is kept in the archive; the journal keeps the history.",
       permission = "run",
       schema = {
         type = "object",
@@ -129,6 +129,12 @@ function M.definitions()
         },
         required = { "id" },
       },
+    },
+    {
+      name = "metronome_archive",
+      description = "List the snapshots kept for deleted tasks: id, title, status, archived_at and the snapshot path.",
+      permission = "read",
+      schema = { type = "object", properties = {} },
     },
     {
       name = "metronome_calibrate",

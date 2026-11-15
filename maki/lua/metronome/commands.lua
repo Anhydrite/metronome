@@ -144,10 +144,18 @@ M.COMMANDS = {
   },
   {
     name = "delete",
-    description = "Remove a task from the panel and status (the journal keeps the history).",
+    description = "Remove a task from the panel and status; a snapshot is kept in the archive.",
     usage = "/metronome delete <id>",
     build = function(rest)
       return need_id(rest, "delete")
+    end,
+  },
+  {
+    name = "archive",
+    description = "List the snapshots kept for deleted tasks.",
+    usage = "/metronome archive",
+    build = function(rest)
+      return {}
     end,
   },
   {
