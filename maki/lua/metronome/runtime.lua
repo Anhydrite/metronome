@@ -599,6 +599,9 @@ function M.new(deps)
       return { ok = false, error = "unknown task: " .. tostring(task_id) }
     end
 
+    -- The worktree is cut from origin/<base>, so the autonomous declaration and
+    -- convergence must read the diff against that same ref.
+    local diff_base = "origin/" .. cfg.project.base_ref
     local impl = deps.implement.run({
       task = task,
       repo = paths.repo,
@@ -609,6 +612,7 @@ function M.new(deps)
       tasks_dir = paths.tasks,
       remote = "origin",
       base_ref = cfg.project.base_ref,
+      diff_base = diff_base,
       runner = runner,
       session_opts = session.implementer,
       state_root = paths.runs,
@@ -639,9 +643,8 @@ function M.new(deps)
     deps.checks.write_report(paths.root, task_id, verified, {})
 
     local sheet = deps.implement.read_sheet(paths.root, task, { tasks_dir = paths.tasks })
-    -- The worktree is cut from origin/<base>, so the diff must be read against
-    -- the same ref. The local base branch is not advanced by a GitHub merge.
-    local diff_base = "origin/" .. cfg.project.base_ref
+    -- The local base branch is not advanced by a GitHub merge, so convergence
+    -- keeps comparing against `diff_base` (the ref the worktree was cut from).
     local converged = deps.converge.run({
       task = task,
       worktree = worktree,

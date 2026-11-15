@@ -546,6 +546,22 @@ return function()
   eq(table.concat(persisted["T-1"] and persisted["T-1"].files or {}, ","), "src/a.lua,src/b.lua",
     "the declaration is persisted on the task")
 
+  -- The worktree is cut from origin/<base>: when the caller knows that ref, the
+  -- declaration must be read against it, like convergence does.
+  local seen_base = nil
+  implement.declare_files({
+    task = { id = "T-1", files = {} },
+    git = {
+      changed_files = function(_, base)
+        seen_base = base
+        return { "src/a.lua" }
+      end,
+    },
+    state = fake_state,
+    root = "/root",
+  }, { task_id = "T-1", worktree = "/wt", base_ref = "main", diff_base = "origin/main" })
+  eq(seen_base, "origin/main", "the diff_base wins over the local base ref")
+
   local ignored = implement.declare_files({
     task = { id = "T-2", files = { "src/only.lua" } },
     git = fake_git,

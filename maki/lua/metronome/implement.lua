@@ -263,6 +263,9 @@ function M.prepare(opts)
     worktree = worktree,
     branch = branch,
     base_ref = base,
+    -- Optional: the ref convergence compares against (`origin/<base>`). The
+    -- autonomous declaration reads the same range.
+    diff_base = opts.diff_base,
   }
 end
 
@@ -378,7 +381,11 @@ function M.declare_files(opts, ctx)
   if type(state) ~= "table" or type(state.set_fields) ~= "function" then
     return nil
   end
-  local called, changed = pcall(git.changed_files, ctx.worktree, ctx.base_ref, { three_dot = true })
+  -- The worktree is cut from `<remote>/<base>`, so the declaration must be read
+  -- against the same ref convergence uses. `ctx.diff_base` carries it when the
+  -- caller knows it; `ctx.base_ref` is the fallback for direct callers.
+  local base = ctx.diff_base or ctx.base_ref
+  local called, changed = pcall(git.changed_files, ctx.worktree, base, { three_dot = true })
   if not called or type(changed) ~= "table" or #changed == 0 then
     return nil
   end
