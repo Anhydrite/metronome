@@ -211,26 +211,33 @@ end
 
 -- Build the row model the panel navigates. Sorting is deterministic: urgency,
 -- then title, then id, so a redraw never reorders rows under the cursor.
+--
+-- Finished tasks (merged, deployed, abandoned) are hidden by default: they
+-- need nothing from the user and only push what does off the panel. Pass
+-- `opts.show_done = true` to bring the `done` bucket back.
 function M.rows(tasks, opts)
   opts = type(opts) == "table" and opts or {}
   local frame = opts.frame or 0
+  local show_done = opts.show_done == true
   local rows = {}
   for _, task in ipairs(M.collect(tasks)) do
     local bucket = M.bucket(task)
-    rows[#rows + 1] = {
-      id = task.id,
-      short_id = M.short_id(task.id),
-      title = task.title or "",
-      status = task.status,
-      phase = task.phase,
-      bucket = bucket,
-      urgency = RANK[bucket] or RANK.progress,
-      detail = M.detail(task, bucket),
-      role = M.role_for(task),
-      spinner = M.spinner(frame),
-      active = not TERMINAL[task.status],
-      waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
-    }
+    if show_done or bucket ~= "done" then
+      rows[#rows + 1] = {
+        id = task.id,
+        short_id = M.short_id(task.id),
+        title = task.title or "",
+        status = task.status,
+        phase = task.phase,
+        bucket = bucket,
+        urgency = RANK[bucket] or RANK.progress,
+        detail = M.detail(task, bucket),
+        role = M.role_for(task),
+        spinner = M.spinner(frame),
+        active = not TERMINAL[task.status],
+        waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
+      }
+    end
   end
   table.sort(rows, function(a, b)
     if a.urgency ~= b.urgency then

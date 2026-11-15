@@ -284,20 +284,16 @@ return function()
   eq(refused_retry, nil, "r refuses a task that is not failed")
   eq(type(refused_retry_err), "string", "the refusal explains why")
 
-  -- r also revives an abandoned task ---------------------------------------
+  -- an abandoned task is finished, so the panel hides it --------------------
   tasks["T-20261114-c9d0"].status = "abandoned"
   panel_mod.refresh(panel)
-  local abandoned_index
-  for i, row in ipairs(panel.rows) do
+  local abandoned_visible = false
+  for _, row in ipairs(panel.rows) do
     if row.id == "T-20261114-c9d0" then
-      abandoned_index = i
+      abandoned_visible = true
     end
   end
-  panel_mod.select(panel, abandoned_index)
-  retried = nil
-  local revived = panel_mod.handle_key(panel, "r")
-  eq(revived and revived.action, "retry", "r revives an abandoned task")
-  eq(retried, "T-20261114-c9d0", "r retries the selected abandoned task")
+  eq(abandoned_visible, false, "an abandoned task is hidden from the panel")
   tasks["T-20261114-c9d0"].status = "ready"
   panel_mod.refresh(panel)
 

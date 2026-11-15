@@ -110,6 +110,19 @@ return function()
   eq(rows[4].waiting, true, "a ready task is marked waiting")
   eq(rows[2].waiting, false, "a failed task is not waiting")
 
+  -- finished tasks are hidden by default -----------------------------------
+
+  local with_done = {
+    task("T-20261114-e5f6", "ship it", "deployed"),
+    task("T-20261114-a7b8", "merge me", "merged"),
+    task("T-20261114-c9d0", "bump deps", "ready"),
+  }
+  local visible = render.rows(with_done)
+  eq(#visible, 1, "finished tasks are hidden by default")
+  eq(visible[1].id, "T-20261114-c9d0", "only the in-progress task remains")
+  local all = render.rows(with_done, { show_done = true })
+  eq(#all, 3, "show_done brings the done bucket back")
+
   -- counts -----------------------------------------------------------------
 
   local counts = render.counts(rows)
