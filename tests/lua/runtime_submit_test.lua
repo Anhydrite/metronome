@@ -984,4 +984,93 @@ auto_deploy = false
     end
   end
   eq(saw_running, true, "a fix round moves the task back to running")
+
+  -- A rebase before the checks rewrites the branch: it must be pushed -------
+  --
+  -- The remote would otherwise keep the pre-rebase commits while the review
+  -- reads the rebased SHA, and the next turn's push would be refused as
+  -- non-fast-forward. The push is leased, never a blind force.
+  local push_calls = {}
+  local rebase_calls = 0
+  local order = {}
+  local dispatched_rebase = false
+  local deps_rebase = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function()
+        return { tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } } }
+      end,
+      transition = function(_, id, status) return { id = id, status = status } end,
+    },
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = {
+      verify = function()
+        order[#order + 1] = "checks"
+        return { ok = true }
+      end,
+      write_report = function() end,
+    },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true, sha = "abc" } end },
+    git = {
+      pr_open = function() return { number = 1, url = "u", state = "open" } end,
+      push = function(_, branch, opts)
+        push_calls[#push_calls + 1] = { branch = branch, force = opts and opts.force }
+        order[#order + 1] = "push"
+        return true
+      end,
+    },
+    merge = {
+      rebase = function()
+        rebase_calls = rebase_calls + 1
+        return { ok = true, sha = "rebsha" }
+      end,
+      run = function() return { ok = true } end,
+    },
+    deploy = { run = function() return { ok = true } end },
+    pipeline = {
+      tick = function(opts)
+        if not dispatched_rebase then
+          dispatched_rebase = true
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_rebase = runtime.new(deps_rebase)
+  rt_rebase.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_rebase.run_pending()
+  eq(rebase_calls, 1, "the branch is rebased before the checks")
+  eq(#push_calls, 1, "the rewritten branch is pushed")
+  eq(push_calls[1] and push_calls[1].force, true, "the push leases the branch")
+  eq(push_calls[1] and push_calls[1].branch, "b", "the push names the task branch")
+  eq(order[1], "push", "the push happens before the checks")
+  eq(order[2], "checks", "the checks run on the pushed branch")
 end

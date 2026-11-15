@@ -65,6 +65,26 @@ local function first_line(text)
   return nil
 end
 
+-- `git push` writes "To <url>" first and the reason after it, so the first
+-- line alone hides why the push was refused. For a push, report the first few
+-- meaningful lines instead.
+local function detail_of(what, stderr)
+  if what ~= "push" then
+    return first_line(stderr)
+  end
+  local parts = {}
+  for line in (stderr or ""):gmatch("[^\n]+") do
+    local trimmed = line:gsub("%s+$", "")
+    if trimmed:match("%S") and not trimmed:match("^To ") then
+      parts[#parts + 1] = trimmed
+    end
+    if #parts >= 3 then
+      break
+    end
+  end
+  return #parts > 0 and table.concat(parts, " / ") or nil
+end
+
 -- Turn a failed command into a cause a caller can branch on. The causes are
 -- the four situations a task pipeline actually hits -- a stale worktree, a
 -- stale branch, a refused push, an unreachable remote -- plus auth and a
@@ -98,7 +118,8 @@ function M.classify(what, result)
       cause = "remote_missing"
       message = "the remote is not reachable"
       hint = "check the remote name/URL with `git remote -v`"
-    elseif what == "push" and (has("non-fast-forward") or has("[rejected]") or has("failed to push some refs")) then
+    elseif what == "push" and (has("non-fast-forward") or has("[rejected]")
+      or has("failed to push some refs") or has("fetch first")) then
       cause = "push_rejected"
       message = "the remote rejected the push"
       hint = "fetch and rebase the task branch, then push again"
@@ -162,7 +183,7 @@ function M.classify(what, result)
     command = result.command,
     message = message,
     hint = hint,
-    detail = first_line(stderr) or first_line(stdout) or "no output",
+    detail = detail_of(what, stderr) or first_line(stdout) or "no output",
   }
 end
 
@@ -521,12 +542,20 @@ function M.rebase(worktree, upstream)
   return M.head_sha(worktree)
 end
 
+-- Push a task branch. The pipeline owns `metronome/*` branches and rewrites
+-- them on purpose (a rebase onto the fresh base, a rollback to the last
+-- checkpoint), so a plain push is refused as non-fast-forward the moment the
+-- branch was rebased. `--force-with-lease` is the right tool: it replaces the
+-- remote branch only when the remote still holds what we last fetched, so a
+-- concurrent push by someone else is still refused instead of overwritten.
 function M.push(worktree, branch, opts)
   opts = opts or {}
-  local args = { "git", "-C", worktree, "push", "-u", opts.remote or "origin", branch }
+  local args = { "git", "-C", worktree, "push", "-u" }
   if opts.force then
     args[#args + 1] = "--force-with-lease"
   end
+  args[#args + 1] = opts.remote or "origin"
+  args[#args + 1] = branch
   local result, err = run(args)
   if not result then
     return nil, err

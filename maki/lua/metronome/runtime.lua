@@ -674,6 +674,19 @@ function M.new(deps)
           end
           return nil, { ok = false, error = "rebase before checks failed: " .. tostring(rebase_err) }
         end
+        -- A rebase rewrites the branch, so the remote still holds the old
+        -- commits: push the rewritten branch now, or the PR and the SHA the
+        -- reviewer reads would point at two different commits. The push leases
+        -- the branch, so a concurrent push is still refused rather than lost.
+        if type(deps.git.push) == "function" then
+          local pushed, push_err = deps.git.push(worktree, impl.ctx.branch, {
+            remote = "origin",
+            force = true,
+          })
+          if not pushed then
+            return nil, { ok = false, error = "push after rebase failed: " .. tostring(push_err) }
+          end
+        end
       end
 
       local checks = task.checks or cfg.checks.default

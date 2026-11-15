@@ -270,6 +270,18 @@ return function()
   eq(type(rej_err), "string", "diverged push explains itself")
   assert_diag(rej_diag, "push_rejected", "push_rejected")
   prove_failed("T-20261114-b003", rej_diag, "push_rejected")
+  -- The refusal names the reason, not only git's "To <url>" preamble.
+  has(rej_err or "", "rejected", "the push refusal reports why")
+  eq((rej_err or ""):find("^To ", 1) ~= nil, false, "the refusal is not git's preamble")
+
+  -- The pipeline rewrites its own branches (rebase onto the fresh base,
+  -- rollback to a checkpoint), so a task branch is pushed with a lease: the
+  -- same diverged push succeeds, and the remote now holds the local commit.
+  local forced, forced_err = git.push(worktree, "metronome/rejected", { force = true })
+  eq(forced, true, "a leased push replaces a rewritten branch: " .. tostring(forced_err))
+  local remote_sha_code, remote_sha = sh({ "git", "-C", remote, "rev-parse", "metronome/rejected" })
+  eq(remote_sha_code, 0, "remote branch readable")
+  eq((remote_sha:gsub("%s+$", "")), lsha, "the remote branch holds the rewritten commit")
 
   -- (d) The remote does not exist.
   local fetched_missing, fm_err, fm_diag = git.fetch(repo, "nope")

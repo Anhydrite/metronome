@@ -523,7 +523,15 @@ local function run_impl(opts)
   end
 
   if opts.push ~= false then
-    local pushed, push_err = opts.git.push(ctx.worktree, ctx.branch, { remote = opts.remote or "origin" })
+    -- The branch may already have been rebased onto the fresh base (or rolled
+    -- back to a checkpoint) by an earlier turn, which rewrites its history.
+    -- A plain push would be refused as non-fast-forward on a branch the
+    -- pipeline owns, so the push leases it: it only replaces the remote branch
+    -- when the remote still holds what we last fetched.
+    local pushed, push_err = opts.git.push(ctx.worktree, ctx.branch, {
+      remote = opts.remote or "origin",
+      force = true,
+    })
     if not pushed then
       return {
         ok = false,

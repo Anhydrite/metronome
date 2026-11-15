@@ -402,5 +402,29 @@ return function()
   eq(scode, 0, "the self-commit log is readable")
   has(sout, "feat: self commit", "the runner's commit is the head")
 
+  -- Scenario E: the branch was rewritten (a rebase onto the fresh base, a
+  -- rollback), so its history no longer descends from what origin holds. A
+  -- plain push would be refused as non-fast-forward; the turn must lease the
+  -- push and land the commit anyway.
+  local id6 = "T-20261114-e006"
+  local task6 = new_task(id6, "Rewritten branch", { "src/rw.lua" }, { "make test" })
+  sheet_for(id6, "Rewritten branch")
+  local function rewrite_runner(args)
+    local wt = maki.fs.joinpath(worktree_root, args.task_id)
+    maki.fs.write(maki.fs.joinpath(wt, "rw.lua"), "return 1\n")
+    local sha = git.commit(wt, "feat: first commit")
+    -- Rewrite the commit: same tree, different history, exactly what a rebase
+    -- onto a moved base does.
+    sh({ "git", "-C", wt, "commit", "--amend", "-q", "-m", "feat: rewritten commit" })
+    return { ok = true, text = "committed and rewrote" }
+  end
+  local result6 = implement.run(run_opts(task6, rewrite_runner))
+  eq(result6.ok, true, "a rewritten branch still pushes: " .. tostring(result6.error))
+  local wt6 = maki.fs.joinpath(worktree_root, id6)
+  local local_sha = git.head_sha(wt6)
+  local rcode6, remote_sha = sh({ "git", "-C", remote, "rev-parse", "refs/heads/metronome/rewritten-branch-e006" })
+  eq(rcode6, 0, "the rewritten branch reached the remote")
+  eq((remote_sha:gsub("%s+$", "")), local_sha, "the remote holds the rewritten commit")
+
   -- The temp dir is deliberately kept: tests/run-lua.sh validates its journal.
 end
