@@ -599,8 +599,25 @@ function M.dispatch(panel, key)
     local text, peek_err = M.peek_text(panel, action.id)
     show(panel, peek_err or text)
   elseif action.action == "answer" then
-    local text, questions_err = M.questions_text(panel)
-    show(panel, questions_err or text)
+    -- `a` must reach the user the way a background qualification does: the
+    -- agent comes back with the native question prompt. Printing the text in
+    -- the panel would show questions nobody can answer.
+    local ask = type(panel.deps.ask) == "function" and panel.deps.ask or nil
+    if ask then
+      local ok, result = pcall(ask)
+      if not ok then
+        show(panel, tostring(result))
+      elseif type(result) == "table" and result.ok == false then
+        local text, questions_err = M.questions_text(panel)
+        show(panel, questions_err or text)
+      else
+        local count = type(result) == "table" and result.asked or 0
+        show(panel, string.format("%d question(s) posée(s) dans le chat", count))
+      end
+    else
+      local text, questions_err = M.questions_text(panel)
+      show(panel, questions_err or text)
+    end
   elseif action.action == "rate" then
     local runtime = panel.deps.runtime
     if type(runtime) == "table" and type(runtime.feedback) == "function" then

@@ -60,10 +60,16 @@ M.COMMANDS = {
     description = "Create an intent from an intention and start qualification.",
     usage = "/metronome submit <intention>",
     build = function(rest)
-      if trim(rest) == "" then
+      local text = trim(rest)
+      local fast = nil
+      if text:match("^%-%-fast%s+") then
+        fast = true
+        text = trim(text:sub(7))
+      end
+      if text == "" then
         return nil, "submit needs an intention"
       end
-      return { intention = trim(rest) }
+      return { intention = text, fast = fast }
     end,
   },
   {

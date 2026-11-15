@@ -465,6 +465,26 @@ function M.new(deps)
 
   -- One task through the whole pipeline -------------------------------------
 
+  -- Two tasks merging at once would rebase onto the same base and race on the
+  -- server. A merge is short (a rebase and a squash merge), so one permit is
+  -- enough: implementation, checks and review still run in parallel.
+  local merge_gate = (type(deps.join) == "function"
+    and maki.async and type(maki.async.semaphore) == "function")
+    and maki.async.semaphore(1) or nil
+
+  local function with_merge_gate(fn)
+    if not merge_gate then
+      return fn()
+    end
+    local permit = merge_gate:acquire()
+    local ok, result = pcall(fn)
+    permit:release()
+    if not ok then
+      return nil, result
+    end
+    return result
+  end
+
   local function run_task(opts, task_id, paths, cfg, runner, session)
     local state = deps.state
     local loaded = state.load(paths.root)
@@ -577,21 +597,26 @@ function M.new(deps)
       return { ok = true, task_id = task_id, sha = impl.sha, pr = pr, pr_open = true }
     end
 
-    local merged = deps.merge.run({
-      task = task_id,
-      worktree = worktree,
-      repo = paths.repo,
-      git = deps.git,
-      state = state,
-      root = paths.root,
-      remote = "origin",
-      base = cfg.project.base_ref,
-      checks = deps.checks,
-      gh = "gh",
-      method = cfg.merge.method,
-      verify = cfg.checks.re_run_after_merge ~= false,
-      commands = checks,
-    })
+    local merged, merge_err = with_merge_gate(function()
+      return deps.merge.run({
+        task = task_id,
+        worktree = worktree,
+        repo = paths.repo,
+        git = deps.git,
+        state = state,
+        root = paths.root,
+        remote = "origin",
+        base = cfg.project.base_ref,
+        checks = deps.checks,
+        gh = "gh",
+        method = cfg.merge.method,
+        verify = cfg.checks.re_run_after_merge ~= false,
+        commands = checks,
+      })
+    end)
+    if not merged then
+      return { ok = false, error = tostring(merge_err or "merge failed") }
+    end
     if not merged.ok then
       return merged
     end
@@ -607,6 +632,7 @@ function M.new(deps)
         repo = paths.repo,
         plan_path = fs.joinpath(paths.repo, cfg.deploy.plan_file or "deploy.md"),
         runner = runner,
+        script = true,
         confirm = false,
         confirmed = true,
         session_opts = session.deployer,
@@ -678,30 +704,63 @@ function M.new(deps)
 
     local results = {}
     local deployed = false
+
+    -- `max_parallel` is the project's cap, not a hardcoded one: a queue of
+    -- independent asks must not take one full pipeline each, end to end.
+    local max_parallel = tonumber(cfg.max_parallel) or 1
+    if max_parallel < 1 then
+      max_parallel = 1
+    end
+
+    -- Run the selected tasks together, at most `max_parallel` at a time.
+    -- `deps.join` is the test seam; in maki `async.join` parks the drain until
+    -- every task of the batch has finished, so the next tick sees a clean
+    -- in-flight set.
+    local function run_batch(batch)
+      if #batch == 0 then
+        return
+      end
+      if type(deps.join) == "function" then
+        deps.join(max_parallel, batch)
+      else
+        -- No join seam (the test harness): run the batch in order. The result
+        -- is the same, only the timing differs.
+        for _, fn in ipairs(batch) do
+          fn()
+        end
+      end
+    end
+
     for _ = 1, 32 do
+      local batch = {}
       local tick = deps.pipeline.tick({
         state = deps.state,
         root = paths.root,
-        max_parallel = 1,
+        max_parallel = max_parallel,
         stall = false,
         apply = true,
         dispatch = function(task)
-          local result = run_task(opts, task.id, paths, cfg, runner, session)
-          results[#results + 1] = result
-          if not result.ok then
-            local reason = tostring(result.error or "task failed")
-            log(paths, "task " .. task.id .. " failed: " .. reason)
-            pcall(deps.state.transition, paths.root, task.id, "failed", { reason = reason })
-            notify_failure(opts.ctx, task.id, reason)
+          -- `tick` has already moved the task to `running`; the work itself is
+          -- collected and run as a batch so several tasks progress at once.
+          batch[#batch + 1] = function()
+            local result = run_task(opts, task.id, paths, cfg, runner, session)
+            results[#results + 1] = result
+            if not result.ok then
+              local reason = tostring(result.error or "task failed")
+              log(paths, "task " .. task.id .. " failed: " .. reason)
+              pcall(deps.state.transition, paths.root, task.id, "failed", { reason = reason })
+              notify_failure(opts.ctx, task.id, reason)
+            end
           end
         end,
       })
       if not tick.ok then
         return { ok = false, error = tick.error, results = results }
       end
-      if #tick.started == 0 then
+      if #batch == 0 then
         break
       end
+      run_batch(batch)
     end
 
     local loaded = deps.state.load(paths.root)
@@ -729,6 +788,7 @@ function M.new(deps)
         repo = paths.repo,
         plan_path = fs.joinpath(paths.repo, cfg.deploy.plan_file or "deploy.md"),
         runner = runner,
+        script = true,
         confirm = false,
         confirmed = true,
         session_opts = session.deployer,
@@ -822,11 +882,11 @@ function M.new(deps)
   -- A background qualification cannot block on a tool result, so it pushes the
   -- questions back into the chat: the agent relays them with the native
   -- `question` tool and answers through `metronome_answer`.
-  local function ask_in_chat(ctx, questions)
-    if not (maki.session and type(maki.session.prompt) == "function") then
-      return false
-    end
-    local sid = type(ctx) == "table" and ctx.session or ctx_session_id(ctx)
+  -- The instruction the agent receives when a round is waiting: ask it with
+  -- the native `question` tool, then hand the answers back. The panel and the
+  -- background qualifier use the same text, so a question looks the same
+  -- wherever it comes from.
+  local function questions_prompt(questions)
     local lines = {
       "Metronome a qualifié une intention et a besoin de réponses.",
       "Utilise l'outil `question` pour poser ces questions à l'utilisateur, puis appelle `metronome_answer` avec les réponses (la clé est entre parenthèses).",
@@ -834,7 +894,15 @@ function M.new(deps)
     for _, question in ipairs(questions) do
       lines[#lines + 1] = string.format("- (%s) %s", tostring(question.id), tostring(question.text))
     end
-    local ok, sent = pcall(maki.session.prompt, table.concat(lines, "\n"), { session = sid })
+    return table.concat(lines, "\n")
+  end
+
+  local function ask_in_chat(ctx, questions)
+    if not (maki.session and type(maki.session.prompt) == "function") then
+      return false
+    end
+    local sid = type(ctx) == "table" and ctx.session or ctx_session_id(ctx)
+    local ok, sent = pcall(maki.session.prompt, questions_prompt(questions), { session = sid })
     return ok and sent ~= nil
   end
 
@@ -922,6 +990,62 @@ function M.new(deps)
     local runner, session, script, perr = prepare(opts, cfg, paths)
     if not runner then
       return { ok = false, error = perr }
+    end
+
+    -- Fast lane. A short, unambiguous intention does not need a qualifier
+    -- session: the qualifier's only jobs here would be to restate the ask and
+    -- invent files/checks, and both are guesses the implementer can make
+    -- better once it has the worktree. Create one task with no declared files
+    -- (the implementer picks the minimal set) and the project's default checks,
+    -- then let the normal scheduler run implement -> checks -> converge ->
+    -- review -> PR -> merge. `analyze` is skipped for free: its gate only
+    -- selects `qualifying` tasks, and this task goes straight to `ready`.
+    local function short_intention(text)
+      if type(text) ~= "string" then
+        return false
+      end
+      local trimmed = text:gsub("^%s+", ""):gsub("%s+$", "")
+      if trimmed == "" or trimmed:find("?", 1, true) then
+        return false
+      end
+      -- More than one sentence is a sign the ask needs decomposing.
+      if trimmed:find("%.%s+%S") then
+        return false
+      end
+      local words = 0
+      for _ in trimmed:gmatch("%S+") do
+        words = words + 1
+      end
+      return words <= 25
+    end
+
+    -- `fast = false` explicitly forces the qualifier, which is what the
+    -- contract tests use; `fast = true` forces the fast lane; nil lets the
+    -- short-intention heuristic decide.
+    if opts.fast == true or (opts.fast ~= false and short_intention(opts.intention)) then
+      local date = os.date("!%Y%m%d")
+      local first_id = deps.qualify.next_id(deps.state.load(paths.root), date)
+      local first_hex = tonumber(first_id:match("([0-9a-f]+)$") or "", 16) or 1
+      local default_checks = (cfg.checks and cfg.checks.default) or {}
+      local applied, apply_err = deps.qualify.apply(deps.state, paths.root, {
+        ok = true,
+        tasks = { {
+          title = opts.intention,
+          intent = opts.intention,
+          files = {},
+          checks = default_checks,
+        } },
+      }, {
+        tasks_dir = paths.tasks,
+        id_factory = function(index)
+          return string.format("T-%s-%04x", date, first_hex + index - 1)
+        end,
+      })
+      if not applied then
+        return { ok = false, error = apply_err }
+      end
+      schedule_job({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
+      return { ok = true, background = true, fast = true, tasks = applied.tasks }
     end
 
     local qualified = deps.qualify.run({
@@ -1057,6 +1181,7 @@ function M.new(deps)
     local opts = {
       intention = input.intention,
       answers = input.answers,
+      fast = input.fast,
       -- Qualify through a background ctx too: the qualifier is a role session,
       -- and a role session opened with the tool's LuaCtx is cancelled with the
       -- turn. `{ session = sid }` opens it as a background session instead.
@@ -1262,6 +1387,33 @@ function M.new(deps)
     }
   end
 
+  -- The panel's `a`: push the pending round into the chat exactly as a
+  -- background qualification would, so the agent comes back to the user with
+  -- the native question prompt instead of the panel printing text nobody can
+  -- answer.
+  function runtime.ask_questions(_input, ctx)
+    local paths = p()
+    local round = deps.questions.round(deps.state, paths.root)
+    local questions = (round and round.questions) or {}
+    if #questions == 0 then
+      return { ok = false, error = "no pending questions" }
+    end
+    local sid = type(ctx) == "table" and ctx.session or ctx_session_id(ctx)
+    if not sid and maki.session and type(maki.session.current) == "function" then
+      local ok, current = pcall(maki.session.current)
+      if ok then
+        sid = current
+      end
+    end
+    if not sid then
+      return { ok = false, error = "no session to ask in" }
+    end
+    if not ask_in_chat({ session = sid }, questions) then
+      return { ok = false, error = "cannot reach the chat session" }
+    end
+    return { ok = true, asked = #questions, session = sid }
+  end
+
   function runtime.panel(input)
     local paths = p()
     local render = deps.ui_render
@@ -1275,6 +1427,9 @@ function M.new(deps)
         state = deps.state,
         root = paths.root,
         runtime = runtime,
+        ask = function()
+          return runtime.ask_questions({}, nil)
+        end,
       })
       if not made then
         return { ok = false, error = err }

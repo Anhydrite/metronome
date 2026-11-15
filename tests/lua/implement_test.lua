@@ -96,6 +96,17 @@ return function()
   eq(implement.branch_for(id), "metronome/" .. id, "branch_for uses the default prefix")
   eq(implement.branch_for(id, { branch_prefix = "task/" }), "task/" .. id,
     "branch_for honours branch_prefix")
+
+  -- Branch names say what the feature is, not just which ticket it is.
+  eq(implement.branch_for(id, { title = "Add feature flag" }),
+    "metronome/add-feature-flag-e001", "branch_for slugs the title and keeps the short id")
+  eq(implement.branch_for(id, { title = "Tarte aux pommes à 4,5 €" }),
+    "metronome/tarte-aux-pommes-a-4-5-e001", "branch_for folds accents and punctuation")
+  eq(implement.branch_for(id, { title = "  " }), "metronome/" .. id,
+    "an empty title falls back to the id")
+  eq(#implement.slug("un titre vraiment tres long qui depasse la limite de longueur autorisee"), 48,
+    "slug cuts at the limit")
+  eq(implement.slug("a--b__c"), "a-b-c", "slug collapses separators")
   eq(implement.sheet_path(root, id), maki.fs.joinpath(root, "tasks", id .. ".md"),
     "sheet_path defaults under root")
   eq(implement.sheet_path(root, id, { tasks_dir = tasks_dir }),
@@ -142,6 +153,18 @@ return function()
   has(prompt, "## Rules", "prompt has the rules section")
   has(prompt, "Stay inside the declared files", "prompt states the scope rule")
 
+  -- An undeclared file set is the fast lane: the implementer chooses the files.
+  local free_task = {}
+  for k, v in pairs(task) do
+    free_task[k] = v
+  end
+  free_task.files = {}
+  local free_prompt = implement.render_prompt(free_task, sheet_text, ctx, {})
+  has(free_prompt, "choose the files the change genuinely needs",
+    "prompt lets the implementer choose files when none are declared")
+  eq(free_prompt:find("Stay inside the declared files", 1, true), nil,
+    "an undeclared file set does not claim a scope it does not have")
+
   -- Prepare ------------------------------------------------------------------
 
   local prep_opts = {
@@ -161,15 +184,15 @@ return function()
   eq(ctx1 and ctx1.task_id, id, "prepare returns the task id")
   eq(ctx1 and ctx1.repo, repo, "prepare returns the repo")
   eq(ctx1 and ctx1.worktree, maki.fs.joinpath(worktree_root, id), "prepare returns the worktree")
-  eq(ctx1 and ctx1.branch, "metronome/" .. id, "prepare returns the branch")
+  eq(ctx1 and ctx1.branch, "metronome/add-feature-flag-e001", "prepare names the branch after the feature")
   eq(ctx1 and ctx1.base_ref, "main", "prepare returns the base")
 
   local loaded = state.load(root).tasks[id]
   eq(loaded and loaded.status, "running", "prepare moves the task to running")
-  eq(loaded and loaded.branch, "metronome/" .. id, "prepare stores the branch")
+  eq(loaded and loaded.branch, "metronome/add-feature-flag-e001", "prepare stores the branch")
   eq(loaded and loaded.worktree, maki.fs.joinpath(worktree_root, id), "prepare stores the worktree")
   eq(loaded and loaded.base_ref, "main", "prepare stores the base")
-  eq(git.current_branch(ctx1.worktree), "metronome/" .. id, "the worktree is on the task branch")
+  eq(git.current_branch(ctx1.worktree), "metronome/add-feature-flag-e001", "the worktree is on the task branch")
 
   local ctx2, perr2 = implement.prepare(prep_opts)
   eq(perr2, nil, "second prepare has no error: " .. tostring(perr2))
@@ -189,7 +212,7 @@ return function()
   local ctx3, perr3 = implement.prepare(prep_opts)
   eq(perr3, nil, "prepare re-attaches the existing branch: " .. tostring(perr3))
   eq(ctx3 and ctx3.worktree, ctx1.worktree, "re-attached worktree has the same path")
-  eq(git.current_branch(ctx3.worktree), "metronome/" .. id,
+  eq(git.current_branch(ctx3.worktree), "metronome/add-feature-flag-e001",
     "re-attached worktree is on the existing branch")
 
   -- A checkout deleted behind git's back (a reset state root, a crashed run)
@@ -200,7 +223,7 @@ return function()
   eq(perr4, nil, "prepare prunes a stale worktree registration: " .. tostring(perr4))
   eq(ctx4 and maki.fs.metadata(ctx4.worktree) ~= nil, true,
     "prepare recreates the worktree directory")
-  eq(ctx4 and git.current_branch(ctx4.worktree), "metronome/" .. id,
+  eq(ctx4 and git.current_branch(ctx4.worktree), "metronome/add-feature-flag-e001",
     "the recreated worktree is on the task branch")
 
   -- Checkpoints --------------------------------------------------------------
@@ -298,7 +321,7 @@ return function()
   eq(lcode, 0, "the worktree head is readable")
   has(lout, "widget_1.lua", "the runner's file is committed")
 
-  local rcode, rout = sh({ "git", "-C", remote, "rev-parse", "--verify", "refs/heads/metronome/" .. id2 })
+  local rcode, rout = sh({ "git", "-C", remote, "rev-parse", "--verify", "refs/heads/metronome/add-widget-e002" })
   eq(rcode, 0, "the task branch is on the bare remote: " .. rout:sub(1, 80))
 
   local result1b = implement.run(run_opts(task2, writing_runner))
@@ -339,7 +362,7 @@ return function()
   eq(result4.run and result4.run.ok, false, "the runner result is returned")
   local wt4 = maki.fs.joinpath(worktree_root, id4)
   eq(git.head_sha(wt4), result4.checkpoint, "a failed turn does not commit")
-  local fcode = sh({ "git", "-C", remote, "rev-parse", "--verify", "refs/heads/metronome/" .. id4 })
+  local fcode = sh({ "git", "-C", remote, "rev-parse", "--verify", "refs/heads/metronome/failing-task-e004" })
   eq(fcode ~= 0, true, "a failed turn does not push")
 
   -- Scenario D: the runner commits by itself.
