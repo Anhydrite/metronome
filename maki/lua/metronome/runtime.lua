@@ -691,6 +691,31 @@ function M.new(deps)
     return runner, session, script
   end
 
+  -- Run `fn` off the caller's turn. `deps.spawn` is the test seam; in maki a
+  -- background task is what lets submit return before qualification ends.
+  local function spawn(fn)
+    if type(deps.spawn) == "function" then
+      return deps.spawn(fn)
+    end
+    -- `maki.async.spawn` lives as long as the plugin; `maki.async.run` is tied
+    -- to the caller's task and is cancelled when the tool handler returns, so
+    -- the role session it opened dies at once. Use spawn.
+    if maki.async and type(maki.async.spawn) == "function" then
+      return maki.async.spawn(fn)
+    end
+    if maki.async and type(maki.async.run) == "function" then
+      return maki.async.run(fn)
+    end
+    return fn()
+  end
+
+  -- Scheduler state. Declared here, before `after_questions`, so the drain and
+  -- a task finishing in its own spawn share the same upvalues.
+  local scheduler_running = false
+  local scheduler_dirty = false
+  local scheduler_job = nil
+  local scheduler_extra = {}
+
   -- The part of a run that follows qualification: the analysis gate, the
   -- scheduler loop and the optional deploy. `submit` reaches it after applying
   -- the qualified tasks; `answer` reaches it after the pending questions are
@@ -713,55 +738,57 @@ function M.new(deps)
       max_parallel = 1
     end
 
-    -- Run the selected tasks together, at most `max_parallel` at a time.
-    -- `deps.join` is the test seam; in maki `async.join` parks the drain until
-    -- every task of the batch has finished, so the next tick sees a clean
-    -- in-flight set.
-    local function run_batch(batch)
-      if #batch == 0 then
-        return
-      end
-      if type(deps.join) == "function" then
-        deps.join(max_parallel, batch)
-      else
-        -- No join seam (the test harness): run the batch in order. The result
-        -- is the same, only the timing differs.
-        for _, fn in ipairs(batch) do
-          fn()
+    -- Each selected task runs in its own plugin-lifetime spawn. A batch held
+    -- by `async.join` lives in the drain's scope, and maki kills the live jobs
+    -- of a scope when it ends: the sessions died mid-review. A spawn outlives
+    -- the drain, and a finished task re-triggers the drain to refill the slots.
+    local function dispatch_one(task)
+      local fn = function()
+        local result = run_task(opts, task.id, paths, cfg, runner, session)
+        results[#results + 1] = result
+        if not result.ok then
+          local reason = tostring(result.error or "task failed")
+          log(paths, "task " .. task.id .. " failed: " .. reason)
+          pcall(deps.state.transition, paths.root, task.id, "failed", { reason = reason })
+          notify_failure(opts.ctx, task.id, reason)
         end
+        -- A slot just freed: another ready task may start now.
+        scheduler_dirty = true
+        if deps.async then
+          spawn(function()
+            pcall(runtime.run_pending)
+          end)
+        end
+      end
+      if deps.async then
+        spawn(fn)
+      else
+        fn()
       end
     end
 
     for _ = 1, 32 do
-      local batch = {}
       local tick = deps.pipeline.tick({
         state = deps.state,
         root = paths.root,
         max_parallel = max_parallel,
         stall = false,
         apply = true,
-        dispatch = function(task)
-          -- `tick` has already moved the task to `running`; the work itself is
-          -- collected and run as a batch so several tasks progress at once.
-          batch[#batch + 1] = function()
-            local result = run_task(opts, task.id, paths, cfg, runner, session)
-            results[#results + 1] = result
-            if not result.ok then
-              local reason = tostring(result.error or "task failed")
-              log(paths, "task " .. task.id .. " failed: " .. reason)
-              pcall(deps.state.transition, paths.root, task.id, "failed", { reason = reason })
-              notify_failure(opts.ctx, task.id, reason)
-            end
-          end
-        end,
+        dispatch = dispatch_one,
       })
       if not tick.ok then
         return { ok = false, error = tick.error, results = results }
       end
-      if #batch == 0 then
+      if #tick.started == 0 then
         break
       end
-      run_batch(batch)
+    end
+
+    -- An async drain returns while its tasks are still running: the pending
+    -- check and the final deploy belong to the synchronous path (the scripted
+    -- e2e driver), where every task has already finished by now.
+    if deps.async then
+      return { ok = true, results = results, background = true }
     end
 
     local loaded = deps.state.load(paths.root)
@@ -810,11 +837,6 @@ function M.new(deps)
   -- tasks are qualified. A top-level spawn loop (started by init.lua) polls
   -- `has_pending` and calls `run_pending`, so role sessions are opened from a
   -- true background task, not from a tool handler or an autocmd callback.
-  local scheduler_running = false
-  local scheduler_dirty = false
-  local scheduler_job = nil
-  local scheduler_extra = {}
-
   local function ctx_session_id(ctx)
     if ctx == nil then
       return nil
@@ -860,24 +882,6 @@ function M.new(deps)
       maki.log.info("metronome background_ctx in=" .. type(ctx) .. " sid=nil")
     end)
     return ctx
-  end
-
-  -- Run `fn` off the caller's turn. `deps.spawn` is the test seam; in maki a
-  -- background task is what lets submit return before qualification ends.
-  local function spawn(fn)
-    if type(deps.spawn) == "function" then
-      return deps.spawn(fn)
-    end
-    -- `maki.async.spawn` lives as long as the plugin; `maki.async.run` is tied
-    -- to the caller's task and is cancelled when the tool handler returns, so
-    -- the role session it opened dies at once. Use spawn.
-    if maki.async and type(maki.async.spawn) == "function" then
-      return maki.async.spawn(fn)
-    end
-    if maki.async and type(maki.async.run) == "function" then
-      return maki.async.run(fn)
-    end
-    return fn()
   end
 
   -- A background qualification cannot block on a tool result, so it pushes the
