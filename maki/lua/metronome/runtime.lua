@@ -628,7 +628,7 @@ function M.new(deps)
     -- diff. A fix round runs exactly the same sequence, with the reviewer's
     -- findings as the prompt's work list, so a review never ends the task
     -- while rounds remain.
-    local function implement_and_verify(feedback)
+    local function implement_and_verify(feedback, repaired)
       local impl = deps.implement.run({
         task = task,
         repo = paths.repo,
@@ -666,6 +666,30 @@ function M.new(deps)
         })
         if not rebased then
           if type(rebase_diag) == "table" and rebase_diag.conflict then
+            -- The base moved under the branch and the same lines changed.
+            -- That is repairable without a human: move the branch back to the
+            -- fresh base and redo the work there, once. A second conflict is
+            -- a real failure and goes to the user.
+            if not repaired and not task.conflict_retried
+              and type(deps.git.reset_hard) == "function" then
+              local reset = deps.git.reset_hard(worktree, "origin/" .. cfg.project.base_ref)
+              if reset then
+                log(paths, "task " .. task_id .. " conflicted with the fresh base on "
+                  .. tostring(rebase_diag.conflict) .. "; redoing it on the fresh base")
+                pcall(state.set_fields, paths.root, task_id, { conflict_retried = true })
+                pcall(state.transition, paths.root, task_id, "failed", {
+                  reason = "rebase conflict on the fresh base, redoing it: "
+                    .. tostring(rebase_err),
+                })
+                pcall(state.transition, paths.root, task_id, "running", { phase = "implement" })
+                -- The reset rewrote the branch: lease the push so the PR shows
+                -- the commit the next turn will build on.
+                if type(deps.git.push) == "function" then
+                  deps.git.push(worktree, impl.ctx.branch, { remote = "origin", force = true })
+                end
+                return implement_and_verify(feedback, true)
+              end
+            end
             return nil, {
               ok = false,
               conflict = true,

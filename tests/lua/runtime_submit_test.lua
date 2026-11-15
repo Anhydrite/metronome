@@ -1073,4 +1073,91 @@ auto_deploy = false
   eq(push_calls[1] and push_calls[1].branch, "b", "the push names the task branch")
   eq(order[1], "push", "the push happens before the checks")
   eq(order[2], "checks", "the checks run on the pushed branch")
+
+  -- A rebase conflict on the fresh base is repaired, not fatal -------------
+  --
+  -- The base moved and the same lines changed. The branch is reset to the
+  -- fresh base and the work is redone there, once; the second conflict is a
+  -- real failure.
+  local rebase_attempts = 0
+  local impl_attempts = 0
+  local resets = 0
+  local dispatched_conflict = false
+  local deps_conflict = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function()
+        return { tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } } }
+      end,
+      transition = function(_, id, status) return { id = id, status = status } end,
+      set_fields = function() return true end,
+    },
+    implement = {
+      run = function()
+        impl_attempts = impl_attempts + 1
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "s" .. impl_attempts }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true, sha = "s2" } end },
+    git = {
+      pr_open = function() return { number = 1, url = "u", state = "open" } end,
+      push = function() return true end,
+      reset_hard = function()
+        resets = resets + 1
+        return "sha"
+      end,
+    },
+    merge = {
+      rebase = function()
+        rebase_attempts = rebase_attempts + 1
+        if rebase_attempts == 1 then
+          return nil, "rebase failed (conflicts: public/styles.css)", { conflict = "public/styles.css" }
+        end
+        return { ok = true, sha = "rebsha" }
+      end,
+      run = function() return { ok = true } end,
+    },
+    deploy = { run = function() return { ok = true } end },
+    pipeline = {
+      tick = function(opts)
+        if not dispatched_conflict then
+          dispatched_conflict = true
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_conflict = runtime.new(deps_conflict)
+  rt_conflict.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_conflict.run_pending()
+  eq(resets, 1, "a rebase conflict resets the branch to the fresh base")
+  eq(impl_attempts, 2, "the work is redone once on the fresh base")
+  eq(rebase_attempts, 2, "the rebase is retried after the reset")
 end
