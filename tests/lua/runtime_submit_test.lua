@@ -110,6 +110,21 @@ return function()
   eq(fast_applied and fast_applied.tasks[1].checks and #fast_applied.tasks[1].checks, 0,
     "fast task uses the project default checks")
 
+  -- complexity: the caller's judgement overrides the wording heuristic ------
+  captured = nil
+  local forced_full = rt.submit({ intention = "add a red button", complexity = "full" }, ctx)
+  eq(type(captured), "table", "complexity=full calls the qualifier")
+  eq(forced_full and forced_full.fast, nil, "complexity=full does not take the fast lane")
+
+  captured = nil
+  local forced_fast = rt.submit({ intention = "redesign the whole checkout flow. also rework the cart", complexity = "fast" }, ctx)
+  eq(captured, nil, "complexity=fast skips the qualifier even for a long intention")
+  eq(forced_fast and forced_fast.fast, true, "complexity=fast takes the fast lane")
+
+  local bad = rt.submit({ intention = "x", complexity = "weird" }, ctx)
+  eq(bad and bad.ok, false, "an unknown complexity is refused")
+  has(tostring(bad and bad.error), "unknown complexity", "the refusal names the problem")
+
   -- wait = false returns at once with queued = true -------------------------
 
   captured = nil
@@ -525,18 +540,23 @@ return function()
   local cancelled = 0
   local stop_status = "running"
   local stop_transition = nil
+  local closed_pr = nil
+  local deleted_branch = nil
   local stop_deps = {
     config = { load = function() return { project = { repo = "/tmp/repo", base_ref = "main" } } end },
     roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
     state = {
       load = function()
-        return { tasks = { T1 = { id = "T1", status = stop_status } } }
+        return { tasks = { T1 = { id = "T1", status = stop_status, branch = "metronome/t1",
+          pr = { number = 7, url = "u", state = "open" } } } }
       end,
       transition = function(_, id, status, extra)
         stop_status = status
         stop_transition = { id = id, status = status, extra = extra }
         return { id = id, status = status }
       end,
+      set_fields = function() return true end,
+      delete = function() return true end,
     },
     paths = function() return paths end,
     spawn = function(fn)
@@ -547,7 +567,17 @@ return function()
     wait_turn_end = false,
     qualify = {}, questions = {}, analyze = {}, checks = {}, converge = {},
     review = {}, merge = {}, deploy = {}, calibrate = {}, pipeline = {},
-    fence = {}, mode = {}, git = {}, implement = {}, runner = {},
+    fence = {}, mode = {}, implement = {}, runner = {},
+    git = {
+      pr_close = function(ref)
+        closed_pr = ref
+        return { closed = true }
+      end,
+      delete_branch = function(_, branch)
+        deleted_branch = branch
+        return { ok = true }
+      end,
+    },
   }
   local rt8 = runtime.new(stop_deps)
   local stopped = rt8.stop({ id = "T1" })
@@ -555,8 +585,147 @@ return function()
   eq(stop_transition and stop_transition.status, "abandoned", "stop parks the task as abandoned")
   eq(stop_transition and stop_transition.extra.reason, "stopped by the user",
     "stop records why in the journal")
+  eq(closed_pr, 7, "stop closes the open pull request")
 
   local idle = rt8.stop({ id = "T1" })
   eq(idle and idle.ok, false, "a task that is not running cannot be stopped")
   has(tostring(idle and idle.error), "not running", "the refusal says why")
+
+  -- delete: the branch goes with the task, nobody will read it ---------------
+  stop_status = "deployed"
+  local removed = rt8.delete({ id = "T1" })
+  eq(removed and removed.ok, true, "delete removes the task")
+  eq(deleted_branch, "metronome/t1", "delete removes the task branch")
+  -- Resume drains the queue even when nothing was active --------------------
+  -- A task that was `ready` when the host died has no session to revive; it
+  -- must still start, without waiting for the next submit.
+  local ticked = false
+  local resume_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 2 },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = true },
+          deploy = { auto_deploy = false, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function() return { tasks = { T1 = { id = "T1", status = "ready", title = "t" } } } end,
+      transition = function(_, id, status) return { id = id, status = status } end,
+    },
+    pipeline = {
+      resume = function() return { ok = true, resumed = {}, errors = {} } end,
+      tick = function(opts)
+        ticked = true
+        opts.dispatch({ id = "T1" })
+        return { ok = true, started = { "T1" } }
+      end,
+    },
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true } end },
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = { run = function() return { ok = true } end },
+    deploy = { run = function() return { ok = true } end },
+    analyze = { gate = function() return { ok = true } end },
+    questions = { round = function() return { questions = {} } end },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {}, qualify = {}, calibrate = {}, fence = {}, mode = {},
+  }
+  local rt9 = runtime.new(resume_deps)
+  local resumed_ok = rt9.resume()
+  eq(resumed_ok and resumed_ok.ok, true, "resume succeeds with only a queued task")
+  eq(ticked, true, "resume drains the queue even when no task was active")
+  -- Merge conflict: the branch goes back to the fresh base and the work is
+  -- redone once, without a human ------------------------------------------
+  local record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
+  local resets = 0
+  local merge_calls = 0
+  local conflict_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 1 },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = true },
+          deploy = { auto_deploy = false, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function() return { tasks = { T1 = record } } end,
+      transition = function(_, id, status) record.status = status; return { id = id, status = status } end,
+      set_fields = function(_, _, fields)
+        for k, v in pairs(fields or {}) do record[k] = v end
+        return true
+      end,
+    },
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true } end },
+    git = {
+      pr_open = function() return { number = 1, url = "u", state = "open" } end,
+      reset_hard = function(_, ref)
+        resets = resets + 1
+        eq(ref, "origin/main", "the branch is reset to the fresh base")
+        return "sha"
+      end,
+    },
+    merge = {
+      run = function()
+        merge_calls = merge_calls + 1
+        if merge_calls == 1 then
+          return { ok = false, conflict = true, conflict_files = "routes/products.js",
+            error = "rebase failed (conflicts: routes/products.js)" }
+        end
+        record.status = "merged"
+        return { ok = true }
+      end,
+    },
+    deploy = { run = function() return { ok = true } end },
+    pipeline = {
+      tick = function(opts)
+        if ticks == 0 then
+          ticks = 1
+          opts.dispatch({ id = "T1" })
+          return { ok = true, started = { "T1" } }
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = {} } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  ticks = 0
+  local rt10 = runtime.new(conflict_deps)
+  rt10.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt10.run_pending()
+  eq(resets, 1, "a conflict resets the branch to the fresh base once")
+  eq(merge_calls, 2, "the merge is attempted again after the repair")
+  eq(record.conflict_retried, true, "the repair is recorded on the task")
+  eq(record.status, "merged", "the repaired task merges")
 end

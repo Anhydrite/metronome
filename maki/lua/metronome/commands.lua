@@ -58,18 +58,19 @@ M.COMMANDS = {
   {
     name = "submit",
     description = "Create an intent from an intention and start qualification.",
-    usage = "/metronome submit <intention>",
+    usage = "/metronome submit [--fast|--full|--auto] <intention>",
     build = function(rest)
       local text = trim(rest)
-      local fast = nil
-      if text:match("^%-%-fast%s+") then
-        fast = true
-        text = trim(text:sub(7))
+      local complexity = nil
+      local flag = text:match("^%-%-([%a]+)%s+")
+      if flag == "fast" or flag == "full" or flag == "auto" then
+        complexity = flag
+        text = trim(text:sub(#flag + 3))
       end
       if text == "" then
         return nil, "submit needs an intention"
       end
-      return { intention = text, fast = fast }
+      return { intention = text, complexity = complexity }
     end,
   },
   {

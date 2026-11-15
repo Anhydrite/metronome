@@ -181,13 +181,16 @@ return function()
   advance_main("README.md", "# main edit\n")
 
   local before_conflict = git.head_sha(wt2)
-  local conf, conferr = merge.rebase({
+  local conf, conferr, confinfo = merge.rebase({
     git = git, repo = repo, worktree = wt2, base = "main", remote = "origin",
   })
   eq(conf, nil, "conflicting rebase refused")
   eq(type(conferr), "string", "conflict explains itself")
   has(conferr, "conflict", "conflict message names the conflict")
   has(conferr, "README.md", "conflict names the file")
+  eq(type(confinfo), "table", "the conflict is reported as a repairable state")
+  eq(confinfo and confinfo.conflict and confinfo.conflict[1], "README.md",
+    "the conflicting file is named for the repair")
 
   local scode, sout = sh({ "git", "-C", wt2, "status", "--porcelain" })
   eq(scode, 0, "status ran after the abort")

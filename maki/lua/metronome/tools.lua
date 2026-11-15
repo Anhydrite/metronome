@@ -25,6 +25,11 @@ function M.definitions()
             type = "string",
             description = "The intention to deliver, captured verbatim.",
           },
+          complexity = {
+            type = "string",
+            enum = { "auto", "fast", "full" },
+            description = "Your judgement of the work. `fast`: one obvious change in one place, no qualifier needed. `full`: several files, a design choice, or an ambiguous ask. `auto` (default): let Metronome decide from the wording. If you are unsure, ask the user with the `question` tool before submitting.",
+          },
         },
         required = { "intention" },
       },

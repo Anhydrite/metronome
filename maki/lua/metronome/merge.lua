@@ -106,9 +106,11 @@ function M.rebase(opts)
     return nil, ferr
   end
 
-  local sha, rerr = git.rebase(opts.worktree, upstream)
+  local sha, rerr, info = git.rebase(opts.worktree, upstream)
   if not sha then
-    return nil, rerr
+    -- A conflict is not a generic failure: the caller can repair it by moving
+    -- the branch back to the fresh base and redoing the work there.
+    return nil, rerr, { conflict = info and info.conflict or nil }
   end
 
   return { ok = true, base = upstream, sha = sha }
@@ -368,7 +370,7 @@ local function run_impl(opts)
   local remote = is_non_empty(opts.remote) and opts.remote or "origin"
 
   -- Rebase onto the fresh base.
-  local rebase, rerr = M.rebase({
+  local rebase, rerr, rinfo = M.rebase({
     git = git,
     repo = opts.repo,
     worktree = worktree,
@@ -377,8 +379,15 @@ local function run_impl(opts)
     auto_rebase = opts.auto_rebase,
   })
   if not rebase then
+    local conflict = rinfo and rinfo.conflict or nil
     fail_task(state, root, id, rerr)
-    return { ok = false, error = rerr, rebase = rebase }
+    return {
+      ok = false,
+      error = rerr,
+      rebase = rebase,
+      conflict = conflict,
+      conflict_files = conflict and table.concat(conflict, ", ") or nil,
+    }
   end
 
   -- Merge the PR.

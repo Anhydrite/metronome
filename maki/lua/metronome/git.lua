@@ -486,7 +486,8 @@ function M.rebase(worktree, upstream)
     run({ "git", "-C", worktree, "rebase", "--abort" })
     local files = #conflicts > 0 and table.concat(conflicts, ", ") or "unknown"
     return nil, string.format("rebase failed (conflicts: %s): %s",
-      files, first_line(result.stderr) or "no output")
+      files, first_line(result.stderr) or "no output"),
+      { conflict = #conflicts > 0 and conflicts or nil }
   end
   return M.head_sha(worktree)
 end
@@ -586,6 +587,32 @@ function M.pr_view(ref, opts)
     return nil, "gh pr view returned invalid JSON: " .. result.stdout:sub(1, 200)
   end
   return M.normalize_pr(decoded)
+end
+
+-- Close a pull request without merging it. A failed, stopped or abandoned task
+-- must not leave an open PR nobody will ever merge, nor a branch nobody will
+-- look at.
+function M.pr_close(ref, opts)
+  opts = type(opts) == "table" and opts or {}
+  if ref == nil or tostring(ref) == "" then
+    return nil, "pr_close needs a pull request"
+  end
+  local result, err = run(
+    { opts.gh or "gh", "pr", "close", tostring(ref) },
+    { cwd = opts.worktree, timeout_ms = opts.timeout_ms }
+  )
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    -- Already closed or merged is not a failure: the goal is a closed PR.
+    local text = tostring(result.stdout or "") .. tostring(result.stderr or "")
+    if text:find("already closed", 1, true) or text:find("already merged", 1, true) then
+      return { closed = true, already = true }
+    end
+    return fail("gh pr close", result)
+  end
+  return { closed = true }
 end
 
 -- Open a PR for the task branch, then read it back so the caller gets
