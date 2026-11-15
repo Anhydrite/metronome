@@ -1160,4 +1160,92 @@ auto_deploy = false
   eq(resets, 1, "a rebase conflict resets the branch to the fresh base")
   eq(impl_attempts, 2, "the work is redone once on the fresh base")
   eq(rebase_attempts, 2, "the rebase is retried after the reset")
+
+  -- A task that already repaired one conflict can repair the next ----------
+  --
+  -- The base can move more than once (several PRs merging), so the bound is a
+  -- count of repairs, not a lifetime flag set by the first one.
+  local second_resets = 0
+  local second_impl = 0
+  local second_rebases = 0
+  local dispatched_second = false
+  local second_task = {
+    id = "T1", status = "ready", title = "t", checks = { "true" },
+    conflict_retried = true, conflict_retries = 1,
+  }
+  local deps_second = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function() return { tasks = { T1 = second_task } } end,
+      transition = function(_, id, status) second_task.status = status; return { id = id, status = status } end,
+      set_fields = function(_, _, fields)
+        for k, v in pairs(fields or {}) do second_task[k] = v end
+        return true
+      end,
+    },
+    implement = {
+      run = function()
+        second_impl = second_impl + 1
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "s" .. second_impl }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true, sha = "s2" } end },
+    git = {
+      pr_open = function() return { number = 1, url = "u", state = "open" } end,
+      push = function() return true end,
+      reset_hard = function() second_resets = second_resets + 1; return "sha" end,
+    },
+    merge = {
+      rebase = function()
+        second_rebases = second_rebases + 1
+        if second_rebases == 1 then
+          return nil, "conflict", { conflict = "public/styles.css" }
+        end
+        return { ok = true, sha = "rebsha" }
+      end,
+      run = function() return { ok = true } end,
+    },
+    deploy = { run = function() return { ok = true } end },
+    pipeline = {
+      tick = function(opts)
+        if not dispatched_second then
+          dispatched_second = true
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_second = runtime.new(deps_second)
+  rt_second.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_second.run_pending()
+  eq(second_resets, 1, "a task with one earlier repair still repairs the next conflict")
+  eq(second_impl, 2, "the work is redone on the fresh base")
+  eq(second_task.conflict_retries, 2, "the repair counter grows")
 end

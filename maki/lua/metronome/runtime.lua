@@ -615,6 +615,20 @@ function M.new(deps)
     return result
   end
 
+  -- How many times a task may be redone on a fresh base. A base that keeps
+  -- moving is a real situation (several PRs merging), so the bound is a count,
+  -- not a lifetime flag: a task that repaired one conflict can still repair
+  -- the next one.
+  local MAX_CONFLICT_REPAIRS = 3
+
+  local function conflict_repairs(task)
+    local n = tonumber(task and task.conflict_retries)
+    if n then
+      return n
+    end
+    return (task and task.conflict_retried) and 1 or 0
+  end
+
   local function run_task(opts, task_id, paths, cfg, runner, session)
     local state = deps.state
     local loaded = state.load(paths.root)
@@ -670,13 +684,16 @@ function M.new(deps)
             -- That is repairable without a human: move the branch back to the
             -- fresh base and redo the work there, once. A second conflict is
             -- a real failure and goes to the user.
-            if not repaired and not task.conflict_retried
+            if not repaired and conflict_repairs(task) < MAX_CONFLICT_REPAIRS
               and type(deps.git.reset_hard) == "function" then
               local reset = deps.git.reset_hard(worktree, "origin/" .. cfg.project.base_ref)
               if reset then
                 log(paths, "task " .. task_id .. " conflicted with the fresh base on "
                   .. tostring(rebase_diag.conflict) .. "; redoing it on the fresh base")
-                pcall(state.set_fields, paths.root, task_id, { conflict_retried = true })
+                pcall(state.set_fields, paths.root, task_id, {
+                  conflict_retried = true,
+                  conflict_retries = conflict_repairs(task) + 1,
+                })
                 pcall(state.transition, paths.root, task_id, "failed", {
                   reason = "rebase conflict on the fresh base, redoing it: "
                     .. tostring(rebase_err),
@@ -877,13 +894,16 @@ function M.new(deps)
       -- A conflict with the base is repairable without a human: move the
       -- branch back to the fresh base and let the implementer redo the work
       -- there. One repair only; a second conflict is a real failure.
-      if merged.conflict and not task.conflict_retried then
+      if merged.conflict and conflict_repairs(task) < MAX_CONFLICT_REPAIRS then
         local reset = deps.git.reset_hard
           and deps.git.reset_hard(worktree, "origin/" .. cfg.project.base_ref)
         if reset then
           log(paths, "task " .. task_id .. " hit a merge conflict on "
             .. tostring(merged.conflict_files) .. "; redoing it on the fresh base")
-          pcall(deps.state.set_fields, paths.root, task_id, { conflict_retried = true })
+          pcall(deps.state.set_fields, paths.root, task_id, {
+            conflict_retried = true,
+            conflict_retries = conflict_repairs(task) + 1,
+          })
           pcall(deps.state.transition, paths.root, task_id, "failed",
             { reason = "merge conflict: " .. tostring(merged.conflict_files) })
           pcall(deps.state.transition, paths.root, task_id, "running", { phase = "implement" })

@@ -4,14 +4,20 @@
   "title": "Metronome task",
   "description": "One unit of work in the pipeline. A task is created by qualification, carried by the implementer, judged by the reviewer, and closed by merge and deploy. This is the shape state.lua stores and the panel renders.",
   "type": "object",
-  "required": ["id", "title", "status"],
+  "required": [
+    "id",
+    "title",
+    "status"
+  ],
   "additionalProperties": false,
   "properties": {
     "id": {
       "type": "string",
       "description": "Stable identifier, never reused.",
       "pattern": "^T-[0-9]{8}-[a-z0-9]{4}$",
-      "examples": ["T-20261114-a3f2"]
+      "examples": [
+        "T-20261114-a3f2"
+      ]
     },
     "title": {
       "type": "string",
@@ -56,7 +62,16 @@
     "phase": {
       "type": "string",
       "description": "The pipeline stage currently running, for the panel.",
-      "enum": ["qualify", "analyze", "implement", "verify", "converge", "review", "merge", "deploy"]
+      "enum": [
+        "qualify",
+        "analyze",
+        "implement",
+        "verify",
+        "converge",
+        "review",
+        "merge",
+        "deploy"
+      ]
     },
     "branch": {
       "type": "string",
@@ -75,22 +90,44 @@
     "files": {
       "type": "array",
       "description": "Files the task expects to touch. The scheduler refuses to run two tasks in parallel whose file sets overlap.",
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "checks": {
       "type": "array",
       "description": "Commands that prove the task is done. A task is not done because the model says so; it is done when these exit 0.",
-      "items": { "type": "string", "minLength": 1 }
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "pr": {
       "type": "object",
       "description": "The pull request, once one exists.",
-      "required": ["number", "url"],
+      "required": [
+        "number",
+        "url"
+      ],
       "additionalProperties": false,
       "properties": {
-        "number": { "type": "integer", "minimum": 1 },
-        "url": { "type": "string", "pattern": "^https?://" },
-        "state": { "type": "string", "enum": ["open", "closed", "merged"] }
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^https?://"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "open",
+            "closed",
+            "merged"
+          ]
+        }
       }
     },
     "review": {
@@ -98,21 +135,51 @@
       "description": "The review loop state. commit_sha is the exact commit reviewed, so a branch that moves invalidates the review.",
       "additionalProperties": false,
       "properties": {
-        "round": { "type": "integer", "minimum": 0 },
-        "max_rounds": { "type": "integer", "minimum": 1 },
-        "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "round": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_rounds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{7,40}$"
+        },
         "findings": {
           "type": "array",
           "items": {
             "type": "object",
-            "required": ["severity", "message"],
+            "required": [
+              "severity",
+              "message"
+            ],
             "additionalProperties": false,
             "properties": {
-              "severity": { "type": "string", "enum": ["blocking", "major", "minor", "nit"] },
-              "message": { "type": "string", "minLength": 1 },
-              "path": { "type": "string" },
-              "line": { "type": "integer", "minimum": 1 },
-              "rule": { "type": "string" }
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "blocking",
+                  "major",
+                  "minor",
+                  "nit"
+                ]
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              },
+              "path": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "rule": {
+                "type": "string"
+              }
             }
           }
         }
@@ -123,46 +190,90 @@
       "description": "Questions the qualifier raised. Metronome poses them to the user, at most max_questions_per_round at a time.",
       "items": {
         "type": "object",
-        "required": ["id", "text"],
+        "required": [
+          "id",
+          "text"
+        ],
         "additionalProperties": false,
         "properties": {
-          "id": { "type": "string", "minLength": 1 },
-          "text": { "type": "string", "minLength": 1 },
-          "answer": { "type": "string" },
-          "asked_at": { "type": "string", "format": "date-time" },
-          "answered_at": { "type": "string", "format": "date-time" }
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "text": {
+            "type": "string",
+            "minLength": 1
+          },
+          "answer": {
+            "type": "string"
+          },
+          "asked_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "answered_at": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       }
     },
     "depends_on": {
       "type": "array",
       "description": "Tasks that must reach merged before this one starts.",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      }
     },
     "checkpoints": {
       "type": "array",
       "description": "Commit SHAs captured before each implementation turn, so a retry restarts from a clean point instead of from nothing.",
-      "items": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" }
+      "items": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{7,40}$"
+      }
     },
     "stall": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "last_progress_at": { "type": "string", "format": "date-time" },
-        "suspect": { "type": "boolean" }
+        "last_progress_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "suspect": {
+          "type": "boolean"
+        }
       }
     },
     "notes": {
       "type": "array",
       "description": "Free-form notes appended by the pipeline, kept in order.",
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      }
     },
     "cost": {
       "type": "number",
       "description": "Dollars billed for this task so far.",
       "minimum": 0
     },
-    "created_at": { "type": "string", "format": "date-time" },
-    "updated_at": { "type": "string", "format": "date-time" }
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "conflict_retried": {
+      "type": "boolean",
+      "description": "A conflict with the base was repaired once by redoing the task on the fresh base."
+    },
+    "conflict_retries": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many times the task was redone on a fresh base after a conflict."
+    }
   }
 }
