@@ -453,8 +453,7 @@ return function()
     config = {
       load = function()
         return {
-          project = { repo = "/tmp/repo", base_ref = "main" },
-          max_parallel = 3,
+          project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 3 },
           checks = { default = { "true" }, timeout_secs = 10 },
           merge = { method = "squash", auto_merge = true },
           deploy = { auto_deploy = false, plan_file = "deploy.md" },
