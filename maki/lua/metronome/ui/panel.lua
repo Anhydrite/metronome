@@ -168,6 +168,15 @@ function M.refresh(panel)
   })
   panel.rows = rows
   panel.counts = counts
+  -- The buffer starts with one summary line per non-empty bucket plus a blank
+  -- line, so row i is not buffer line i. Without this map the highlighted line
+  -- and the selected task drift apart: the user sees one task and `d` deletes
+  -- another.
+  panel.row_line = {}
+  local header = #lines - #rows
+  for i = 1, #rows do
+    panel.row_line[i] = header + i
+  end
   if #rows == 0 then
     panel.cursor = 1
   else
@@ -177,7 +186,7 @@ function M.refresh(panel)
     panel.buf:set_lines(lines)
   end
   if panel.win and type(panel.win.set_cursor) == "function" then
-    panel.win:set_cursor(panel.cursor)
+    panel.win:set_cursor(panel.row_line[panel.cursor] or panel.cursor)
   end
   return counts
 end
@@ -330,18 +339,29 @@ end
 
 -- Selection -----------------------------------------------------------------
 
-function M.select(panel, row)
-  if type(row) ~= "number" then
+-- `line` is a buffer line, which is what a click reports. A caller holding a
+-- row index (the keyboard path and the tests) still selects that row when the
+-- number does not name a task line.
+function M.select(panel, line)
+  if type(line) ~= "number" then
     return nil, "row must be a number"
   end
-  if row < 1 or row > #panel.rows then
+  local index = nil
+  for i, at in ipairs(panel.row_line or {}) do
+    if at == line then
+      index = i
+      break
+    end
+  end
+  index = index or line
+  if index < 1 or index > #panel.rows then
     return nil, "row out of range"
   end
-  panel.cursor = row
+  panel.cursor = index
   if panel.win and type(panel.win.set_cursor) == "function" then
-    panel.win:set_cursor(row)
+    panel.win:set_cursor((panel.row_line and panel.row_line[index]) or index)
   end
-  return panel.rows[row]
+  return panel.rows[index]
 end
 
 function M.move(panel, delta)
@@ -350,7 +370,7 @@ function M.move(panel, delta)
   end
   panel.cursor = math.max(1, math.min(#panel.rows, panel.cursor + delta))
   if panel.win and type(panel.win.set_cursor) == "function" then
-    panel.win:set_cursor(panel.cursor)
+    panel.win:set_cursor((panel.row_line and panel.row_line[panel.cursor]) or panel.cursor)
   end
   return panel.cursor
 end
