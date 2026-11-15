@@ -825,7 +825,23 @@ function M.intent_line(group, opts, total)
   return {
     { "▸ ", "dim" },
     { '"' .. text .. '"', "bold" },
+  }
+end
+
+-- The request's counts, on their own line under the intention. A long
+-- intention must never push the counts off the panel, so they do not share
+-- its line.
+function M.intent_counts_line(group, total)
+  local shown = #group.rows
+  total = type(total) == "number" and total or shown
+  local count = total .. (total == 1 and " task" or " tasks")
+  if shown < total then
+    count = count .. " (" .. shown .. " shown)"
+  end
+  local c = M.group_counts(group.rows)
+  return {
     { "  " .. count, "dim" },
+    { "  " .. string.format("✓%d ▶%d ✗%d ☐%d", c.done, c.running, c.failed, c.todo), "dim" },
   }
 end
 
@@ -837,6 +853,56 @@ function M.counts(rows)
     end
   end
   return counts
+end
+
+-- The four counts a request line carries: finished, in flight, failed, and
+-- not started. One classification, used by the request word and by the icons
+-- so the two can never disagree.
+function M.group_counts(rows)
+  local c = { total = 0, done = 0, running = 0, failed = 0, todo = 0 }
+  for _, row in ipairs(rows or {}) do
+    c.total = c.total + 1
+    local s = row.status
+    if s == "merged" or s == "deployed" then
+      c.done = c.done + 1
+    elseif s == "failed" or s == "stalled" or s == "abandoned" then
+      c.failed = c.failed + 1
+    elseif s == "running" or s == "verifying" or s == "reviewing"
+      or s == "merging" or s == "deploying" or s == "changes_requested" then
+      c.running = c.running + 1
+    else
+      c.todo = c.todo + 1
+    end
+  end
+  return c
+end
+
+-- The one word a request carries in the left column: is it running, failed,
+-- finished, or not started yet? A request is a group of tasks, so the word
+-- summarises the group by what needs the human first: a failure outranks
+-- progress, progress outranks a finished task, and only a request where
+-- nothing has started reads "not started".
+function M.request_status(rows)
+  local c = M.group_counts(rows)
+  if c.total == 0 then
+    return "empty", "dim"
+  end
+  if c.failed > 0 then
+    return "failed", "error"
+  end
+  if c.running > 0 then
+    return "running", "keyword"
+  end
+  if c.done == c.total then
+    return "done", "ok"
+  end
+  if c.done > 0 then
+    return "partial", "dim"
+  end
+  if c.todo > 0 then
+    return "not started", "dim"
+  end
+  return "waiting", "dim"
 end
 
 -- The attention bell: one line per non-empty bucket, in urgency order. Empty
@@ -979,6 +1045,7 @@ function M.lines(tasks, opts)
     for _, group in ipairs(M.groups(rows)) do
       if group.intent ~= "" then
         lines[#lines + 1] = M.intent_line(group, opts, total[group.intent])
+        lines[#lines + 1] = M.intent_counts_line(group, total[group.intent])
       end
       for _, entry in ipairs(M.tree(group.rows)) do
         local row = entry.row
@@ -1033,35 +1100,22 @@ function M.panes(tasks, opts)
 
   local left_width = tonumber(opts.left_width) or 40
 
-  -- Left column: one compact line per intention, with the four status icons.
-  local function status_counts(group)
-    local c = { done = 0, running = 0, failed = 0, todo = 0 }
-    for _, row in ipairs(group.rows or {}) do
-      local s = row.status
-      if s == "merged" or s == "deployed" then
-        c.done = c.done + 1
-      elseif s == "failed" or s == "stalled" or s == "abandoned" then
-        c.failed = c.failed + 1
-      elseif s == "running" or s == "verifying" or s == "reviewing"
-        or s == "merging" or s == "deploying" or s == "changes_requested" then
-        c.running = c.running + 1
-      else
-        c.todo = c.todo + 1
-      end
-    end
-    return c
-  end
-
+  -- Left column: one compact line per intention, with the request's status in
+  -- words -- running, failed, done, not started -- because that is what the
+  -- human needs at a glance. The per-state counts live on the right pane's
+  -- header, where there is room for them.
   local left = {}
   left[#left + 1] = { text = "REQUESTS", style = "bold" }
   for i, group in ipairs(groups) do
-    local c = status_counts(group)
+    local word, wstyle = M.request_status(group.rows)
     local marker = i == selected and "▸ " or "  "
     local label = group.intent ~= "" and ('"' .. group.intent .. '"') or "(no intention)"
-    local icons = string.format("✓%d ▶%d ✗%d ☐%d", c.done, c.running, c.failed, c.todo)
     left[#left + 1] = {
-      text = marker .. M.fit(label, left_width - 17) .. "  " .. icons,
-      style = i == selected and "bold" or "dim",
+      spans = {
+        { marker .. M.fit(label, left_width - 18), i == selected and "bold" or "dim" },
+        { "  " },
+        { word, wstyle },
+      },
     }
   end
 
@@ -1073,6 +1127,7 @@ function M.panes(tasks, opts)
     local group = groups[selected]
     if group.intent ~= "" then
       right[#right + 1] = { spans = M.intent_line(group, opts, total[group.intent]) }
+      right[#right + 1] = { spans = M.intent_counts_line(group, total[group.intent]) }
     end
 
     -- The PERT graph: the dependency schema of the request, drawn left to
@@ -1120,15 +1175,23 @@ function M.panes(tasks, opts)
   local height = math.max(#left, #right)
   for i = 1, height do
     local l = left[i]
-    local ltext = l and l.text or ""
+    local ltext = l and (l.text or (l.spans and M.text(l.spans)) or "") or ""
     local lstyle = l and l.style or "dim"
     local fitted = M.fit(ltext, left_width)
     local pad = left_width - display_width(fitted)
     if pad < 0 then pad = 0 end
-    local spans = {
-      { fitted .. string.rep(" ", pad), lstyle },
-      { " │ ", "dim" },
-    }
+    local spans = {}
+    if l and type(l.spans) == "table" then
+      -- A left line with styled parts (the request status word) keeps them:
+      -- only the padding is appended.
+      for _, span in ipairs(l.spans) do
+        spans[#spans + 1] = span
+      end
+      spans[#spans + 1] = { string.rep(" ", pad), "dim" }
+    else
+      spans[#spans + 1] = { fitted .. string.rep(" ", pad), lstyle }
+    end
+    spans[#spans + 1] = { " │ ", "dim" }
     local r = right[i]
     if r then
       for _, span in ipairs(r.spans) do

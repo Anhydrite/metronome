@@ -240,20 +240,6 @@ function M.prepare(opts)
     return nil, ferr
   end
 
-  -- The worktree is cut from remote/base and converge diffs against it. If the
-  -- local base carries commits the remote does not, the qualifier read a tree
-  -- the implementer will never see: refuse instead of re-implementing work
-  -- that only exists locally.
-  if type(opts.git.ahead_count) == "function" then
-    local ahead = opts.git.ahead_count(opts.repo, base, { remote = remote })
-    if ahead and ahead > 0 then
-      return nil, string.format(
-        "local base %s is %d commit(s) ahead of %s/%s; the pipeline works from %s/%s, so push or reset the local base first",
-        base, ahead, remote, base, remote, base
-      )
-    end
-  end
-
   local worktree = M.worktree_path(opts.root, task_id, opts)
   -- A task that already has a branch keeps it: a retry must re-attach the
   -- branch its checkpoints and pull request point at, never invent a new one

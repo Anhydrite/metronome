@@ -917,7 +917,12 @@ function M.new(deps)
   -- answered, so answering resumes the pipeline instead of leaving the tasks
   -- stuck in `qualifying` forever.
   local function after_questions(opts, paths, cfg, runner, session)
-    local gate, gerr = deps.analyze.gate(deps.state, paths.root, { tasks_dir = paths.tasks })
+    local gate, gerr = deps.analyze.gate(deps.state, paths.root, {
+      tasks_dir = paths.tasks,
+      repo = paths.repo,
+      ref = "origin/" .. tostring(cfg.project.base_ref),
+      git = deps.git,
+    })
     if not gate or not gate.ok then
       return { ok = false, error = gerr or (gate and gate.verdict) or "analysis gate failed" }
     end
@@ -1259,11 +1264,24 @@ function M.new(deps)
       return { ok = true, background = true, fast = true, tasks = applied.tasks }
     end
 
+    -- The qualifier must describe the tree the worktree will be cut from, so it
+    -- reads `origin/<base>` from git rather than the local checkout. Fetch first
+    -- so that ref is as fresh as the worktree will be; a fetch that fails (no
+    -- network, no remote) leaves the last known ref, which is still the truth
+    -- the pipeline would merge into, and the qualifier's own git reads will say
+    -- so if the ref does not exist at all.
+    if deps.git and type(deps.git.fetch) == "function" then
+      deps.git.fetch(paths.repo, "origin")
+    end
+    local qualify_ref = "origin/" .. tostring(cfg.project.base_ref)
+
     local qualified = deps.qualify.run({
       intention = opts.intention,
       runner = runner,
       session_opts = session.qualifier,
       repo = paths.repo,
+      ref = qualify_ref,
+      git = deps.git,
       task_id = "qualify",
       validate = false,
       state_root = paths.runs,

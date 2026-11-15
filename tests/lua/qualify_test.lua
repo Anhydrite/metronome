@@ -92,6 +92,73 @@ return function()
   eq(missing, nil, "missing repo returns nil")
   eq(merr ~= nil and merr:find("cannot read repository", 1, true) ~= nil, true, "missing repo explains itself")
 
+  -- repo_context from a git ref --------------------------------------------
+  --
+  -- The pipeline reads `origin/<base>`, not the working directory: a diverged
+  -- local checkout must not shape a task sheet. A fake git module proves the
+  -- contract without a repository, and the file list must be exactly what the
+  -- ref lists, sorted, with excerpts read from the same ref.
+
+  local calls = { ls = {}, show = {} }
+  local fake_git = {}
+  function fake_git.ls_tree(_, ref)
+    calls.ls[#calls.ls + 1] = ref
+    if ref ~= "origin/main" then
+      return nil, "unknown ref " .. tostring(ref)
+    end
+    return { "src/app.js", "README.md", "package.json" }
+  end
+  function fake_git.show_file(_, ref, path)
+    calls.show[#calls.show + 1] = ref .. ":" .. path
+    if ref ~= "origin/main" then
+      return nil, "unknown ref " .. tostring(ref)
+    end
+    if path == "README.md" then
+      return "# Committed\n"
+    end
+    return nil, "missing " .. path
+  end
+
+  local refctx, refcerr = q.repo_context(repo, { ref = "origin/main", git = fake_git })
+  eq(refcerr, nil, "ref context has no error: " .. tostring(refcerr))
+  eq(refctx and refctx.ref, "origin/main", "ref context records the ref")
+  eq(refctx and refctx.root, repo, "ref context keeps the root")
+  eq(#calls.ls, 1, "ls_tree is called once")
+  eq(calls.ls[1], "origin/main", "ls_tree reads the requested ref")
+  local ref_files = table.concat(refctx and refctx.files or {}, ",")
+  eq(ref_files, "README.md,package.json,src/app.js", "ref file list is sorted")
+  eq((refctx and #refctx.excerpts or 0) >= 1, true, "ref context excerpts at least one file")
+  local ref_excerpt = refctx and refctx.excerpts[1] or {}
+  eq(ref_excerpt.path, "README.md", "preferred file is excerpted first")
+  eq(ref_excerpt.text, "# Committed\n", "excerpt comes from the ref, not the working tree")
+
+  local ref_capped, ref_caperr = q.repo_context(repo, {
+    ref = "origin/main",
+    git = fake_git,
+    max_files = 2,
+  })
+  eq(ref_caperr, nil, "capped ref context has no error")
+  eq(#(ref_capped and ref_capped.files or {}), 2, "ref list honours max_files")
+  eq(ref_capped and ref_capped.truncated, true, "ref list sets truncated at the cap")
+
+  local bad_ref, bad_ref_err = q.repo_context(repo, { ref = "origin/nope", git = fake_git })
+  eq(bad_ref, nil, "an unknown ref returns nil")
+  eq(bad_ref_err, "unknown ref origin/nope", "the git error is propagated")
+
+  local no_git, no_git_err = q.repo_context(repo, { ref = "origin/main" })
+  eq(no_git, nil, "ref without the git module returns nil")
+  eq(no_git_err ~= nil and no_git_err:find("git module", 1, true) ~= nil, true, "the refusal names the missing module")
+
+  local empty_ref, empty_ref_err = q.repo_context(repo, { ref = "", git = fake_git })
+  eq(empty_ref, nil, "empty ref returns nil")
+  eq(empty_ref_err ~= nil and empty_ref_err:find("non-empty", 1, true) ~= nil, true, "empty ref explains itself")
+
+  -- A ref context reaches the prompt, and says which tree it describes.
+  local ref_prompt = q.build_prompt("add a thing", refctx, {})
+  has(ref_prompt, "Ref: origin/main", "the prompt names the ref")
+  has(ref_prompt, "- src/app.js", "the prompt lists ref files")
+  has(ref_prompt, "# Committed", "the prompt carries ref excerpts")
+
   -- extract_json -----------------------------------------------------------
 
   local fenced = q.extract_json('```json\n{"a":1}\n```')

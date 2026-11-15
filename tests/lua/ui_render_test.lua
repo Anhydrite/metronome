@@ -234,9 +234,37 @@ return function()
   end
   local pane_joined = table.concat(pane_text, "\n")
   has(pane_joined, "REQUESTS", "panes renders the left column")
-  has(pane_joined, "✓0", "panes shows the status icons")
-  has(pane_joined, "▶1", "panes counts the running task")
-  has(pane_joined, "☐1", "panes counts the todo task")
+  -- The left column answers "where is this request?" in words, not only icons.
+  has(pane_joined, "running", "the left column names a running request")
+  has(pane_joined, "failed", "the left column names a failed request")
+  -- The per-state counts live on the selected request's header.
+  has(pane_joined, "▶1", "the header counts the running task")
+  has(pane_joined, "☐1", "the header counts the todo task")
+
+  -- request_status: the word a request carries, by what needs the human first.
+  local rs = render.request_status
+  eq(rs({ { status = "running" }, { status = "ready" } }), "running",
+    "a running task makes the request running")
+  eq(rs({ { status = "failed" }, { status = "running" } }), "failed",
+    "a failure outranks progress")
+  eq(rs({ { status = "merged" }, { status = "deployed" } }), "done",
+    "a fully merged request is done")
+  eq(rs({ { status = "ready" }, { status = "draft" } }), "not started",
+    "a request nothing started reads not started")
+  eq(rs({ { status = "merged" }, { status = "ready" } }), "partial",
+    "a half-merged request is partial")
+  eq(rs({}), "empty", "an empty request says so")
+
+  -- group_counts agrees with the word: one classification, two renderings.
+  local gc = render.group_counts({
+    { status = "merged" }, { status = "running" },
+    { status = "failed" }, { status = "ready" },
+  })
+  eq(gc.done, 1, "group_counts counts done")
+  eq(gc.running, 1, "group_counts counts running")
+  eq(gc.failed, 1, "group_counts counts failed")
+  eq(gc.todo, 1, "group_counts counts todo")
+  eq(gc.total, 4, "group_counts counts the total")
 
   -- an intentionless task is rendered flat, with no header
   local flat = render.lines({ task("T-20261115-0004", "legacy", "ready") })

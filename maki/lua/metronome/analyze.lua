@@ -505,10 +505,33 @@ function M.analyze(tasks, opts)
   -- unknown_file: a declared file that is not in the repository. A new file
   -- is legitimate, so this is a warning: the analyst may still be right that
   -- the sheet is describing something that should not exist.
+  --
+  -- With `opts.ref` the check reads the tree the worktree will be cut from
+  -- (`origin/<base>`), not the local checkout: a diverged checkout would
+  -- otherwise flag a file that exists on the base, or accept one that only
+  -- exists locally.
+  local ref_files = nil
+  if type(opts.ref) == "string" and opts.ref ~= ""
+    and type(opts.git) == "table" and type(opts.git.ls_tree) == "function"
+    and type(opts.repo) == "string" and opts.repo ~= "" then
+    local listed = opts.git.ls_tree(opts.repo, opts.ref)
+    if type(listed) == "table" then
+      ref_files = {}
+      for _, path in ipairs(listed) do
+        ref_files[path] = true
+      end
+    end
+  end
   if type(opts.repo) == "string" and opts.repo ~= "" then
     for i = 1, #ids do
       for _, file in ipairs(filesets[i]) do
-        if not exists_under(opts.repo, file) then
+        local known
+        if ref_files then
+          known = ref_files[file] == true
+        else
+          known = exists_under(opts.repo, file)
+        end
+        if not known then
           findings[#findings + 1] = {
             severity = "minor",
             rule = "unknown_file",
@@ -1010,6 +1033,8 @@ function M.gate(state, root, opts)
     intention = opts.intention,
     known_ids = known_ids,
     repo = opts.repo,
+    ref = opts.ref,
+    git = opts.git,
     runner = opts.runner,
     session_opts = opts.session_opts,
     semantic = opts.semantic,

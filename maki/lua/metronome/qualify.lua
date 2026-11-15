@@ -69,6 +69,13 @@ end
 -- The walk is deterministic (names sorted at every level) and capped, so a
 -- huge repository cannot blow up the prompt. Reading is best-effort: a file
 -- that disappears mid-walk is simply not excerpted.
+--
+-- `opts.ref` reads the tree from git instead of the working directory. That is
+-- the mode the pipeline uses: the qualifier must describe `origin/<base>`,
+-- because that is what the task worktree is cut from. A local checkout that
+-- diverged would otherwise make the qualifier name files the implementer never
+-- sees. `opts.git` is the git module (injected, like the state module, because
+-- `require` cannot yield here).
 function M.repo_context(repo, opts)
   opts = opts or {}
   if type(repo) ~= "string" or repo == "" then
@@ -79,8 +86,17 @@ function M.repo_context(repo, opts)
   local max_excerpts = opts.max_excerpts or 12
   local max_bytes = opts.max_bytes or 4096
   local max_depth = opts.max_depth or 6
+  local ref = opts.ref
+  local git = opts.git
 
-  if not fs.dir(repo) then
+  if ref ~= nil then
+    if type(ref) ~= "string" or ref == "" then
+      return nil, "repo_context ref must be a non-empty string"
+    end
+    if type(git) ~= "table" or type(git.ls_tree) ~= "function" then
+      return nil, "repo_context needs the git module to read ref " .. ref
+    end
+  elseif not fs.dir(repo) then
     return nil, "cannot read repository: " .. repo
   end
 
@@ -123,7 +139,34 @@ function M.repo_context(repo, opts)
     end
   end
 
-  walk(repo, "", 0)
+  local function read_at(path)
+    if ref then
+      local text = git.show_file(repo, ref, path)
+      return text
+    end
+    return fs.read(fs.joinpath(repo, path))
+  end
+
+  if ref then
+    -- `ls-tree` lists committed files only, so there is nothing to skip: the
+    -- git database is not in the tree and dependency caches are whatever the
+    -- repository committed. Sorting keeps the prompt stable across runs.
+    local listed, lerr = git.ls_tree(repo, ref)
+    if not listed then
+      return nil, lerr
+    end
+    table.sort(listed)
+    for _, path in ipairs(listed) do
+      if #files < max_files then
+        files[#files + 1] = path
+      else
+        truncated = true
+        break
+      end
+    end
+  else
+    walk(repo, "", 0)
+  end
 
   -- Excerpts: key files first, then whatever else fits.
   local excerpts = {}
@@ -132,7 +175,7 @@ function M.repo_context(repo, opts)
     if #excerpts >= max_excerpts or seen[path] then
       return
     end
-    local text = fs.read(fs.joinpath(repo, path))
+    local text = read_at(path)
     if type(text) ~= "string" then
       return
     end
@@ -161,6 +204,7 @@ function M.repo_context(repo, opts)
 
   return {
     root = repo,
+    ref = ref,
     files = files,
     excerpts = excerpts,
     truncated = truncated,
@@ -189,6 +233,9 @@ function M.build_prompt(intent, context, opts)
     line("## Repository")
     line("")
     line("Root: " .. tostring(context.root))
+    if context.ref then
+      line("Ref: " .. tostring(context.ref) .. " (the tree every task worktree is cut from)")
+    end
     line("")
     line("Files:")
     for _, path in ipairs(context.files or {}) do

@@ -194,23 +194,6 @@ return function()
   eq(loaded and loaded.base_ref, "main", "prepare stores the base")
   eq(git.current_branch(ctx1.worktree), "metronome/add-feature-flag-e001", "the worktree is on the task branch")
 
-  -- A local base ahead of the remote base is refused: the worktree is cut
-  -- from the remote, so the qualifier would describe files it will not hold.
-  local diverged_git = {}
-  for k, v in pairs(git) do
-    diverged_git[k] = v
-  end
-  diverged_git.ahead_count = function() return 1 end
-  local diverged_opts = {}
-  for k, v in pairs(prep_opts) do
-    diverged_opts[k] = v
-  end
-  diverged_opts.git = diverged_git
-  local _, diverged_err = implement.prepare(diverged_opts)
-  eq(diverged_err ~= nil, true, "a diverged local base is refused")
-  eq(diverged_err and diverged_err:find("ahead", 1, true) ~= nil, true,
-    "the refusal explains the divergence")
-
   local ctx2, perr2 = implement.prepare(prep_opts)
   eq(perr2, nil, "second prepare has no error: " .. tostring(perr2))
   eq(ctx2 and ctx2.worktree, ctx1.worktree, "second prepare reuses the worktree")

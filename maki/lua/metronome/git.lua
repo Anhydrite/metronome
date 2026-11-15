@@ -449,7 +449,8 @@ function M.ahead_count(repo, base, opts)
     return nil, err
   end
   if not result.ok then
-    return nil, fail("git rev-list", result)
+    local _, err = fail("git rev-list", result)
+    return nil, err
   end
   local n = tonumber(tostring(result.stdout or ""):match("%d+"))
   if not n then
@@ -564,6 +565,69 @@ function M.changed_files(worktree, base_ref, opts)
     end
   end
   return files
+end
+
+-- The files a ref contains, read from git rather than from the working tree.
+--
+-- The qualifier must describe the tree the worktree will be cut from
+-- (`origin/<base>`), not whatever the local checkout happens to hold: a local
+-- branch that diverged would make it name files the implementer never sees.
+-- `git ls-tree -r --name-only` answers exactly that, and reads nothing that is
+-- not committed.
+function M.ls_tree(repo, ref, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(repo) ~= "string" or repo == "" then
+    return nil, "ls_tree needs a repo"
+  end
+  if type(ref) ~= "string" or ref == "" then
+    return nil, "ls_tree needs a ref"
+  end
+  local result, err = run(
+    { "git", "-C", repo, "ls-tree", "-r", "--name-only", ref },
+    { timeout_ms = opts.timeout_ms }
+  )
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    local _, err = fail("ls-tree " .. ref, result)
+    return nil, err
+  end
+  local files = {}
+  for line in result.stdout:gmatch("[^\n]+") do
+    if line ~= "" then
+      files[#files + 1] = line
+    end
+  end
+  return files
+end
+
+-- The contents of one file at one ref. Used to excerpt the qualifier's key
+-- files from the same tree `ls_tree` listed, so a listing and its excerpts can
+-- never describe two different commits.
+function M.show_file(repo, ref, path, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(repo) ~= "string" or repo == "" then
+    return nil, "show_file needs a repo"
+  end
+  if type(ref) ~= "string" or ref == "" then
+    return nil, "show_file needs a ref"
+  end
+  if type(path) ~= "string" or path == "" then
+    return nil, "show_file needs a path"
+  end
+  local result, err = run(
+    { "git", "-C", repo, "show", ref .. ":" .. path },
+    { timeout_ms = opts.timeout_ms }
+  )
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    local _, err = fail("show " .. ref .. ":" .. path, result)
+    return nil, err
+  end
+  return result.stdout
 end
 
 -- Pull requests -------------------------------------------------------------

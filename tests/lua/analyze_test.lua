@@ -299,6 +299,39 @@ return function()
   })
   eq(find_rule(no_repo, "unknown_file"), nil, "unknown_file is skipped without a repo")
 
+  -- With a ref, existence is read from git, not the checkout: a file that is
+  -- only in the local checkout must not satisfy the check, and a file that is
+  -- in the ref must satisfy it even when the checkout lacks it.
+  local ref_git = {
+    ls_tree = function(_, ref)
+      if ref ~= "origin/main" then
+        return nil, "unknown ref"
+      end
+      return { "src/on_base.lua" }
+    end,
+  }
+  local ref_only = analyze.analyze({
+    task("T-20261114-h004", "First", { "src/on_base.lua" }),
+  }, { repo = repo, ref = "origin/main", git = ref_git })
+  eq(find_rule(ref_only, "unknown_file"), nil, "a file on the ref is known")
+
+  local local_only = analyze.analyze({
+    task("T-20261114-h005", "First", { "src/exists.lua" }),
+  }, { repo = repo, ref = "origin/main", git = ref_git })
+  local local_only_finding = find_rule(local_only, "unknown_file")
+  eq(local_only_finding ~= nil, true, "a file only in the checkout is not on the ref")
+  has(local_only_finding and local_only_finding.message or "", "src/exists.lua",
+    "the ref finding names the file")
+
+  local bad_ref = analyze.analyze({
+    task("T-20261114-h006", "First", { "src/exists.lua" }),
+  }, {
+    repo = repo,
+    ref = "origin/main",
+    git = { ls_tree = function() return nil, "boom" end },
+  })
+  eq(find_rule(bad_ref, "unknown_file"), nil, "an unreadable ref skips the check instead of guessing")
+
   -- analyze: oversized ----------------------------------------------------
 
   local oversized = analyze.analyze({

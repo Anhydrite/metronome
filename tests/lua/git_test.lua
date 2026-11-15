@@ -360,6 +360,59 @@ return function()
   eq(dwt, detach_wt, "detached worktree path returned")
   eq(git.current_branch(detach_wt), "HEAD", "detached worktree has no branch")
 
+  -- ls_tree / show_file: the qualifier reads the committed tree -------------
+  --
+  -- The qualifier must describe `origin/<base>`, not whatever the local
+  -- checkout holds. These two read git, so a dirty working tree cannot leak
+  -- into a task sheet.
+
+  maki.fs.mkdir(maki.fs.joinpath(repo, "src"), { parents = true })
+  maki.fs.write(maki.fs.joinpath(repo, "src", "lib.js"), "module.exports = 1\n")
+  sh({ "git", "add", "-A" }, repo)
+  code, out = sh({ "git", "commit", "-m", "feat: add lib" }, repo)
+  eq(code, 0, "lib committed: " .. out:sub(1, 80))
+  code, out = sh({ "git", "push", "origin", "main" }, repo)
+  eq(code, 0, "lib pushed: " .. out:sub(1, 80))
+
+  local tree, terr = git.ls_tree(repo, "origin/main")
+  eq(terr, nil, "ls_tree has no error: " .. tostring(terr))
+  local in_tree = {}
+  for _, path in ipairs(tree or {}) do
+    in_tree[path] = true
+  end
+  eq(in_tree["README.md"], true, "ls_tree lists a committed file")
+  eq(in_tree["src/lib.js"], true, "ls_tree lists a nested committed file")
+
+  -- A dirty working tree must not change what the ref says.
+  maki.fs.write(maki.fs.joinpath(repo, "src", "lib.js"), "module.exports = 2\n")
+  maki.fs.write(maki.fs.joinpath(repo, "uncommitted.js"), "nope\n")
+  local dirty_tree = git.ls_tree(repo, "origin/main")
+  local dirty = {}
+  for _, path in ipairs(dirty_tree or {}) do
+    dirty[path] = true
+  end
+  eq(dirty["uncommitted.js"], nil, "ls_tree ignores an uncommitted file")
+
+  local text, serr = git.show_file(repo, "origin/main", "src/lib.js")
+  eq(serr, nil, "show_file has no error: " .. tostring(serr))
+  eq(text, "module.exports = 1", "show_file returns the committed content, not the dirty one")
+
+  local missing_text, missing_err = git.show_file(repo, "origin/main", "does/not/exist.js")
+  eq(missing_text, nil, "show_file refuses a missing path")
+  has(missing_err or "", "does/not/exist.js", "the refusal names the path")
+
+  local bad_ref, bad_ref_err = git.ls_tree(repo, "origin/no-such-branch")
+  eq(bad_ref, nil, "ls_tree refuses an unknown ref")
+  eq(type(bad_ref_err), "string", "ls_tree explains an unknown ref")
+
+  local no_ref, no_ref_err = git.ls_tree(repo, "")
+  eq(no_ref, nil, "ls_tree needs a ref")
+  eq(type(no_ref_err), "string", "ls_tree says a ref is missing")
+
+  -- Restore the working tree so the rest of the suite is unaffected.
+  sh({ "git", "checkout", "--", "src/lib.js" }, repo)
+  maki.fs.rm(maki.fs.joinpath(repo, "uncommitted.js"))
+
   -- Cleanup -----------------------------------------------------------------
 
   local removed, rerr = git.worktree_remove(repo, worktree, { force = true })
