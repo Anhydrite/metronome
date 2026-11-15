@@ -446,4 +446,82 @@ return function()
   rt6.run_pending()
   eq(merge_called, false, "auto_merge off does not merge the pull request")
   eq(deploy_called, false, "auto_merge off does not deploy")
+  -- Parallelism: the drain hands every selected task to `join` as one batch --
+  local join_batches = {}
+  local ticks = 0
+  local deps7 = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          max_parallel = 3,
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = true },
+          deploy = { auto_deploy = false, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = {
+      session_opts = function()
+        return { system = "", model_spec = "m", thinking = "low", tools = {} }
+      end,
+    },
+    state = {
+      load = function()
+        return { tasks = {
+          T1 = { id = "T1", status = "ready", title = "un", checks = { "true" } },
+          T2 = { id = "T2", status = "ready", title = "deux", checks = { "true" } },
+        } }
+      end,
+      transition = function(_, id, status)
+        return { id = id, status = status }
+      end,
+    },
+    implement = {
+      run = function()
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true } end },
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = { run = function() return { ok = true } end },
+    deploy = { run = function() return { ok = true, deployed = true } end },
+    pipeline = {
+      tick = function(opts)
+        ticks = ticks + 1
+        if ticks == 1 then
+          opts.dispatch({ id = "T1" })
+          opts.dispatch({ id = "T2" })
+          return { ok = true, started = { "T1", "T2" } }
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    join = function(n, fns)
+      join_batches[#join_batches + 1] = { n = n, count = #fns }
+      for _, fn in ipairs(fns) do fn() end
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = {} } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt7 = runtime.new(deps7)
+  rt7.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt7.run_pending()
+  eq(join_batches[1] and join_batches[1].n, 3,
+    "the drain joins with the configured max_parallel, not a hardcoded 1")
+  eq(join_batches[1] and join_batches[1].count, 2,
+    "both selected tasks run as one batch")
 end

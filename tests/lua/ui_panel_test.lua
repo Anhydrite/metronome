@@ -462,6 +462,23 @@ return function()
   eq(flashes[1]:find("which db?", 1, true) ~= nil, true, "the answer prompt lists the question")
   panel_mod.close(peeker)
 
+  -- `a` with an ask adapter reaches the user the way a background
+  -- qualification does: the agent comes back with the native question prompt.
+  local asked = 0
+  local asker = new_panel({
+    ask = function()
+      asked = asked + 1
+      return { ok = true, asked = 2 }
+    end,
+  })
+  flashes = {}
+  panel_mod.open(asker)
+  panel_mod.dispatch(asker, "a")
+  eq(asked, 1, "a calls the ask adapter")
+  eq(#flashes, 1, "a reports what it did")
+  eq(flashes[1]:find("2 question", 1, true) ~= nil, true, "the flash counts the questions asked")
+  panel_mod.close(asker)
+
   -- Missing UI -------------------------------------------------------------
 
   local headless = new_panel({ ui = {} })
