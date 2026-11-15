@@ -250,7 +250,7 @@ return function()
   eq(panel_mod.selected(panel).id, "T-20261114-d1e2", "selected is the first row")
   eq(panel_mod.move(panel, 1), 2, "move down advances the cursor")
   eq(panel_mod.selected(panel).id, "T-20261114-b7c1", "the cursor moved to the failure")
-  eq(opened[1].cursor, 2, "the window cursor follows")
+  eq(opened[1].cursor, panel.row_line[2], "the window cursor follows the task line")
   eq(panel_mod.move(panel, -1), 1, "move up rewinds the cursor")
   eq(panel_mod.move(panel, -10), 1, "move up clamps at the first row")
   eq(panel_mod.move(panel, 10), 4, "move down clamps at the last row")
@@ -300,6 +300,23 @@ return function()
   eq(retried, "T-20261114-c9d0", "r retries the selected abandoned task")
   tasks["T-20261114-c9d0"].status = "ready"
   panel_mod.refresh(panel)
+
+  -- The highlighted line is the selected task ------------------------------
+  -- The buffer starts with one summary line per bucket plus a blank line, so
+  -- row i is not buffer line i. `d` must delete the task under the cursor.
+  local panel_rows = panel.rows
+  local lines = panel.buf.lines
+  for i, row in ipairs(panel_rows) do
+    local line = render.text(lines[panel.row_line[i]])
+    eq(line:find(row.id:sub(-4), 1, true) ~= nil, true,
+      "row " .. i .. " maps to the buffer line that shows it")
+  end
+  local first_row = panel_rows[1]
+  local picked = panel_mod.select(panel, panel.row_line[1])
+  eq(picked and picked.id, first_row.id, "selecting a buffer line selects its task")
+  eq(panel.win.cursor, panel.row_line[1], "the window cursor sits on the task line")
+  panel_mod.move(panel, 1)
+  eq(panel.win.cursor, panel.row_line[2], "moving down moves the cursor one task line")
 
   -- d deletes the selected task --------------------------------------------
   local selected_index
