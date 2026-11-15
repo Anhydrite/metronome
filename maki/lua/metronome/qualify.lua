@@ -556,6 +556,10 @@ function M.normalize(parsed, opts)
     local task = {
       title = title,
       intent = intent,
+      -- The submitted intention, kept on every task so the panel can group a
+      -- request's tasks together. `intent` is the qualifier's per-task detail
+      -- and is not a stable request identity.
+      origin = opts.intention or "",
       files = files,
       checks = checks,
       acceptance = acceptance,
@@ -799,6 +803,9 @@ function M.sheet_markdown(task)
   line("")
   line("- ID: " .. tostring(task.id or ""))
   line("- Intent: " .. tostring(task.intent or ""))
+  if type(task.origin) == "string" and task.origin ~= "" then
+    line("- Origin: " .. task.origin)
+  end
   line("- Files: " .. table.concat(task.files or {}, ", "))
   line("- Checks: " .. table.concat(task.checks or {}, ", "))
   if task.depends_on and #task.depends_on > 0 then
@@ -867,6 +874,7 @@ function M.apply(state, root, result, opts)
       id = id,
       title = task.title,
       intent = task.intent or "",
+      origin = task.origin or "",
       files = task.files,
       checks = task.checks,
       status = "draft",
@@ -897,6 +905,7 @@ function M.apply(state, root, result, opts)
       id = id,
       title = task.title,
       intent = task.intent or "",
+      origin = task.origin or "",
       files = task.files,
       checks = task.checks,
       depends_on = task.depends_on or {},

@@ -1105,6 +1105,7 @@ function M.new(deps)
         tasks = { {
           title = opts.intention,
           intent = opts.intention,
+          origin = opts.intention,
           files = {},
           checks = default_checks,
         } },

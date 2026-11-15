@@ -504,6 +504,7 @@ function M.peek(panel, id, opts)
     status = task.status,
     phase = task.phase,
     intent = type(task.intent) == "string" and task.intent or nil,
+    origin = type(task.origin) == "string" and task.origin ~= "" and task.origin or nil,
     depends_on = type(task.depends_on) == "table" and task.depends_on or nil,
     branch = type(task.branch) == "string" and task.branch or nil,
     notes = (not quiet and type(task.notes) == "table") and task.notes or {},
@@ -523,6 +524,9 @@ function M.peek_text(panel, id, opts)
     "status: " .. tostring(info.status)
       .. (info.phase and ("  phase: " .. tostring(info.phase)) or ""),
   }
+  if info.origin and info.origin ~= "" then
+    lines[#lines + 1] = "request: " .. tostring(info.origin)
+  end
   if info.intent and info.intent ~= "" then
     lines[#lines + 1] = "asked: " .. tostring(info.intent)
   end

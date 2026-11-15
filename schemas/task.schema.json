@@ -21,7 +21,11 @@
     },
     "intent": {
       "type": "string",
-      "description": "The free-text intention this task came from, kept verbatim for traceability."
+      "description": "The task's own intention, as detailed by the qualifier. This is the work item, not the user's ask."
+    },
+    "origin": {
+      "type": "string",
+      "description": "The intention the user submitted, kept verbatim. Every task a submission produced carries the same origin, which is what the panel groups requests by. Absent on tasks created before this field existed; readers fall back to `intent`."
     },
     "status": {
       "type": "string",

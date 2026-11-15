@@ -137,6 +137,17 @@ return function()
   eq(groups[2].intent, "login", "the other intention follows")
   eq(#groups[2].rows, 2, "the login group holds both tasks")
 
+  -- origin is the request identity: one ask, many detailed tasks -----------
+  local split = {
+    { id = "T-20261115-0201", title = "auth core", status = "running", intent = "hash passwords", origin = "add a login system" },
+    { id = "T-20261115-0202", title = "routes", status = "ready", intent = "account routes", origin = "add a login system" },
+    { id = "T-20261115-0203", title = "docs", status = "ready", intent = "write the readme", origin = "add a login system" },
+  }
+  local split_groups = render.groups(render.rows(split))
+  eq(#split_groups, 1, "tasks sharing an origin stay one request")
+  eq(split_groups[1].intent, "add a login system", "the request is the submitted intention")
+  eq(#split_groups[1].rows, 3, "all three tasks belong to it")
+
   local g_lines, g_rows, _, g_row_lines = render.lines(grouped)
   eq(g_rows[1].id, "T-20261115-0003", "display order puts the failure first")
   eq(g_rows[2].id, "T-20261115-0001", "then the login group")

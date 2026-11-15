@@ -189,6 +189,13 @@ return function()
 
   local with_intent = q.normalize({ tasks = { { title = "t", files = { "f" }, checks = { "c" } } } }, { intention = "the intention" })
   eq(with_intent and with_intent.tasks[1].intent, "the intention", "intent falls back to the intention")
+  eq(with_intent and with_intent.tasks[1].origin, "the intention", "origin carries the submitted intention")
+
+  local detailed = q.normalize({
+    tasks = { { title = "t", intent = "detail of the work", files = { "f" }, checks = { "c" } } },
+  }, { intention = "the ask" })
+  eq(detailed and detailed.tasks[1].intent, "detail of the work", "intent keeps the qualifier's detail")
+  eq(detailed and detailed.tasks[1].origin, "the ask", "origin stays the user's ask")
 
   local notasks, notaskserr = q.normalize({ tasks = {} })
   eq(notasks, nil, "empty tasks returns nil")

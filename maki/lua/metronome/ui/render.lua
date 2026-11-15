@@ -351,6 +351,20 @@ end
 -- Finished tasks (merged, deployed, abandoned) are hidden by default: they
 -- need nothing from the user and only push what does off the panel. Pass
 -- `opts.show_done = true` to bring the `done` bucket back.
+-- The request a task belongs to. A submission is identified by the intention
+-- the user typed (`origin`), not by the qualifier's per-task detail (`intent`):
+-- one ask split into eight tasks must stay one request in the panel. Tasks
+-- created before `origin` existed fall back to `intent`.
+function M.request_of(task)
+  if type(task) ~= "table" then
+    return ""
+  end
+  if type(task.origin) == "string" and task.origin ~= "" then
+    return task.origin
+  end
+  return type(task.intent) == "string" and task.intent or ""
+end
+
 function M.rows(tasks, opts)
   opts = type(opts) == "table" and opts or {}
   local frame = opts.frame or 0
@@ -372,7 +386,7 @@ function M.rows(tasks, opts)
         spinner = M.spinner(frame),
         active = not TERMINAL[task.status],
         waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
-        intent = type(task.intent) == "string" and task.intent or "",
+        intent = M.request_of(task),
         depends_on = M.short_deps(task.depends_on),
         depends_on_ids = type(task.depends_on) == "table" and task.depends_on or {},
         branch = type(task.branch) == "string" and task.branch ~= "" and task.branch or nil,
@@ -667,7 +681,7 @@ function M.lines(tasks, opts)
   -- hides, so the header shows the real size of the split.
   local total = {}
   for _, task in ipairs(M.collect(tasks)) do
-    local intent = type(task.intent) == "string" and task.intent or ""
+    local intent = M.request_of(task)
     total[intent] = (total[intent] or 0) + 1
   end
 
@@ -723,7 +737,7 @@ function M.panes(tasks, opts)
 
   local total = {}
   for _, task in ipairs(M.collect(tasks)) do
-    local intent = type(task.intent) == "string" and task.intent or ""
+    local intent = M.request_of(task)
     total[intent] = (total[intent] or 0) + 1
   end
 
