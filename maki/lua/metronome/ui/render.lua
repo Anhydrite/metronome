@@ -211,6 +211,111 @@ function M.short_deps(deps)
   return table.concat(out, ",")
 end
 
+-- The one-cell status glyph a row and a PERT node carry.
+local STATUS_ICON = {
+  merged = "✓", deployed = "✓",
+  running = "▶", verifying = "▶", reviewing = "▶",
+  merging = "▶", deploying = "▶", changes_requested = "▶",
+  failed = "✗", stalled = "✗", abandoned = "✗",
+}
+
+function M.status_icon(status)
+  return STATUS_ICON[status] or "☐"
+end
+
+function M.status_icon_style(status)
+  if status == "failed" or status == "stalled" or status == "abandoned" then
+    return "bad"
+  end
+  if status == "merged" or status == "deployed" then
+    return "ok"
+  end
+  if STATUS_ICON[status] == "▶" then
+    return "run"
+  end
+  return "ready"
+end
+
+-- Earliest/latest start and finish for every task of one intention, plus the
+-- slack. A task is on the critical path when its slack is zero: any delay to
+-- it delays the whole request. Durations are unit unless `row.estimate` is a
+-- positive number. A cycle leaves the unreached tasks without info, and the
+-- caller draws them flat.
+function M.critical(rows)
+  local by_id, deps, succ = {}, {}, {}
+  for _, row in ipairs(rows or {}) do
+    by_id[row.id] = row
+    deps[row.id] = {}
+    succ[row.id] = {}
+  end
+  for _, row in ipairs(rows or {}) do
+    for _, dep in ipairs(row.depends_on_ids or {}) do
+      if by_id[dep] and dep ~= row.id then
+        deps[row.id][#deps[row.id] + 1] = dep
+        succ[dep][#succ[dep] + 1] = row.id
+      end
+    end
+  end
+
+  local indeg, queue = {}, {}
+  for id in pairs(by_id) do
+    indeg[id] = #deps[id]
+    if indeg[id] == 0 then
+      queue[#queue + 1] = id
+    end
+  end
+  table.sort(queue)
+  local order = {}
+  while #queue > 0 do
+    local id = table.remove(queue, 1)
+    order[#order + 1] = id
+    for _, s in ipairs(succ[id]) do
+      indeg[s] = indeg[s] - 1
+      if indeg[s] == 0 then
+        queue[#queue + 1] = s
+      end
+    end
+  end
+
+  local duration_of = function(row)
+    local n = tonumber(row and row.estimate)
+    if n and n > 0 then
+      return n
+    end
+    return 1
+  end
+
+  local info = {}
+  local total = 0
+  for _, id in ipairs(order) do
+    local es = 0
+    for _, dep in ipairs(deps[id]) do
+      if info[dep] then
+        es = math.max(es, info[dep].ef)
+      end
+    end
+    local ef = es + duration_of(by_id[id])
+    info[id] = { es = es, ef = ef }
+    if ef > total then
+      total = ef
+    end
+  end
+  for i = #order, 1, -1 do
+    local id = order[i]
+    local lf = total
+    for _, s in ipairs(succ[id]) do
+      if info[s] then
+        lf = math.min(lf, info[s].ls)
+      end
+    end
+    info[id].lf = lf
+    info[id].ls = lf - duration_of(by_id[id])
+    info[id].slack = info[id].ls - info[id].es
+    info[id].critical = info[id].slack == 0
+  end
+  return info
+end
+
 -- Normalise the projection to a list. state.tasks is a map, but the tests and
 -- a future scheduler may hand us an array; accept both and drop anything that
 -- is not a task.
@@ -329,6 +434,7 @@ function M.tree(rows)
   for _, row in ipairs(rows or {}) do
     by_id[row.id] = row
   end
+  local crit = M.critical(rows)
 
   local children = {}
   local parent_of = {}
@@ -385,6 +491,8 @@ function M.tree(rows)
       prefix = line_prefix,
       depth = depth,
       extra_deps = #extra > 0 and table.concat(extra, ",") or nil,
+      icon = M.status_icon(row.status),
+      critical = crit[row.id] and crit[row.id].critical or false,
     }
     local kids = children[row.id] or {}
     for i, kid in ipairs(kids) do
@@ -514,7 +622,9 @@ function M.row_line(row, opts)
   if row.prefix and row.prefix ~= "" then
     spans[#spans + 1] = { row.prefix, "dim" }
   end
-  spans[#spans + 1] = { row.short_id, "dim" }
+  local icon = row.icon or M.status_icon(row.status)
+  spans[#spans + 1] = { icon, M.status_icon_style(row.status) }
+  spans[#spans + 1] = { row.short_id, row.critical and "run" or "dim" }
   spans[#spans + 1] = { "  " }
   spans[#spans + 1] = { M.fit(row.title, opts.title_max or 26) }
   spans[#spans + 1] = { "  " }
@@ -581,6 +691,133 @@ function M.lines(tasks, opts)
     end
   end
   return lines, display, counts, row_lines
+end
+
+-- A short state summary for an intention, used in the left column.
+function M.intent_summary(group)
+  local counts = M.counts(group and group.rows or {})
+  local parts = {}
+  if counts.questions > 0 then parts[#parts + 1] = counts.questions .. " blocked" end
+  if counts.failures > 0 then parts[#parts + 1] = counts.failures .. " failed" end
+  if counts.review > 0 then parts[#parts + 1] = counts.review .. " review" end
+  if counts.progress > 0 then parts[#parts + 1] = counts.progress .. " progress" end
+  if #parts == 0 then
+    return "nothing to do"
+  end
+  return table.concat(parts, " · ")
+end
+
+-- Two columns: the requests on the left, the detail of the selected one on the
+-- right. The left is an index of intentions with their state; the right is the
+-- schema of the selected intention: its dependency tree, each task with its
+-- status and progress. `opts.selected_intent` picks the detail (1-based).
+--
+-- Returns `lines, rows, counts, row_lines, groups, selected`. `rows` are the
+-- selected intention's tasks in display order, so the panel's cursor and its
+-- actions keep working on a task. `row_lines[i]` is the buffer line of row i.
+function M.panes(tasks, opts)
+  opts = type(opts) == "table" and opts or {}
+  local rows = M.rows(tasks, opts)
+  local groups = M.groups(rows)
+  local counts = M.counts(rows)
+
+  local total = {}
+  for _, task in ipairs(M.collect(tasks)) do
+    local intent = type(task.intent) == "string" and task.intent or ""
+    total[intent] = (total[intent] or 0) + 1
+  end
+
+  local selected = tonumber(opts.selected_intent) or 1
+  if selected < 1 then selected = 1 end
+  if selected > #groups then selected = #groups end
+
+  local left_width = tonumber(opts.left_width) or 40
+
+  -- Left column: one compact line per intention, with the four status icons.
+  local function status_counts(group)
+    local c = { done = 0, running = 0, failed = 0, todo = 0 }
+    for _, row in ipairs(group.rows or {}) do
+      local s = row.status
+      if s == "merged" or s == "deployed" then
+        c.done = c.done + 1
+      elseif s == "failed" or s == "stalled" or s == "abandoned" then
+        c.failed = c.failed + 1
+      elseif s == "running" or s == "verifying" or s == "reviewing"
+        or s == "merging" or s == "deploying" or s == "changes_requested" then
+        c.running = c.running + 1
+      else
+        c.todo = c.todo + 1
+      end
+    end
+    return c
+  end
+
+  local left = {}
+  left[#left + 1] = { text = "REQUESTS", style = "bold" }
+  for i, group in ipairs(groups) do
+    local c = status_counts(group)
+    local marker = i == selected and "▸ " or "  "
+    local label = group.intent ~= "" and ('"' .. group.intent .. '"') or "(no intention)"
+    local icons = string.format("✓%d ▶%d ✗%d ☐%d", c.done, c.running, c.failed, c.todo)
+    left[#left + 1] = {
+      text = marker .. M.fit(label, left_width - 17) .. "  " .. icons,
+      style = i == selected and "bold" or "dim",
+    }
+  end
+
+  -- Right column: the selected intention's schema.
+  local right = {}
+  if #groups == 0 then
+    right[#right + 1] = { spans = { { "(no tasks)", "dim" } } }
+  else
+    local group = groups[selected]
+    if group.intent ~= "" then
+      right[#right + 1] = { spans = M.intent_line(group, opts, total[group.intent]) }
+    end
+    for _, entry in ipairs(M.tree(group.rows)) do
+      local row = entry.row
+      row.prefix = entry.prefix
+      row.extra_deps = entry.extra_deps
+      row.icon = entry.icon
+      row.critical = entry.critical
+      right[#right + 1] = { spans = M.row_line(row, opts), row = row }
+    end
+  end
+
+  local lines = {}
+  for _, line in ipairs((M.summary_lines(rows))) do
+    lines[#lines + 1] = line
+  end
+  lines[#lines + 1] = ""
+
+  local display = {}
+  local row_lines = {}
+  local height = math.max(#left, #right)
+  for i = 1, height do
+    local l = left[i]
+    local ltext = l and l.text or ""
+    local lstyle = l and l.style or "dim"
+    local fitted = M.fit(ltext, left_width)
+    local pad = left_width - display_width(fitted)
+    if pad < 0 then pad = 0 end
+    local spans = {
+      { fitted .. string.rep(" ", pad), lstyle },
+      { " │ ", "dim" },
+    }
+    local r = right[i]
+    if r then
+      for _, span in ipairs(r.spans) do
+        spans[#spans + 1] = span
+      end
+    end
+    lines[#lines + 1] = spans
+    if r and r.row then
+      display[#display + 1] = r.row
+      row_lines[#display] = #lines
+    end
+  end
+
+  return lines, display, counts, row_lines, groups, selected
 end
 
 -- Draw into a maki buffer. The buffer is injected so the tests can pass a

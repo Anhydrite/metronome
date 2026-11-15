@@ -151,7 +151,8 @@ return function()
   has(g_joined, '"login"', "the panel shows the other intention")
   has(g_joined, "2 tasks", "the header counts the tasks the intention produced")
   has(g_joined, "⎇ auth-core-0001", "a row shows its branch")
-  has(g_joined, "└─▶ T-…0002", "a dependent task is indented under its dependency")
+  has(g_joined, "└─▶", "a dependent task is indented under its dependency")
+  has(g_joined, "T-…0002", "the dependent task is named")
 
   -- the dependency tree is the schema --------------------------------------
   local tree_rows = render.rows({
@@ -171,6 +172,43 @@ return function()
   eq(tree[4].row.id, "T-20261115-0104", "the last child closes the branch")
   eq(tree[4].prefix, "└─▶ ", "the last child uses the closing branch")
   eq(tree[4].extra_deps, "T-…0102", "a second dependency is kept as an extra edge")
+
+  -- critical path -----------------------------------------------------------
+  local crit_rows = render.rows({
+    { id = "T-1", title = "a", status = "ready", depends_on = {} },
+    { id = "T-2", title = "b", status = "ready", depends_on = { "T-1" } },
+    { id = "T-3", title = "c", status = "ready", depends_on = { "T-1" } },
+    { id = "T-4", title = "d", status = "ready", depends_on = { "T-2" } },
+  })
+  local crit = render.critical(crit_rows)
+  eq(crit["T-1"].critical, true, "the root is on the critical path")
+  eq(crit["T-2"].critical, true, "the longest branch is critical")
+  eq(crit["T-3"].critical, false, "the short branch has slack")
+  eq(crit["T-3"].slack, 1, "the short branch can slip one unit")
+  eq(crit["T-4"].es, 2, "the end waits for the longest branch")
+  eq(crit["T-4"].ef, 3, "the end finishes after one unit")
+
+  -- panes ------------------------------------------------------------------
+  local pane_tasks = {
+    { id = "T-1", title = "auth", status = "running", intent = "login", depends_on = {} },
+    { id = "T-2", title = "routes", status = "ready", intent = "login", depends_on = { "T-1" } },
+    { id = "T-3", title = "export", status = "failed", intent = "export", depends_on = {} },
+  }
+  local pane_lines, pane_rows, _, pane_row_lines, pane_groups, pane_selected =
+    render.panes(pane_tasks, { selected_intent = 2 })
+  eq(#pane_groups, 2, "panes groups by intention")
+  eq(pane_selected, 2, "panes honours the selected intention")
+  eq(#pane_rows, 2, "panes shows the selected intention's tasks")
+  eq(pane_row_lines[1] < pane_row_lines[2], true, "panes maps rows to buffer lines")
+  local pane_text = {}
+  for _, line in ipairs(pane_lines) do
+    pane_text[#pane_text + 1] = render.text(line)
+  end
+  local pane_joined = table.concat(pane_text, "\n")
+  has(pane_joined, "REQUESTS", "panes renders the left column")
+  has(pane_joined, "✓0", "panes shows the status icons")
+  has(pane_joined, "▶1", "panes counts the running task")
+  has(pane_joined, "☐1", "panes counts the todo task")
 
   -- an intentionless task is rendered flat, with no header
   local flat = render.lines({ task("T-20261115-0004", "legacy", "ready") })

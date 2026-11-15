@@ -162,10 +162,23 @@ function M.refresh(panel)
   if not state then
     return nil, err
   end
-  local lines, rows, counts, row_lines = panel.render.lines(state.tasks, {
-    quiet = panel.quiet,
-    frame = panel.frame,
-  })
+  local lines, rows, counts, row_lines, groups, selected
+  if type(panel.render.panes) == "function" then
+    lines, rows, counts, row_lines, groups, selected = panel.render.panes(state.tasks, {
+      quiet = panel.quiet,
+      frame = panel.frame,
+      selected_intent = panel.intent_index,
+    })
+    panel.groups = groups
+    if selected then
+      panel.intent_index = selected
+    end
+  else
+    lines, rows, counts, row_lines = panel.render.lines(state.tasks, {
+      quiet = panel.quiet,
+      frame = panel.frame,
+    })
+  end
   panel.rows = rows
   panel.counts = counts
   -- The renderer returns the buffer line of every row, because group headers
@@ -373,7 +386,27 @@ function M.move(panel, delta)
   if #panel.rows == 0 then
     return nil
   end
-  panel.cursor = math.max(1, math.min(#panel.rows, panel.cursor + delta))
+  local next_index = panel.cursor + delta
+  if next_index >= 1 and next_index <= #panel.rows then
+    panel.cursor = next_index
+    if panel.win and type(panel.win.set_cursor) == "function" then
+      panel.win:set_cursor((panel.row_line and panel.row_line[panel.cursor]) or panel.cursor)
+    end
+    return panel.cursor
+  end
+  -- At the edge of the current intention, cross to the next/previous one.
+  local groups = panel.groups or {}
+  local target = (panel.intent_index or 1) + (delta > 0 and 1 or -1)
+  if target < 1 or target > #groups then
+    panel.cursor = delta > 0 and #panel.rows or 1
+    if panel.win and type(panel.win.set_cursor) == "function" then
+      panel.win:set_cursor((panel.row_line and panel.row_line[panel.cursor]) or panel.cursor)
+    end
+    return panel.cursor
+  end
+  panel.intent_index = target
+  M.refresh(panel)
+  panel.cursor = delta > 0 and 1 or math.max(1, #panel.rows)
   if panel.win and type(panel.win.set_cursor) == "function" then
     panel.win:set_cursor((panel.row_line and panel.row_line[panel.cursor]) or panel.cursor)
   end
