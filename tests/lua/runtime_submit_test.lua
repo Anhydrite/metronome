@@ -716,9 +716,13 @@ return function()
     review = { review = function() return { ok = true, approved = true } end },
     git = {
       pr_open = function() return { number = 1, url = "u", state = "open" } end,
-      reset_hard = function(_, ref)
+      rev_parse = function(_, ref)
+        eq(ref, "origin/main", "the fresh base is resolved before the reset")
+        return "base123"
+      end,
+      reset_hard = function(_, sha)
         resets = resets + 1
-        eq(ref, "origin/main", "the branch is reset to the fresh base")
+        eq(sha, "base123", "the branch is reset to the resolved fresh base")
         return "sha"
       end,
     },
@@ -1116,6 +1120,10 @@ auto_deploy = false
     git = {
       pr_open = function() return { number = 1, url = "u", state = "open" } end,
       push = function() return true end,
+      rev_parse = function(_, ref)
+        eq(ref, "origin/main", "the fresh base is resolved before the reset")
+        return "base123"
+      end,
       reset_hard = function()
         resets = resets + 1
         return "sha"
@@ -1207,6 +1215,7 @@ auto_deploy = false
     git = {
       pr_open = function() return { number = 1, url = "u", state = "open" } end,
       push = function() return true end,
+      rev_parse = function() return "base123" end,
       reset_hard = function() second_resets = second_resets + 1; return "sha" end,
     },
     merge = {

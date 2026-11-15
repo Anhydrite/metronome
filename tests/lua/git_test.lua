@@ -372,6 +372,18 @@ return function()
   eq(dwt, detach_wt, "detached worktree path returned")
   eq(git.current_branch(detach_wt), "HEAD", "detached worktree has no branch")
 
+  -- rev_parse resolves a ref for reset_hard, which only takes a sha --------
+  local head_now = git.head_sha(repo)
+  local resolved, rperr = git.rev_parse(repo, "main")
+  eq(rperr, nil, "rev_parse resolves a branch: " .. tostring(rperr))
+  eq(resolved, head_now, "rev_parse returns the commit sha")
+  local bad_reset, bad_reset_err = git.reset_hard(repo, "origin/main")
+  eq(bad_reset, nil, "reset_hard refuses a ref")
+  eq(type(bad_reset_err), "string", "the refusal explains itself")
+  local bad_ref, bad_ref_err = git.rev_parse(repo, "no-such-ref")
+  eq(bad_ref, nil, "rev_parse refuses an unknown ref")
+  eq(type(bad_ref_err), "string", "the refusal explains itself")
+
   -- ls_tree / show_file: the qualifier reads the committed tree -------------
   --
   -- The qualifier must describe `origin/<base>`, not whatever the local

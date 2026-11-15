@@ -453,6 +453,13 @@ function M.new(deps)
     if type(repo) == "string" and repo ~= "" and repo ~= paths.repo then
       paths = M.paths({ repo = repo, root = paths.root })
     end
+    -- A bound project needs its role prompts on disk. `init` writes them, but a
+    -- state directory that only carries a config (a copied project, a partial
+    -- restore) would otherwise fail mid-run with a raw "missing prompt" error.
+    -- The write is idempotent and never overwrites a prompt the user edited.
+    if type(paths.prompts) == "string" and paths.prompts ~= "" then
+      write_prompts(paths.prompts)
+    end
     return cfg, nil, paths
   end
 
@@ -686,7 +693,12 @@ function M.new(deps)
             -- a real failure and goes to the user.
             if not repaired and conflict_repairs(task) < MAX_CONFLICT_REPAIRS
               and type(deps.git.reset_hard) == "function" then
-              local reset = deps.git.reset_hard(worktree, "origin/" .. cfg.project.base_ref)
+              -- `reset_hard` takes a sha, never a ref: resolve the fresh base
+              -- first, or the reset is refused and the repair silently does
+              -- nothing.
+              local base_sha = type(deps.git.rev_parse) == "function"
+                and deps.git.rev_parse(worktree, "origin/" .. cfg.project.base_ref) or nil
+              local reset = base_sha and deps.git.reset_hard(worktree, base_sha) or nil
               if reset then
                 log(paths, "task " .. task_id .. " conflicted with the fresh base on "
                   .. tostring(rebase_diag.conflict) .. "; redoing it on the fresh base")
@@ -895,8 +907,10 @@ function M.new(deps)
       -- branch back to the fresh base and let the implementer redo the work
       -- there. One repair only; a second conflict is a real failure.
       if merged.conflict and conflict_repairs(task) < MAX_CONFLICT_REPAIRS then
-        local reset = deps.git.reset_hard
-          and deps.git.reset_hard(worktree, "origin/" .. cfg.project.base_ref)
+        local base_sha = deps.git.rev_parse
+          and deps.git.rev_parse(worktree, "origin/" .. cfg.project.base_ref) or nil
+        local reset = base_sha and deps.git.reset_hard
+          and deps.git.reset_hard(worktree, base_sha) or nil
         if reset then
           log(paths, "task " .. task_id .. " hit a merge conflict on "
             .. tostring(merged.conflict_files) .. "; redoing it on the fresh base")

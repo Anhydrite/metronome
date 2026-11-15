@@ -480,6 +480,31 @@ function M.ahead_count(repo, base, opts)
   return n
 end
 
+-- Resolve a ref (`origin/main`, a tag, a branch) to the commit it names.
+-- `reset_hard` only accepts a sha on purpose, so a caller that holds a ref
+-- resolves it here first instead of passing a name the reset would refuse.
+function M.rev_parse(worktree, ref)
+  if type(worktree) ~= "string" or worktree == "" then
+    return nil, "rev_parse needs a worktree"
+  end
+  if type(ref) ~= "string" or ref == "" or ref:match("^%-") then
+    return nil, "rev_parse needs a ref"
+  end
+  local result, err = run({ "git", "-C", worktree, "rev-parse", "--verify", ref .. "^{commit}" })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    local _, ferr = fail("rev-parse " .. ref, result)
+    return nil, ferr
+  end
+  local sha = (result.stdout:gsub("%s+$", ""))
+  if not sha:match("^[0-9a-f]+$") then
+    return nil, "rev-parse " .. ref .. " returned no commit"
+  end
+  return sha
+end
+
 function M.head_sha(worktree)
   local result, err = run({ "git", "-C", worktree, "rev-parse", "HEAD" })
   if not result then
