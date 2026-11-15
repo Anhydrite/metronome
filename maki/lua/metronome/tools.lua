@@ -16,7 +16,7 @@ function M.definitions()
   return {
     {
       name = "metronome_submit",
-      description = "Create an intent from an intention and start qualification. Blocks until qualification returns, then answers with the created tasks (or the questions the qualifier raised). The pipeline then runs in the background: do not poll with sleeps, call metronome_status only when you need it.",
+      description = "Create an intent from an intention and start qualification. Call it as soon as the request is clear, with the intention verbatim: do not explore, read or analyze the repository first — the qualifier does that. Blocks until qualification returns, then answers with the created tasks (or the questions the qualifier raised). The pipeline then runs in the background: do not poll with sleeps, call metronome_status only when you need it.",
       permission = "run",
       schema = {
         type = "object",
@@ -28,7 +28,7 @@ function M.definitions()
           complexity = {
             type = "string",
             enum = { "auto", "fast", "full" },
-            description = "Your judgement of the work. `fast`: one obvious change in one place, no qualifier needed. `full`: several files, a design choice, or an ambiguous ask. `auto` (default): let Metronome decide from the wording. If you are unsure, ask the user with the `question` tool before submitting.",
+            description = "Leave it at `auto` unless the user explicitly asks for `fast` or `full`. Do not read the repository to choose it: `auto` lets Metronome decide from the wording, and a wrong guess costs less than an analysis turn.",
           },
         },
         required = { "intention" },

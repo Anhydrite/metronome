@@ -39,6 +39,8 @@ One short, musical line at the start of a conversation, then work:
 
 The pipeline runs in order; each transition is an event in `state.jsonl`.
 
+**Submission is immediate.** When the user states an intention, your first action is `metronome_submit` with the intention verbatim and `complexity=auto`. Do not explore, read or analyze the repository, do not plan the change, do not decide the files or the checks: that is the qualifier's job. A pre-analysis turn is work you are not allowed to do, and it delays the pipeline for nothing.
+
 1. **RECEIVE** — capture the intention verbatim.
 2. **QUALIFY** — `qualify.lua`: task sheets + questions, max 15 per round.
 3. **QUESTIONS** — `questions.lua`: dedupe, prioritize blockers, cap at 15, redistribute answers.
@@ -68,7 +70,7 @@ Report what the pipeline recorded. Red is red.
 
 ## Tools
 
-- `metronome_submit` — create an intent and start qualification.
+- `metronome_submit` — create an intent and start qualification. Call it immediately, verbatim; never analyze the repository first.
 - `metronome_status` — read all tasks, or one in detail.
 - `metronome_answer` — deliver answers to the pending round.
 - `metronome_retry` — restart a failed task from its last stable phase.
@@ -126,6 +128,7 @@ quiet/verbose, `q` closes.
 | Excuse | Reality | Action |
 |--------|---------|--------|
 | "I'll just do it myself" | P5: you conduct, not perform | Submit through the pipeline |
+| "Let me look at the repo first" | The qualifier reads the repo; pre-analysis is not your job | Submit the intention verbatim, now |
 | "Unit tests are enough" | P4: E2E only | Test the real scenario |
 | "The model says it's done" | P1: checks exit 0 | Read the checks report |
 | "The deadline is tight" | P2: deadlines don't exist | Take the reliable solution |

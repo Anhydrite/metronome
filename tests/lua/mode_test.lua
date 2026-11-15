@@ -39,6 +39,12 @@ return function()
   eq(text:find("`question` tool", 1, true) ~= nil, true, "the directive asks the user with the question tool")
   eq(text:find("Never invent an answer", 1, true) ~= nil, true, "the directive forbids inventing answers")
   eq(text:find("Never sleep, poll", 1, true) ~= nil, true, "the directive forbids polling for a task")
+  eq(text:find("Submit immediately", 1, true) ~= nil, true, "the directive submits immediately")
+  eq(text:find("verbatim", 1, true) ~= nil, true, "the directive submits the intention verbatim")
+  eq(text:find("Do not explore, read or analyze the repository", 1, true) ~= nil, true,
+    "the directive forbids pre-analysis")
+  eq(text:find("judge the complexity yourself", 1, true), nil,
+    "the directive no longer asks the agent to analyze the scope")
   eq(text:find("code_execution", 1, true) ~= nil, true, "the directive forbids code_execution polling")
   eq(text:find("ajoute une tache export CSV", 1, true) ~= nil, true, "the directive keeps the request")
 
