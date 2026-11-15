@@ -96,6 +96,10 @@ function M.rebase(opts)
   if not is_non_empty(opts.worktree) then
     return nil, "rebase needs a worktree"
   end
+  if not fs.metadata(opts.worktree) then
+    return nil, "worktree is gone: " .. tostring(opts.worktree)
+      .. " (re-implement the task before merging)"
+  end
 
   local remote = is_non_empty(opts.remote) and opts.remote or "origin"
   local base = is_non_empty(opts.base) and opts.base or "main"
@@ -141,6 +145,10 @@ function M.merge_pr(opts)
   end
   if not is_non_empty(opts.worktree) then
     return nil, "merge_pr needs a worktree"
+  end
+  if not fs.metadata(opts.worktree) then
+    return nil, "worktree is gone: " .. tostring(opts.worktree)
+      .. " (re-implement the task before merging)"
   end
 
   local method = is_non_empty(opts.method) and opts.method or "squash"

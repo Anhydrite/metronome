@@ -39,7 +39,9 @@ local TRANSITIONS = {
   deployed = {},
   failed = { running = true, abandoned = true },
   stalled = { running = true, failed = true, abandoned = true },
-  abandoned = { running = true },
+  -- A retried task that re-enters review can hit the round limit while it is
+  -- still abandoned; escalation must be able to fail it, not error out.
+  abandoned = { running = true, failed = true },
 }
 
 function M.can_transition(from, to)
@@ -114,7 +116,7 @@ end
 -- base waiting to be deployed and the single-flight lock that says which
 -- deployer is currently draining it.
 local function new_state()
-  return { tasks = {}, events = 0, deploy = { pending = nil, lock = nil } }
+  return { tasks = {}, ids = {}, events = 0, deploy = { pending = nil, lock = nil } }
 end
 
 -- Replay a journal into
@@ -148,6 +150,9 @@ function M.replay(text)
         if kind == "task_created" then
           state.tasks[id] = event.task or { id = id }
           state.tasks[id].id = id
+          -- An id is never reused, even after the task is deleted: keep every
+          -- id ever created so next_id can never hand out a freed one.
+          state.ids[id] = true
         elseif event.kind == "task_deleted" then
           state.tasks[id] = nil
         elseif state.tasks[id] then
@@ -155,6 +160,9 @@ function M.replay(text)
           if event.kind == "status" then
             task.status = event.status
             task.phase = event.phase or task.phase
+            if type(event.reason) == "string" and event.reason ~= "" then
+              task.failure_reason = event.reason
+            end
           elseif event.kind == "field" then
             for k, v in pairs(event.fields or {}) do
               task[k] = v
@@ -229,6 +237,14 @@ local function normalize(state)
   end
   if type(state.deploy) ~= "table" then
     state.deploy = {}
+  end
+  if type(state.ids) ~= "table" then
+    -- A projection written before the id ledger existed: rebuild it from the
+    -- tasks it still holds. Deleted ids are lost once, then never again.
+    state.ids = {}
+    for id in pairs(state.tasks) do
+      state.ids[id] = true
+    end
   end
   if type(state.deploy.pending) ~= "table" then
     state.deploy.pending = nil
@@ -485,6 +501,9 @@ function M.transition(root, task_id, to, extra)
     task_id = task_id,
     status = to,
     phase = extra and extra.phase or nil,
+    -- A failure without a reason is a dead end for the user: persist it so
+    -- the journal, the projection and the panel all carry it.
+    reason = extra and extra.reason or nil,
   }
   local new_state, err = M.append(root, event)
   if not new_state then

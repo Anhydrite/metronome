@@ -148,6 +148,23 @@ return function()
   eq(split_groups[1].intent, "add a login system", "the request is the submitted intention")
   eq(#split_groups[1].rows, 3, "all three tasks belong to it")
 
+  -- The PERT graph is the dependency schema: nodes, arrows, critical path.
+  local pert_rows = render.rows(grouped)
+  local pert_lines, pert_order, pert_node_line = render.pert(pert_rows)
+  eq(#pert_lines > 0, true, "pert returns lines")
+  eq(#pert_order, #pert_rows, "pert orders every row")
+  eq(type(pert_node_line[pert_order[1].id]), "number", "pert maps a row to its line")
+  local pert_text = {}
+  for _, spans in ipairs(pert_lines) do
+    local parts = {}
+    for _, span in ipairs(spans) do parts[#parts + 1] = span[1] end
+    pert_text[#pert_text + 1] = table.concat(parts)
+  end
+  local pert_joined = table.concat(pert_text, "\n")
+  has(pert_joined, "▶", "the pert graph draws an arrow")
+  local chain = render.critical_chain(pert_rows)
+  eq(#chain >= 2, true, "the critical path has at least one edge")
+
   local g_lines, g_rows, _, g_row_lines = render.lines(grouped)
   eq(g_rows[1].id, "T-20261115-0003", "display order puts the failure first")
   eq(g_rows[2].id, "T-20261115-0001", "then the login group")

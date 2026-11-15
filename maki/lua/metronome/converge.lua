@@ -461,8 +461,18 @@ local function run_impl(opts)
     }
   end
 
+  -- A failed convergence must carry a reason. Without it the caller falls
+  -- back to "task failed" and the user never learns which file was missing or
+  -- out of scope.
+  local err = nil
+  if not after.ok then
+    local first = type(after.findings) == "table" and after.findings[1] or nil
+    local detail = first and (first.message or first.kind) or "diff does not match the sheet"
+    err = "convergence failed: " .. tostring(detail)
+  end
   return {
     ok = after.ok,
+    error = err,
     findings = after.findings,
     comparison = after.comparison,
     stat = after.stat,

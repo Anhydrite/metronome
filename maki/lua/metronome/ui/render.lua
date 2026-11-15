@@ -316,6 +316,44 @@ function M.critical(rows)
   return info
 end
 
+-- The critical path, root to leaf, as a list of ids. A delay on any of these
+-- delays the whole request, which is what the panel must make obvious. An
+-- empty list means there is no dependency edge at all.
+function M.critical_chain(rows)
+  local info = M.critical(rows)
+  local by_id = {}
+  for _, row in ipairs(rows or {}) do
+    by_id[row.id] = row
+  end
+  local last, best = nil, -1
+  for id, node in pairs(info) do
+    if node.critical and node.ef > best then
+      last, best = id, node.ef
+    end
+  end
+  if not last then
+    return {}
+  end
+  local chain = { last }
+  local seen = { [last] = true }
+  while true do
+    local row = by_id[chain[1]]
+    local pick, pick_ef = nil, -1
+    for _, dep in ipairs(row and row.depends_on_ids or {}) do
+      local node = info[dep]
+      if node and node.critical and not seen[dep] and node.ef > pick_ef then
+        pick, pick_ef = dep, node.ef
+      end
+    end
+    if not pick then
+      break
+    end
+    table.insert(chain, 1, pick)
+    seen[pick] = true
+  end
+  return chain
+end
+
 -- Normalise the projection to a list. state.tasks is a map, but the tests and
 -- a future scheduler may hand us an array; accept both and drop anything that
 -- is not a task.
@@ -527,6 +565,254 @@ function M.tree(rows)
   end
   return out
 end
+
+-- PERT graph ----------------------------------------------------------------
+
+-- The four-hex tail of an id, the label a node carries in the graph.
+local function node_label(id)
+  local s = tostring(id or "")
+  local tail = s:match("([0-9a-zA-Z]+)$") or s
+  if #tail > 4 then
+    tail = tail:sub(-4)
+  end
+  return tail
+end
+
+-- Draw one request's dependency graph left to right, the way a PERT chart
+-- reads: nodes in columns by earliest start, arrows between them, the critical
+-- path in the running style. A shared child is drawn once and every parent
+-- points at it, so the picture is the DAG, not a spanning tree.
+--
+-- Returns `lines, order, node_line`: styled lines, the reading order of rows
+-- (topological, layer by layer), and the 1-based line each row starts on.
+-- `node_line` is what lets the panel keep its cursor on a task even though a
+-- line may hold several nodes.
+function M.pert(rows)
+  rows = rows or {}
+  local by_id = {}
+  for _, row in ipairs(rows) do
+    by_id[row.id] = row
+  end
+  local deps, kids = {}, {}
+  for _, row in ipairs(rows) do
+    deps[row.id] = {}
+    kids[row.id] = {}
+  end
+  for _, row in ipairs(rows) do
+    for _, dep in ipairs(row.depends_on_ids or {}) do
+      if by_id[dep] and dep ~= row.id then
+        deps[row.id][#deps[row.id] + 1] = dep
+        kids[dep][#kids[dep] + 1] = row.id
+      end
+    end
+  end
+
+  -- Layer = longest path from a root (the earliest start column). A cycle is
+  -- broken at the back edge so the panel never hangs.
+  local layer, visiting = {}, {}
+  local function lay(id)
+    if layer[id] then
+      return layer[id]
+    end
+    if visiting[id] then
+      return 0
+    end
+    visiting[id] = true
+    local l = 0
+    for _, dep in ipairs(deps[id]) do
+      l = math.max(l, lay(dep) + 1)
+    end
+    visiting[id] = nil
+    layer[id] = l
+    return l
+  end
+  for _, row in ipairs(rows) do
+    lay(row.id)
+  end
+
+  local max_layer = 0
+  for _, row in ipairs(rows) do
+    if layer[row.id] > max_layer then
+      max_layer = layer[row.id]
+    end
+  end
+
+  local layers = {}
+  for _, row in ipairs(rows) do
+    local l = layer[row.id]
+    layers[l] = layers[l] or {}
+    layers[l][#layers[l] + 1] = row
+  end
+
+  -- Rows: a node sits near the barycenter of its parents, then the first free
+  -- row, so a child lands between its parents instead of far below them.
+  local row_of, used, next_row = {}, {}, 0
+  for l = 0, max_layer do
+    local list = layers[l] or {}
+    local desired = {}
+    for _, row in ipairs(list) do
+      local sum, n = 0, 0
+      for _, dep in ipairs(deps[row.id]) do
+        if row_of[dep] then
+          sum = sum + row_of[dep]
+          n = n + 1
+        end
+      end
+      desired[row.id] = n > 0 and (sum / n) or nil
+    end
+    table.sort(list, function(a, b)
+      local da, db = desired[a.id], desired[b.id]
+      if da and db and da ~= db then
+        return da < db
+      end
+      if da and not db then
+        return true
+      end
+      if db and not da then
+        return false
+      end
+      return a.id < b.id
+    end)
+    for _, row in ipairs(list) do
+      local r
+      if desired[row.id] then
+        r = math.floor(desired[row.id] + 0.5)
+        while used[r] do
+          r = r + 1
+        end
+      else
+        r = next_row
+        while used[r] do
+          r = r + 1
+        end
+      end
+      used[r] = true
+      row_of[row.id] = r
+      if r >= next_row then
+        next_row = r + 1
+      end
+    end
+  end
+
+  local NODE_W = 5
+  local COL_W = 12
+  local width = (max_layer + 1) * COL_W
+  local height = math.max(next_row, 1)
+  local canvas = {}
+  for r = 0, height - 1 do
+    canvas[r] = {}
+    for c = 0, width - 1 do
+      canvas[r][c] = { " ", "dim" }
+    end
+  end
+  local function put(r, c, ch, style)
+    if r >= 0 and r < height and c >= 0 and c < width then
+      canvas[r][c] = { ch, style or "dim" }
+    end
+  end
+  local function hline(r, c1, c2, ch)
+    for c = c1, c2 do
+      put(r, c, ch or "─")
+    end
+  end
+  local function vline(c, r1, r2, ch)
+    for r = r1, r2 do
+      put(r, c, ch or "│")
+    end
+  end
+
+  local pos = {}
+  for _, row in ipairs(rows) do
+    local r, c = row_of[row.id], layer[row.id] * COL_W
+    pos[row.id] = { r, c }
+    local label = node_label(row.id)
+    local style = M.status_icon_style(row.status)
+    put(r, c, M.status_icon(row.status), style)
+    for i = 1, #label do
+      put(r, c + i, label:sub(i, i), style)
+    end
+  end
+
+  for _, row in ipairs(rows) do
+    local pr, pc = pos[row.id][1], pos[row.id][2]
+    local ks = kids[row.id] or {}
+    for _, kid in ipairs(ks) do
+      local cr, cc = pos[kid][1], pos[kid][2]
+      local sx = pc + NODE_W
+      local vx = cc - 2
+      local ax = cc - 1
+      if pr == cr then
+        if vx - 1 >= sx then
+          hline(pr, sx, vx - 1)
+        end
+        put(pr, ax, "▶")
+      else
+        if vx - 1 >= sx then
+          hline(pr, sx, vx - 1)
+        end
+        put(pr, vx, cr > pr and "┐" or "┘")
+        local from, to = math.min(pr, cr) + 1, math.max(pr, cr) - 1
+        if from <= to then
+          vline(vx, from, to)
+        end
+        put(cr, vx, cr > pr and "┴" or "┬")
+        if ax - 1 >= vx + 1 then
+          hline(cr, vx + 1, ax - 1)
+        end
+        put(cr, ax, "▶")
+      end
+    end
+    if #ks > 1 then
+      put(pr, pc + NODE_W, "┬")
+    end
+  end
+
+  local lines = {}
+  for r = 0, height - 1 do
+    local last = 0
+    for c = 0, width - 1 do
+      if canvas[r][c][1] ~= " " then
+        last = c
+      end
+    end
+    local spans, buf, style = {}, {}, nil
+    for c = 0, last do
+      local cell = canvas[r][c]
+      if cell[2] ~= style then
+        if #buf > 0 then
+          spans[#spans + 1] = { table.concat(buf), style }
+        end
+        buf = {}
+        style = cell[2]
+      end
+      buf[#buf + 1] = cell[1]
+    end
+    if #buf > 0 then
+      spans[#spans + 1] = { table.concat(buf), style }
+    end
+    lines[#lines + 1] = spans
+  end
+
+  local order = {}
+  for _, row in ipairs(rows) do
+    order[#order + 1] = row
+  end
+  table.sort(order, function(a, b)
+    if layer[a.id] ~= layer[b.id] then
+      return layer[a.id] < layer[b.id]
+    end
+    if row_of[a.id] ~= row_of[b.id] then
+      return row_of[a.id] < row_of[b.id]
+    end
+    return a.id < b.id
+  end)
+  local node_line = {}
+  for _, row in ipairs(rows) do
+    node_line[row.id] = row_of[row.id] + 1
+  end
+  return lines, order, node_line, layer, row_of
+end
+
 function M.intent_line(group, opts, total)
   opts = type(opts) == "table" and opts or {}
   local text = M.fit(group.intent, opts.intent_max or 70)
@@ -788,12 +1074,37 @@ function M.panes(tasks, opts)
     if group.intent ~= "" then
       right[#right + 1] = { spans = M.intent_line(group, opts, total[group.intent]) }
     end
-    for _, entry in ipairs(M.tree(group.rows)) do
-      local row = entry.row
-      row.prefix = entry.prefix
-      row.extra_deps = entry.extra_deps
-      row.icon = entry.icon
-      row.critical = entry.critical
+
+    -- The PERT graph: the dependency schema of the request, drawn left to
+    -- right with the arrows the DAG actually has.
+    local pert_lines, order = M.pert(group.rows)
+    if #pert_lines > 0 then
+      right[#right + 1] = {
+        spans = { { "PERT", "bold" }, { "  " .. #group.rows .. " nodes", "dim" } },
+      }
+      for _, spans in ipairs(pert_lines) do
+        right[#right + 1] = { spans = spans }
+      end
+      local chain = M.critical_chain(group.rows)
+      if #chain > 1 then
+        local parts = {}
+        for _, id in ipairs(chain) do
+          parts[#parts + 1] = node_label(id)
+        end
+        right[#right + 1] = {
+          spans = { { "critical path  ", "dim" }, { table.concat(parts, " → "), "keyword" } },
+        }
+      end
+    end
+
+    -- The navigable list: one line per task. The graph is the schema; this is
+    -- where the cursor and the actions (Enter, Space, r, d, s) work.
+    right[#right + 1] = { spans = { { "", "dim" } } }
+    for _, row in ipairs(group.rows) do
+      row.prefix = nil
+      row.extra_deps = nil
+      row.icon = M.status_icon(row.status)
+      row.critical = false
       right[#right + 1] = { spans = M.row_line(row, opts), row = row }
     end
   end

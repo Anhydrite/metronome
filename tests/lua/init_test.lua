@@ -62,6 +62,32 @@ return function()
   eq(merged.roles.implementer.model, "new/model", "an update applies the override")
   eq(merged.roles.implementer.thinking, "low", "an update keeps the existing thinking")
 
+  -- A nested or dotted key updates the section it names, and the rendered
+  -- config carries the new value instead of the hardcoded default.
+  local nested = runtime.normalize_init({
+    answers = { review = { max_rounds = 6 } },
+  }, { repo = "/tmp/project" }, current)
+  eq(nested.review.max_rounds, 6, "a nested review.max_rounds is applied")
+  local dotted = runtime.normalize_init({
+    answers = { ["review.max_rounds"] = 7 },
+  }, { repo = "/tmp/project" }, current)
+  eq(dotted.review.max_rounds, 7, "a dotted review.max_rounds is applied")
+  local rendered = runtime.render_config(dotted)
+  eq(rendered:find("max_rounds = 7", 1, true) ~= nil, true,
+    "the rendered config keeps the updated max_rounds")
+
+  -- Changing a model must not reset the sections the update did not name.
+  local kept = runtime.normalize_init({
+    answers = { implementer_model = "new/model" },
+  }, { repo = "/tmp/project" }, {
+    repo = "/tmp/project", base_ref = "develop", max_parallel = 2,
+    checks = { "npm test" }, roles = {},
+    review = { max_rounds = 5, require_checks_green = true },
+    merge = { auto_merge = true, method = "rebase" },
+  })
+  eq(kept.review.max_rounds, 5, "a model change keeps review.max_rounds")
+  eq(kept.merge.method, "rebase", "a model change keeps merge.method")
+
   local current_questions = runtime.init_questions("/tmp/project", current)
   local current_by_key = {}
   for _, question in ipairs(current_questions) do

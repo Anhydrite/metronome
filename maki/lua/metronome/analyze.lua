@@ -523,6 +523,65 @@ function M.analyze(tasks, opts)
     end
   end
 
+  -- undeclared_file_dependency: a sheet whose checks or acceptance name a
+  -- file another sheet produces, without declaring that sheet as a dependency.
+  -- The qualifier split one ask into tasks that must run in order; a missing
+  -- edge makes the scheduler run them together and the reviewer catch it too
+  -- late.
+  local texts = {}
+  for i = 1, #ids do
+    local parts = {}
+    for _, c in ipairs(checksets[i]) do
+      parts[#parts + 1] = c
+    end
+    for _, a in ipairs(string_list(list[i] and list[i].acceptance)) do
+      parts[#parts + 1] = a
+    end
+    texts[i] = table.concat(parts, "\n")
+  end
+  local function depends_on(id, target, seen)
+    seen = seen or {}
+    if seen[id] then
+      return false
+    end
+    seen[id] = true
+    for _, dep in ipairs(dep_map[id] or {}) do
+      if dep == target or depends_on(dep, target, seen) then
+        return true
+      end
+    end
+    return false
+  end
+  for i = 1, #ids do
+    local mine = {}
+    for _, f in ipairs(filesets[i]) do
+      mine[f] = true
+    end
+    for j = 1, #ids do
+      if i ~= j and not depends_on(ids[i], ids[j]) then
+        for _, file in ipairs(filesets[j]) do
+          if not mine[file] then
+            local base = file:match("([^/]+)$") or file
+            local named = texts[i]:find(file, 1, true) ~= nil
+              or (base ~= file and texts[i]:find(base, 1, true) ~= nil)
+            if named then
+              findings[#findings + 1] = {
+                severity = "major",
+                rule = "undeclared_file_dependency",
+                message = string.format(
+                  "task %s names %s, produced by %s, without depending on it",
+                  ids[i], file, ids[j]
+                ),
+                tasks = { ids[i], ids[j] },
+              }
+              break
+            end
+          end
+        end
+      end
+    end
+  end
+
   -- oversized: a sheet too large to review as one pull request.
   for i = 1, #ids do
     if #filesets[i] > max_files then

@@ -82,6 +82,11 @@
       "type": "string",
       "description": "Present only on note: the prose to append.",
       "minLength": 1
+    },
+    "reason": {
+      "type": "string",
+      "description": "Optional on status: why the task moved, persisted for a failure so the panel and the journal never show a bare failed.",
+      "minLength": 1
     }
   },
   "allOf": [

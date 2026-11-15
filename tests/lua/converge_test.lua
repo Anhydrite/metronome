@@ -258,6 +258,9 @@ return function()
   end, { no_sheet = true }))
   eq(noop_err, nil, "a no-op turn has no error")
   eq(nooped and nooped.ok, false, "a no-op turn stays blocked")
+  eq(type(nooped and nooped.error), "string", "a blocked convergence carries a reason")
+  eq(nooped and nooped.error:find("convergence failed", 1, true) ~= nil, true,
+    "the convergence reason names the failure")
   eq(nooped and #nooped.findings, 2, "a no-op turn keeps both findings")
   local noop_before_msgs, noop_after_msgs = {}, {}
   for _, finding in ipairs(noop_before and noop_before.findings or {}) do

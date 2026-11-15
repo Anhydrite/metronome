@@ -30,6 +30,7 @@ return function()
   eq(state.can_transition("deployed", "running"), false, "deployed -> running refused")
   eq(state.can_transition("abandoned", "draft"), false, "abandoned -> draft refused")
   eq(state.can_transition("abandoned", "running"), true, "abandoned -> running allowed for retry")
+  eq(state.can_transition("abandoned", "failed"), true, "abandoned -> failed allowed for escalation")
   eq(state.can_transition("running", "running"), true, "same status is a no-op")
 
   eq(state.is_terminal("merged"), true, "merged is terminal")
@@ -109,12 +110,24 @@ return function()
   eq(snapshot and snapshot.sheet, "# to delete\n", "archive keeps the sheet text")
   eq(state.delete(root, "T-20261114-dead"), true, "delete removes a task")
   eq(state.load(root).tasks["T-20261114-dead"], nil, "deleted task is gone from load")
+  eq(state.load(root).ids["T-20261114-dead"], true, "a deleted id stays reserved")
   eq(#state.archived(root), 1, "the archive survives the delete")
   eq(state.delete(root, "T-20261114-dead"), nil, "deleting an unknown task fails")
 
   local moved, merr = state.transition(root, "T-20261114-a3f2", "qualifying")
   eq(merr, nil, "legal transition has no error")
   eq(moved and moved.status, "qualifying", "status moved")
+
+  -- A failure keeps its reason: the journal, the projection and the panel all
+  -- read it, instead of a bare "task failed".
+  state.create(root, { id = "T-20261114-b001", title = "will fail" })
+  state.transition(root, "T-20261114-b001", "qualifying")
+  local failed = state.transition(root, "T-20261114-b001", "failed", { reason = "checks exited 1" })
+  eq(failed and failed.status, "failed", "task moved to failed")
+  eq(failed and failed.failure_reason, "checks exited 1", "failure reason persisted")
+  local reloaded = state.load(root)
+  eq(reloaded.tasks["T-20261114-b001"].failure_reason, "checks exited 1",
+    "failure reason survives a replay")
 
   local bad, berr = state.transition(root, "T-20261114-a3f2", "merged")
   eq(bad, nil, "illegal transition returns nil")

@@ -172,65 +172,170 @@ end
 -- is not supplied keeps the current value instead of falling back to the
 -- hardcoded default. That makes a model change safe: it does not reset the
 -- checks, the base branch or the merge/deploy policy.
+-- Flatten a nested answers table and dotted keys into one map, so
+-- `{review={max_rounds=6}}` and `{["review.max_rounds"]=6}` mean the same
+-- thing. Arrays are kept as values, not descended into.
+local function flatten_answers(input, prefix, out)
+  out = out or {}
+  for key, value in pairs(input or {}) do
+    local name = prefix and (prefix .. "." .. tostring(key)) or tostring(key)
+    if type(value) == "table" and value[1] == nil and next(value) ~= nil then
+      flatten_answers(value, name, out)
+    else
+      out[name] = value
+    end
+  end
+  return out
+end
+
+local function pick(flat, current_section, key, default)
+  local dotted = flat[key]
+  if dotted ~= nil then
+    return dotted
+  end
+  local leaf = key:match("([^.]+)$") or key
+  if type(current_section) == "table" then
+    if current_section[key] ~= nil then
+      return current_section[key]
+    end
+    if current_section[leaf] ~= nil then
+      return current_section[leaf]
+    end
+  end
+  return default
+end
+
+local function as_number(value, default)
+  local n = tonumber(value)
+  if n == nil then
+    return default
+  end
+  return n
+end
+
+-- Merge the answers with the defaults. `input.answers` is the normal shape;
+-- a flat table of key=value pairs is accepted too, and a key may be nested or
+-- dotted (`review.max_rounds`). `current` is the config already on disk, when
+-- there is one: an answer that is not supplied keeps the current value
+-- instead of falling back to the hardcoded default.
 local function normalize_init(input, paths, current)
   current = type(current) == "table" and current or {}
   local current_roles = type(current.roles) == "table" and current.roles or {}
   local answers = type(input) == "table" and (input.answers or input) or {}
+  local flat = flatten_answers(answers)
 
-  local auto_merge
-  if answers.auto_merge ~= nil then
-    auto_merge = truthy(answers.auto_merge)
-  else
-    auto_merge = current.auto_merge == true
+  local function value(key)
+    if flat[key] ~= nil then
+      return flat[key]
+    end
+    -- Accept the unqualified spelling too: `auto_merge` means
+    -- `merge.auto_merge`, `max_rounds` means `review.max_rounds`.
+    local leaf = key:match("([^.]+)$")
+    if leaf and leaf ~= key and flat[leaf] ~= nil then
+      return flat[leaf]
+    end
+    return nil
   end
-  local auto_deploy
-  if answers.auto_deploy ~= nil then
-    auto_deploy = truthy(answers.auto_deploy)
-  else
-    auto_deploy = current.auto_deploy == true
+
+  local function bool(key, current_value, default)
+    local v = value(key)
+    if v ~= nil then
+      return truthy(v)
+    end
+    if current_value ~= nil then
+      return current_value == true
+    end
+    return default
   end
-  local deploy_confirm
-  if answers.deploy_confirm ~= nil then
-    deploy_confirm = not (answers.deploy_confirm == false or answers.deploy_confirm == "false")
-  else
-    deploy_confirm = current.deploy_confirm ~= false
-  end
+
   local checks
-  if answers.checks ~= nil then
-    checks = split_checks(answers.checks)
+  if value("checks") ~= nil then
+    checks = split_checks(value("checks"))
   elseif type(current.checks) == "table" then
     checks = current.checks
   else
     checks = { "npm test" }
   end
 
+  local current_review = type(current.review) == "table" and current.review or {}
+  local current_merge = type(current.merge) == "table" and current.merge or {}
+  local current_deploy = type(current.deploy) == "table" and current.deploy or {}
+  local current_quality = type(current.quality) == "table" and current.quality or {}
+  local current_limits = type(current.limits) == "table" and current.limits or {}
+
+  local deploy_confirm
+  if value("deploy.confirm") ~= nil then
+    deploy_confirm = truthy(value("deploy.confirm"))
+  elseif value("deploy_confirm") ~= nil then
+    deploy_confirm = truthy(value("deploy_confirm"))
+  elseif current_deploy.confirm ~= nil then
+    deploy_confirm = current_deploy.confirm == true
+  elseif current.deploy_confirm ~= nil then
+    deploy_confirm = current.deploy_confirm == true
+  else
+    deploy_confirm = true
+  end
+
   local normalized = {
-    repo = answers.repo or current.repo or paths.repo,
-    base_ref = answers.base_ref or current.base_ref or "main",
-    max_parallel = tonumber(answers.max_parallel) or current.max_parallel or 1,
+    repo = value("repo") or current.repo or paths.repo,
+    base_ref = value("base_ref") or current.base_ref or "main",
+    max_parallel = as_number(value("max_parallel"), current.max_parallel or 1),
     checks = checks,
-    auto_merge = auto_merge,
-    auto_deploy = auto_deploy,
+    auto_merge = bool("merge.auto_merge", current_merge.auto_merge ~= nil and current_merge.auto_merge or current.auto_merge, false),
+    auto_deploy = bool("deploy.auto_deploy", current_deploy.auto_deploy ~= nil and current_deploy.auto_deploy or current.auto_deploy, false),
     deploy_confirm = deploy_confirm,
     roles = {},
+    review = {
+      max_rounds = as_number(pick(flat, current_review, "review.max_rounds", 3), 3),
+      require_checks_green = pick(flat, current_review, "review.require_checks_green", true) == true
+        or pick(flat, current_review, "review.require_checks_green", true) == "true",
+      protected_paths = pick(flat, current_review, "review.protected_paths",
+        { "review-rules.md", "AGENTS.md", ".metronome/", "deploy.md" }),
+    },
+    merge = {
+      method = pick(flat, current_merge, "merge.method", "squash"),
+      auto_rebase = pick(flat, current_merge, "merge.auto_rebase", true) == true
+        or pick(flat, current_merge, "merge.auto_rebase", true) == "true",
+    },
+    deploy = {
+      plan_file = pick(flat, current_deploy, "deploy.plan_file", "deploy.md"),
+    },
+    quality = {
+      variants = as_number(pick(flat, current_quality, "quality.variants", 1), 1),
+      stall_minutes = as_number(pick(flat, current_quality, "quality.stall_minutes", 20), 20),
+    },
+    limits = {
+      max_task_cost_usd = as_number(pick(flat, current_limits, "limits.max_task_cost_usd", 5.0), 5.0),
+      timeout_minutes = as_number(pick(flat, current_limits, "limits.timeout_minutes", 30), 30),
+      max_questions_per_round = as_number(pick(flat, current_limits, "limits.max_questions_per_round", 15), 15),
+    },
   }
   for _, role in ipairs(ROLE_ORDER) do
     local default = DEFAULT_ROLES[role]
     local role_current = current_roles[role] or {}
     normalized.roles[role] = {
-      model = answers[role .. "_model"] or role_current.model or default.model,
-      thinking = answers[role .. "_thinking"] or role_current.thinking or default.thinking,
+      model = value(role .. "_model") or value("roles." .. role .. ".model")
+        or role_current.model or default.model,
+      thinking = value(role .. "_thinking") or value("roles." .. role .. ".thinking")
+        or role_current.thinking or default.thinking,
     }
   end
   return normalized
 end
 
 local function render_config(answers)
+  local review = type(answers.review) == "table" and answers.review or {}
+  local merge = type(answers.merge) == "table" and answers.merge or {}
+  local deploy = type(answers.deploy) == "table" and answers.deploy or {}
+  local quality = type(answers.quality) == "table" and answers.quality or {}
+  local limits = type(answers.limits) == "table" and answers.limits or {}
+  local function s(v) return tostring(v) end
+  local function b(v) return v == true and "true" or "false" end
   local lines = {
     "[project]",
     "repo = " .. toml_string(answers.repo),
     "base_ref = " .. toml_string(answers.base_ref),
-    "max_parallel = " .. tostring(answers.max_parallel),
+    "max_parallel = " .. s(answers.max_parallel),
     "",
     "[git]",
     'branch_prefix = "metronome/"',
@@ -250,32 +355,32 @@ local function render_config(answers)
   lines[#lines + 1] = "timeout_secs = 600"
   lines[#lines + 1] = ""
   lines[#lines + 1] = "[review]"
-  lines[#lines + 1] = "max_rounds = 3"
-  lines[#lines + 1] = "require_checks_green = true"
-  lines[#lines + 1] = 'protected_paths = ["review-rules.md", "AGENTS.md", ".metronome/", "deploy.md"]'
+  lines[#lines + 1] = "max_rounds = " .. s(review.max_rounds or 3)
+  lines[#lines + 1] = "require_checks_green = " .. b(review.require_checks_green ~= false)
+  lines[#lines + 1] = "protected_paths = " .. toml_array(review.protected_paths
+    or { "review-rules.md", "AGENTS.md", ".metronome/", "deploy.md" })
   lines[#lines + 1] = ""
   lines[#lines + 1] = "[merge]"
-  lines[#lines + 1] = "auto_merge = " .. tostring(answers.auto_merge)
-  lines[#lines + 1] = 'method = "squash"'
-  lines[#lines + 1] = "auto_rebase = true"
+  lines[#lines + 1] = "auto_merge = " .. b(answers.auto_merge)
+  lines[#lines + 1] = "method = " .. toml_string(merge.method or "squash")
+  lines[#lines + 1] = "auto_rebase = " .. b(merge.auto_rebase ~= false)
   lines[#lines + 1] = ""
   lines[#lines + 1] = "[deploy]"
-  lines[#lines + 1] = "auto_deploy = " .. tostring(answers.auto_deploy)
-  lines[#lines + 1] = "confirm = " .. tostring(answers.deploy_confirm)
-  lines[#lines + 1] = 'plan_file = "deploy.md"'
+  lines[#lines + 1] = "auto_deploy = " .. b(answers.auto_deploy)
+  lines[#lines + 1] = "confirm = " .. b(answers.deploy_confirm)
+  lines[#lines + 1] = "plan_file = " .. toml_string(deploy.plan_file or "deploy.md")
   lines[#lines + 1] = ""
   lines[#lines + 1] = "[quality]"
-  lines[#lines + 1] = "variants = 1"
-  lines[#lines + 1] = "stall_minutes = 20"
+  lines[#lines + 1] = "variants = " .. s(quality.variants or 1)
+  lines[#lines + 1] = "stall_minutes = " .. s(quality.stall_minutes or 20)
   lines[#lines + 1] = ""
   lines[#lines + 1] = "[limits]"
-  lines[#lines + 1] = "max_task_cost_usd = 5.0"
-  lines[#lines + 1] = "timeout_minutes = 30"
-  lines[#lines + 1] = "max_questions_per_round = 15"
+  lines[#lines + 1] = "max_task_cost_usd = " .. s(limits.max_task_cost_usd or 5.0)
+  lines[#lines + 1] = "timeout_minutes = " .. s(limits.timeout_minutes or 30)
+  lines[#lines + 1] = "max_questions_per_round = " .. s(limits.max_questions_per_round or 15)
   return table.concat(lines, "\n") .. "\n"
 end
 
--- Exposed for tests and for the command surface.
 M.DEFAULT_ROLES = DEFAULT_ROLES
 M.ROLE_ORDER = ROLE_ORDER
 M.init_questions = init_questions
@@ -380,6 +485,13 @@ function M.new(deps)
       auto_deploy = cfg.deploy and cfg.deploy.auto_deploy,
       deploy_confirm = cfg.deploy and cfg.deploy.confirm,
       roles = cfg.roles,
+      -- Keep the sections an update does not name, so changing a model never
+      -- resets the review, merge, deploy, quality or limits policy.
+      review = cfg.review,
+      merge = cfg.merge,
+      deploy = cfg.deploy,
+      quality = cfg.quality,
+      limits = cfg.limits,
     }
   end
 
@@ -533,6 +645,31 @@ function M.new(deps)
     end
 
     local worktree = impl.ctx.worktree
+
+    -- The base can move while the implementer works (another task merges).
+    -- Rebase onto the fresh origin/base before the checks and the converge
+    -- diff, so the diff is measured against the base the PR will merge into.
+    -- A conflict sends the task back to implementation on the new base.
+    if deps.merge and type(deps.merge.rebase) == "function" then
+      local rebased, rebase_err, rebase_diag = deps.merge.rebase({
+        repo = paths.repo,
+        worktree = worktree,
+        remote = "origin",
+        base = cfg.project.base_ref,
+        git = deps.git,
+      })
+      if not rebased then
+        if type(rebase_diag) == "table" and rebase_diag.conflict then
+          return {
+            ok = false,
+            conflict = true,
+            error = "rebase onto fresh base conflicted: " .. tostring(rebase_err),
+          }
+        end
+        return { ok = false, error = "rebase before checks failed: " .. tostring(rebase_err) }
+      end
+    end
+
     local checks = task.checks or cfg.checks.default
     local verified = deps.checks.verify({
       checks = checks,

@@ -102,6 +102,26 @@ return function()
     task("T-20261114-b003", "First", { "src/a.lua", "src/b.lua" }),
     task("T-20261114-b004", "Second", { "src/b.lua", "src/a.lua" }),
   })
+  -- A task whose checks name a file another task produces must depend on it.
+  local cross = analyze.analyze({
+    { id = "T-20261115-0001", title = "orders route", files = { "routes/orders.js" },
+      checks = { "node check.js orders" }, depends_on = {} },
+    { id = "T-20261115-0002", title = "account page", files = { "public/mon-compte.html" },
+      checks = { "grep -q 'routes/orders.js' public/mon-compte.html" }, depends_on = {} },
+  })
+  local cross_finding = find_rule(cross, "undeclared_file_dependency")
+  eq(cross_finding ~= nil, true, "an undeclared cross-file dependency is flagged")
+  eq(cross_finding and cross_finding.severity, "major", "undeclared_file_dependency is major")
+  local declared = analyze.analyze({
+    { id = "T-20261115-0003", title = "orders route", files = { "routes/orders.js" },
+      checks = { "node check.js orders" }, depends_on = {} },
+    { id = "T-20261115-0004", title = "account page", files = { "public/mon-compte.html" },
+      checks = { "grep -q 'routes/orders.js' public/mon-compte.html" },
+      depends_on = { "T-20261115-0003" } },
+  })
+  eq(count_rule(declared, "undeclared_file_dependency"), 0,
+    "a declared dependency is not flagged")
+
   local dup_files_finding = find_rule(dup_files, "duplicate_files")
   eq(dup_files_finding and dup_files_finding.severity, "blocking", "duplicate_files is blocking")
   eq(dup_files_finding and dup_files_finding.tasks[1], "T-20261114-b003", "duplicate_files names the first task")

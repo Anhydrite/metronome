@@ -214,6 +214,10 @@ function M.build_prompt(intent, context, opts)
   line('{"tasks":[{"title":"...","intent":"...","files":["..."],"checks":["..."],"acceptance":["..."],"depends_on":["..."],"questions":[{"id":"q1","text":"..."}]}]}')
   line("")
   line("Every task needs at least one file and at least one check.")
+  line("Declare depends_on for every cross-file contract: if a task's checks or "
+    .. "acceptance name a file, route or payload another task produces, it must "
+    .. "depend on that task. An undeclared edge runs both tasks together and "
+    .. "fails review.")
   line("Questions are only for decisions the repository cannot answer.")
   line(string.format("At most %d questions in total.", max_questions))
 
@@ -776,8 +780,11 @@ end
 function M.next_id(state, date)
   date = date or os.date("!%Y%m%d")
   local tasks = type(state) == "table" and type(state.tasks) == "table" and state.tasks or {}
+  -- `ids` is the never-shrinking ledger: a deleted task keeps its id reserved,
+  -- so a new submission can never collide with its old run artifacts.
+  local ledger = type(state) == "table" and type(state.ids) == "table" and state.ids or tasks
   local max = 0
-  for id in pairs(tasks) do
+  for id in pairs(ledger) do
     if type(id) == "string" then
       local day, hex = id:match("^T%-(%d%d%d%d%d%d%d%d)%-([0-9a-f][0-9a-f][0-9a-f][0-9a-f])$")
       if day == date then
@@ -889,6 +896,14 @@ function M.apply(state, root, result, opts)
     if not created_task then
       return nil, cerr
     end
+
+    -- Runs and checks are keyed by task id only. An id is never reused now,
+    -- but a project migrated from the old behaviour may still hold artifacts
+    -- under this id: drop them so a fresh task never reads a previous run.
+    for _, dir in ipairs({ "runs", "worktrees" }) do
+      pcall(fs.rm, fs.joinpath(root, dir, id), { recursive = true, force = true })
+    end
+    pcall(fs.rm, fs.joinpath(root, "checks", id .. ".json"), { force = true })
 
     local moved, terr = state.transition(root, id, "qualifying", { phase = "qualify" })
     if not moved then

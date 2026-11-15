@@ -430,6 +430,34 @@ function M.commit(worktree, message)
   return M.head_sha(worktree)
 end
 
+-- How many commits the local `base` has that `remote/base` does not. A
+-- positive count means the local base diverged from what the pipeline treats
+-- as the truth (the remote base every worktree is cut from and every PR merges
+-- into). Running on a diverged base makes the qualifier describe files the
+-- worktree will not contain, so the caller must refuse rather than guess.
+function M.ahead_count(repo, base, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(repo) ~= "string" or repo == "" or type(base) ~= "string" or base == "" then
+    return nil, "ahead_count needs a repo and a base"
+  end
+  local remote = (type(opts.remote) == "string" and opts.remote ~= "") and opts.remote or "origin"
+  local result, err = run(
+    { "git", "-C", repo, "rev-list", "--count", remote .. "/" .. base .. ".." .. base },
+    { timeout_ms = opts.timeout_ms }
+  )
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return nil, fail("git rev-list", result)
+  end
+  local n = tonumber(tostring(result.stdout or ""):match("%d+"))
+  if not n then
+    return nil, "git rev-list returned no count"
+  end
+  return n
+end
+
 function M.head_sha(worktree)
   local result, err = run({ "git", "-C", worktree, "rev-parse", "HEAD" })
   if not result then
@@ -747,6 +775,19 @@ end
 -- work visible: the caller can retry the move without opening a second PR.
 function M.pr_open(state, root, task_id, opts)
   opts = opts or {}
+  -- A retry must not accumulate pull requests. Close the previous open one
+  -- first; a merged or already-closed PR is left alone.
+  local loaded = type(state.load) == "function" and state.load(root) or nil
+  local existing = loaded and loaded.tasks and loaded.tasks[task_id]
+    and loaded.tasks[task_id].pr or nil
+  if existing and existing.number
+    and existing.state ~= "merged" and existing.state ~= "closed" then
+    pcall(M.pr_close, existing.number, {
+      gh = opts.gh,
+      worktree = opts.worktree,
+      timeout_ms = opts.timeout_ms,
+    })
+  end
   local pr, err = M.pr_create(opts)
   if not pr then
     return nil, err

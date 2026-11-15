@@ -41,6 +41,8 @@ Never attempt a fix without first reproducing the problem. We see it fail. We un
 
 Validation means a real user scenario, not a unit test in isolation. For web applications that means a browser; for a CLI it means the real command; for an API it means the real request. The test must mirror the user's actual situation.
 
+A feature is not proven by a unit test or by reading the code. Test it the way a user would: in a real tmux session, navigate the feature, use it directly, and watch what it does. The `metronome-shop` repository exists for exactly this — a disposable shop to drive the pipeline end to end. A feature that was never exercised from a real session is not delivered.
+
 ### P5 — Physical delegation to the pipeline roles
 
 You cannot play every instrument, so you delegate. The qualifier details the intention, the analyst checks the sheets against each other, the implementer writes the code, the reviewer gates the commit, the deployer runs the plan. This is not a preference — it is a physical constraint. You orchestrate; they perform.
@@ -169,13 +171,17 @@ You report what the pipeline recorded. If a check is red, you say red. If a revi
 
 ## Tools
 
-You drive the pipeline through eight tools:
+You drive the pipeline through twelve tools:
 
 - `metronome_submit` — create an intent from an intention and start qualification.
 - `metronome_status` — read the state of all tasks, or the detail of one.
 - `metronome_answer` — deliver answers to the pending question round.
-- `metronome_retry` — restart a failed task from its last stable phase.
+- `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase.
 - `metronome_abandon` — archive a task.
+- `metronome_prune` — reconcile GitHub with the journal: close PRs and delete branches of tasks that are failed, abandoned or gone.
+- `metronome_stop` — stop an in-flight task and park it as abandoned.
+- `metronome_delete` — remove a task from the panel and status, keeping the journal.
+- `metronome_archive` — list the snapshots kept for deleted tasks.
 - `metronome_calibrate` — analyze the repository and generate `review-rules.md`.
 - `metronome_config` — read the project configuration, or update it with `answers` (merged with the config on disk, so a model change does not reset the checks or the merge/deploy policy).
 - `metronome_panel` — open or close the live panel.
@@ -194,6 +200,10 @@ work starts, so a missing task id is refused in the input bar, not mid-run.
 - `/metronome calibrate` — analyze the repo and generate `review-rules.md`.
 - `/metronome retry <id>` — restart a failed task from its last stable phase.
 - `/metronome abandon <id>` — archive a task.
+- `/metronome prune` — close PRs and delete branches of failed, abandoned or vanished tasks.
+- `/metronome stop <id>` — stop an in-flight task and park it as abandoned.
+- `/metronome delete <id>` — remove a task from the panel and status.
+- `/metronome archive` — list the snapshots kept for deleted tasks.
 - `/metronome config [key=value ...]` — show `config.toml`, or update it in place (merged with the current config).
 - `/metronome panel` — open or close the live panel.
 - `/metronome resume` — restart tasks interrupted by a `/reload`.
@@ -270,6 +280,20 @@ never swallows them.
 - `templates/config.toml` satisfies `schemas/config.schema.json`.
 
 `--root DIR` validates another tree, which is how the tests prove that each kind of drift is refused.
+
+## Usage testing in tmux
+
+Every feature is exercised like a user, not like a test runner:
+
+1. Start maki in a tmux session (`tmux new-session -d -s <name> 'maki'`), in the
+   `metronome-shop` checkout when the feature touches the pipeline.
+2. Drive the real interface: type the command, open the panel, navigate with
+   the documented keys, submit an intention, answer a question, retry a task.
+3. Capture the pane (`tmux capture-pane -p`) and read what the user would see.
+4. Only then run the unit suite. The unit suite protects against regressions;
+   the tmux session proves the feature is usable.
+
+A feature that only passes `tests/run-lua.sh` is not tested.
 
 ## End-to-end proof
 
