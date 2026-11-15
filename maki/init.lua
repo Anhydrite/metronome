@@ -64,11 +64,9 @@ local function wire()
     mode = require("metronome.mode"),
     ui_render = require("metronome.ui.render"),
     ui_panel = require("metronome.ui.panel"),
-    -- Several tasks progress at once: `join` is how the drain waits for a
-    -- batch without blocking the queue. Tests leave it out and stay serial.
-    join = function(n, fns)
-      return maki.async.join(n, fns)
-    end,
+    -- Several tasks progress at once: each one runs in its own plugin-lifetime
+    -- spawn. Tests leave this out and stay synchronous.
+    async = true,
   }
   local runtime, err = require("metronome.runtime").new(deps)
   if not runtime then

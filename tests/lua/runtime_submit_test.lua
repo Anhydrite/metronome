@@ -446,8 +446,9 @@ return function()
   rt6.run_pending()
   eq(merge_called, false, "auto_merge off does not merge the pull request")
   eq(deploy_called, false, "auto_merge off does not deploy")
-  -- Parallelism: the drain hands every selected task to `join` as one batch --
-  local join_batches = {}
+  -- Parallelism: the drain starts every selected task, up to max_parallel ----
+  local tick_parallel = nil
+  local dispatched = 0
   local ticks = 0
   local deps7 = {
     config = {
@@ -491,6 +492,7 @@ return function()
     pipeline = {
       tick = function(opts)
         ticks = ticks + 1
+        tick_parallel = opts.max_parallel
         if ticks == 1 then
           opts.dispatch({ id = "T1" })
           opts.dispatch({ id = "T2" })
@@ -501,10 +503,7 @@ return function()
     },
     paths = function() return paths end,
     spawn = function(fn) fn() end,
-    join = function(n, fns)
-      join_batches[#join_batches + 1] = { n = n, count = #fns }
-      for _, fn in ipairs(fns) do fn() end
-    end,
+    async = true,
     wait_turn_end = false,
     runner = {},
     qualify = {
@@ -519,8 +518,7 @@ return function()
   local rt7 = runtime.new(deps7)
   rt7.submit({ intention = "x", fast = false }, { session = "S1" })
   rt7.run_pending()
-  eq(join_batches[1] and join_batches[1].n, 3,
-    "the drain joins with the configured max_parallel, not a hardcoded 1")
-  eq(join_batches[1] and join_batches[1].count, 2,
-    "both selected tasks run as one batch")
+  eq(tick_parallel, 3,
+    "the drain ticks with the configured max_parallel, not a hardcoded 1")
+  eq(ticks >= 2, true, "the drain stops once nothing else is ready")
 end
