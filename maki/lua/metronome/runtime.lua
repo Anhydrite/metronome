@@ -716,6 +716,10 @@ function M.new(deps)
   local scheduler_job = nil
   local scheduler_extra = {}
 
+  -- One handle per task in flight. Stopping a task means cancelling its spawn,
+  -- not only moving its status: the session it opened has to die too.
+  local task_handles = {}
+
   -- The part of a run that follows qualification: the analysis gate, the
   -- scheduler loop and the optional deploy. `submit` reaches it after applying
   -- the qualified tasks; `answer` reaches it after the pending questions are
@@ -761,7 +765,10 @@ function M.new(deps)
         end
       end
       if deps.async then
-        spawn(fn)
+        task_handles[task.id] = spawn(function()
+          fn()
+          task_handles[task.id] = nil
+        end)
       else
         fn()
       end
@@ -1317,6 +1324,44 @@ function M.new(deps)
     end
     schedule_job(bg, paths, cfg, runner, session)
     return { ok = true, background = true, task = moved }
+  end
+
+  -- Statuses a task can be stopped from: it is doing something, and stopping it
+  -- is a decision, not a cleanup.
+  local STOPPABLE = {
+    running = true,
+    verifying = true,
+    reviewing = true,
+    merging = true,
+    deploying = true,
+  }
+
+  -- Stop an in-flight task: cancel its spawn (which ends the role session it
+  -- opened) and park it as `abandoned` with a reason the journal keeps. A
+  -- stopped task is restartable with `retry`.
+  function runtime.stop(input)
+    input = type(input) == "table" and input or {}
+    local paths = p()
+    local loaded = deps.state.load(paths.root)
+    local task = loaded and loaded.tasks and loaded.tasks[input.id]
+    if not task then
+      return { ok = false, error = "unknown task: " .. tostring(input.id) }
+    end
+    if not STOPPABLE[task.status] then
+      return { ok = false, error = "task is not running: " .. tostring(task.status) }
+    end
+    local handle = task_handles[input.id]
+    if handle and type(handle.cancel) == "function" then
+      pcall(handle.cancel, handle)
+    end
+    task_handles[input.id] = nil
+    local moved, err = deps.state.transition(paths.root, input.id, "abandoned", {
+      reason = "stopped by the user",
+    })
+    if not moved then
+      return { ok = false, error = err }
+    end
+    return { ok = true, task = moved, stopped = true }
   end
 
   function runtime.abandon(input)

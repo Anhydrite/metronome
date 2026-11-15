@@ -92,6 +92,7 @@ local PANEL_KEYS = {
   { "a", "answer" },
   { "r", "retry" },
   { "d", "delete" },
+  { "s", "stop" },
   { "v", "verbose" },
   { "+", "rate up" },
   { "-", "rate down" },
@@ -207,6 +208,8 @@ function M.open(panel)
       { "Space", "peek" },
       { "a", "answer" },
       { "r", "retry" },
+      { "d", "delete" },
+      { "s", "stop" },
       { "v", "verbose" },
       { "q", "close" },
     },
@@ -386,6 +389,25 @@ function M.retry(panel, id)
   return { action = "retry", id = id }
 end
 
+-- Stop is not delete: the task keeps its journal entry and its worktree, and
+-- `retry` can restart it. Deleting a running task would leave its session
+-- writing to a record nobody can see.
+function M.stop(panel, id)
+  local runtime = panel.deps.runtime
+  if type(runtime) ~= "table" or type(runtime.stop) ~= "function" then
+    return nil, "stop is not wired"
+  end
+  local ok, result = pcall(runtime.stop, { id = id })
+  if not ok then
+    return nil, tostring(result)
+  end
+  if type(result) == "table" and result.ok == false then
+    return nil, tostring(result.error or "stop failed")
+  end
+  M.refresh(panel)
+  return { action = "stop", id = id }
+end
+
 function M.delete(panel, id)
   local runtime = panel.deps.runtime
   if type(runtime) ~= "table" or type(runtime.delete) ~= "function" then
@@ -524,6 +546,14 @@ function M.handle_key(panel, key)
       return nil, "no task selected"
     end
     return M.delete(panel, row.id)
+  end
+
+  if key == "s" then
+    local row = M.selected(panel)
+    if not row then
+      return nil, "no task selected"
+    end
+    return M.stop(panel, row.id)
   end
 
   if key == "a" then

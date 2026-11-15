@@ -90,6 +90,21 @@ function M.definitions()
       },
     },
     {
+      name = "metronome_stop",
+      description = "Stop an in-flight task: cancel its session and park it as abandoned with a reason. The task can be restarted with metronome_retry.",
+      permission = "run",
+      schema = {
+        type = "object",
+        properties = {
+          id = {
+            type = "string",
+            description = "Task id to stop.",
+          },
+        },
+        required = { "id" },
+      },
+    },
+    {
       name = "metronome_delete",
       description = "Remove a task from the panel and status. The journal keeps the history; the task disappears from status and the panel.",
       permission = "run",

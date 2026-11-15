@@ -126,6 +126,14 @@ M.COMMANDS = {
     end,
   },
   {
+    name = "stop",
+    description = "Stop an in-flight task: cancel its session and park it as abandoned.",
+    usage = "/metronome stop <id>",
+    build = function(rest)
+      return need_id(rest, "stop")
+    end,
+  },
+  {
     name = "delete",
     description = "Remove a task from the panel and status (the journal keeps the history).",
     usage = "/metronome delete <id>",
@@ -407,7 +415,7 @@ function M.register(runtime, register, flash, show_questions, show_text, ask_que
   ask_questions = ask_questions or M.ask_questions
   local spec = {
     name = "/metronome",
-    description = "Drive the Metronome pipeline: init, submit, status, answer, calibrate, retry, abandon, config, panel, resume, feedback.",
+    description = "Drive the Metronome pipeline: init, submit, status, answer, calibrate, retry, stop, abandon, config, panel, resume, feedback.",
     nargs = "*",
     handler = function(opts)
       local result = M.run(runtime, opts)
