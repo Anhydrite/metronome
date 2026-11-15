@@ -728,4 +728,118 @@ return function()
   eq(merge_calls, 2, "the merge is attempted again after the repair")
   eq(record.conflict_retried, true, "the repair is recorded on the task")
   eq(record.status, "merged", "the repaired task merges")
+  -- Prune: an open PR or a branch whose task is dead is an orphan -----------
+  local prune_closed, prune_deleted = {}, {}
+  local prune_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          git = { branch_prefix = "metronome/" },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function()
+        return { tasks = {
+          LIVE = { id = "LIVE", status = "running", branch = "metronome/live" },
+          DEAD = { id = "DEAD", status = "failed", branch = "metronome/dead" },
+        } }
+      end,
+    },
+    git = {
+      list_open_prs = function()
+        return {
+          { number = 10, head = "metronome/live", url = "u", title = "live" },
+          { number = 11, head = "metronome/dead", url = "u", title = "dead" },
+          { number = 12, head = "someone/else", url = "u", title = "not ours" },
+        }
+      end,
+      list_branches = function(_, _, opts)
+        eq(opts and opts.pattern, "metronome/*", "prune lists only task branches")
+        return { "metronome/live", "metronome/dead", "metronome/orphan" }
+      end,
+      pr_close = function(ref)
+        prune_closed[#prune_closed + 1] = ref
+        return { closed = true }
+      end,
+      delete_branch = function(_, branch)
+        prune_deleted[#prune_deleted + 1] = branch
+        return { ok = true }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {}, qualify = {}, questions = {}, analyze = {}, implement = {},
+    checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
+    pipeline = {}, calibrate = {}, fence = {}, mode = {},
+  }
+  local rt11 = runtime.new(prune_deps)
+  local pruned = rt11.prune({})
+  eq(pruned and pruned.ok, true, "prune succeeds")
+  eq(#pruned.closed, 1, "prune closes the PR of a dead task")
+  eq(pruned.closed[1] and pruned.closed[1].number, 11, "the dead task's PR is the one closed")
+  eq(#pruned.kept, 1, "prune keeps the PR of a live task")
+  eq(pruned.kept[1] and pruned.kept[1].task, "LIVE", "the live task keeps its PR")
+  has(table.concat(pruned.deleted, ","), "metronome/dead", "the dead PR's branch is deleted")
+  has(table.concat(pruned.deleted, ","), "metronome/orphan", "a branch with no task is deleted")
+  eq(table.concat(pruned.deleted, ","):find("metronome/live", 1, true), nil,
+    "a live task's branch is kept")
+  -- config: a base branch that does not exist on origin is refused ----------
+  local cfg_root = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "runtime-config")
+  maki.fs.rm(cfg_root, { recursive = true })
+  maki.fs.mkdir(cfg_root, { parents = true })
+  local cfg_path = maki.fs.joinpath(cfg_root, "config.toml")
+  maki.fs.write(cfg_path, [[
+[project]
+repo = "/tmp/repo"
+base_ref = "main"
+max_parallel = 1
+
+[checks]
+default = ["true"]
+
+[merge]
+auto_merge = true
+
+[deploy]
+auto_deploy = false
+]])
+  local asked_pattern = nil
+  local cfg_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 1 },
+          checks = { default = { "true" } },
+          merge = { auto_merge = true },
+          deploy = { auto_deploy = false },
+          roles = {},
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = { load = function() return { tasks = {} } end },
+    git = {
+      list_branches = function(_, _, opts)
+        asked_pattern = opts and opts.pattern
+        return {}
+      end,
+    },
+    paths = function()
+      return { root = cfg_root, config = cfg_path, repo = "/tmp/repo" }
+    end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {}, qualify = {}, questions = {}, analyze = {}, implement = {},
+    checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
+    pipeline = {}, calibrate = {}, fence = {}, mode = {},
+  }
+  local rt12 = runtime.new(cfg_deps)
+  local bad_base = rt12.config({ answers = { base_ref = "nope" } })
+  eq(bad_base and bad_base.ok, false, "a base branch missing on origin is refused")
+  has(tostring(bad_base and bad_base.error), "nope", "the refusal names the branch")
+  eq(asked_pattern, "nope", "the branch is checked against origin")
 end

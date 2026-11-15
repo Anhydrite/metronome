@@ -1450,6 +1450,99 @@ function M.new(deps)
     return { ok = true, deleted = input.id }
   end
 
+  -- Reconcile GitHub with the journal: an open PR or a remote branch whose
+  -- task is not alive is an orphan. Prevention (closing on failure/stop) only
+  -- covers what happens after it ships; this repairs what is already there.
+  --
+  -- Live means the task can still reach a merge: ready, qualifying,
+  -- awaiting_answers, running, verifying, reviewing, changes_requested,
+  -- pr_open, merging, deploying. A failed, abandoned or deleted task is not.
+  local LIVE = {
+    ready = true,
+    qualifying = true,
+    awaiting_answers = true,
+    running = true,
+    verifying = true,
+    reviewing = true,
+    changes_requested = true,
+    pr_open = true,
+    merging = true,
+    deploying = true,
+  }
+
+  function runtime.prune(_input)
+    local paths = p()
+    local cfg, cerr = load_config(nil)
+    if not cfg then
+      return { ok = false, error = cerr }
+    end
+    if type(deps.git.list_open_prs) ~= "function"
+      or type(deps.git.list_branches) ~= "function" then
+      return { ok = false, error = "git module cannot list PRs or branches" }
+    end
+
+    local loaded = deps.state.load(paths.root) or { tasks = {} }
+    local live_branches = {}
+    for _, task in pairs(loaded.tasks or {}) do
+      if LIVE[task.status] and type(task.branch) == "string" then
+        live_branches[task.branch] = task.id
+      end
+    end
+
+    local prefix = (cfg.git and cfg.git.branch_prefix) or "metronome/"
+    local closed, deleted, kept, errors = {}, {}, {}, {}
+
+    local prs, perr = deps.git.list_open_prs({ repo = paths.repo, gh = "gh" })
+    if not prs then
+      return { ok = false, error = perr }
+    end
+    local pr_branches = {}
+    for _, pr in ipairs(prs) do
+      local head = tostring(pr.head or "")
+      if head:sub(1, #prefix) == prefix then
+        pr_branches[head] = true
+        if live_branches[head] then
+          kept[#kept + 1] = { number = pr.number, branch = head, task = live_branches[head] }
+        else
+          local ok = pcall(deps.git.pr_close, pr.number, { gh = "gh", worktree = paths.repo })
+          if ok then
+            closed[#closed + 1] = { number = pr.number, branch = head }
+            -- A closed PR leaves a branch nobody will read: drop it too.
+            if type(deps.git.delete_branch) == "function" then
+              pcall(deps.git.delete_branch, paths.repo, head, { remote = "origin" })
+              deleted[#deleted + 1] = head
+            end
+          else
+            errors[#errors + 1] = { number = pr.number, error = "close failed" }
+          end
+        end
+      end
+    end
+
+    local branches, berr = deps.git.list_branches(paths.repo, "origin", { pattern = prefix .. "*" })
+    if not branches then
+      return { ok = false, error = berr, closed = closed, kept = kept }
+    end
+    for _, branch in ipairs(branches) do
+      if not live_branches[branch] and not pr_branches[branch] then
+        local ok = pcall(deps.git.delete_branch, paths.repo, branch, { remote = "origin" })
+        if ok then
+          deleted[#deleted + 1] = branch
+        else
+          errors[#errors + 1] = { branch = branch, error = "delete failed" }
+        end
+      end
+    end
+
+    return {
+      ok = #errors == 0,
+      closed = closed,
+      deleted = deleted,
+      kept = kept,
+      errors = errors,
+    }
+  end
+
   function runtime.calibrate(input)
     local paths = p()
     local result, err = deps.calibrate.run({
@@ -1477,6 +1570,17 @@ function M.new(deps)
     local updating = type(answers) == "table" and next(answers) ~= nil
     if updating then
       local normalized = normalize_init(input, paths, current)
+      -- The base branch is where every task branch starts and what every PR
+      -- merges into: a typo must fail here, not on the first task.
+      if type(deps.git.list_branches) == "function" and normalized.base_ref then
+        local branches = deps.git.list_branches(paths.repo, "origin", { pattern = normalized.base_ref })
+        if branches and #branches == 0 then
+          return {
+            ok = false,
+            error = "base branch not found on origin: " .. tostring(normalized.base_ref),
+          }
+        end
+      end
       fs.mkdir(paths.root, { parents = true })
       fs.write(paths.config, render_config(normalized))
       local cfg, errors = deps.config.load(paths.config)

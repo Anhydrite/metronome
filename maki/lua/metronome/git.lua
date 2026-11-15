@@ -589,6 +589,65 @@ function M.pr_view(ref, opts)
   return M.normalize_pr(decoded)
 end
 
+-- Every open pull request, with the branch it comes from. The reconciler
+-- needs the branch name, not only the number: that is what ties a PR to a task.
+function M.list_open_prs(opts)
+  opts = type(opts) == "table" and opts or {}
+  local result, err = run(
+    { opts.gh or "gh", "pr", "list", "--state", "open", "--limit", "200",
+      "--json", "number,headRefName,url,title" },
+    { cwd = opts.repo, timeout_ms = opts.timeout_ms }
+  )
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("gh pr list", result)
+  end
+  local ok, decoded = pcall(maki.json.decode, result.stdout)
+  if not ok or type(decoded) ~= "table" then
+    return nil, "gh pr list returned invalid JSON: " .. tostring(result.stdout):sub(1, 200)
+  end
+  local prs = {}
+  for _, pr in ipairs(decoded) do
+    prs[#prs + 1] = {
+      number = pr.number,
+      head = pr.headRefName,
+      url = pr.url,
+      title = pr.title,
+    }
+  end
+  return prs
+end
+
+-- Remote branch names, optionally filtered by a prefix. `ls-remote` reads the
+-- remote, so a branch deleted by a merge is not reported as still there.
+function M.list_branches(repo, remote, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(repo) ~= "string" or repo == "" then
+    return nil, "list_branches needs a repo"
+  end
+  local args = { "git", "-C", repo, "ls-remote", "--heads", remote or "origin" }
+  if type(opts.pattern) == "string" and opts.pattern ~= "" then
+    args[#args + 1] = opts.pattern
+  end
+  local result, err = run(args, { timeout_ms = opts.timeout_ms })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("git ls-remote", result)
+  end
+  local names = {}
+  for line in tostring(result.stdout or ""):gmatch("[^\n]+") do
+    local name = line:match("refs/heads/(.+)$")
+    if name then
+      names[#names + 1] = name
+    end
+  end
+  return names
+end
+
 -- Close a pull request without merging it. A failed, stopped or abandoned task
 -- must not leave an open PR nobody will ever merge, nor a branch nobody will
 -- look at.

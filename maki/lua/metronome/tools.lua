@@ -95,6 +95,12 @@ function M.definitions()
       },
     },
     {
+      name = "metronome_prune",
+      description = "Reconcile GitHub with the journal: close open pull requests and delete remote branches whose task is failed, abandoned or gone. Reports what it closed, deleted and kept.",
+      permission = "run",
+      schema = { type = "object", properties = {} },
+    },
+    {
       name = "metronome_stop",
       description = "Stop an in-flight task: cancel its session and park it as abandoned with a reason. The task can be restarted with metronome_retry.",
       permission = "run",
