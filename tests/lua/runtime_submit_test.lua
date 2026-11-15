@@ -521,4 +521,42 @@ return function()
   eq(tick_parallel, 3,
     "the drain ticks with the configured max_parallel, not a hardcoded 1")
   eq(ticks >= 2, true, "the drain stops once nothing else is ready")
+  -- Stop: cancels the spawn and parks the task as abandoned -----------------
+  local cancelled = 0
+  local stop_status = "running"
+  local stop_transition = nil
+  local stop_deps = {
+    config = { load = function() return { project = { repo = "/tmp/repo", base_ref = "main" } } end },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function()
+        return { tasks = { T1 = { id = "T1", status = stop_status } } }
+      end,
+      transition = function(_, id, status, extra)
+        stop_status = status
+        stop_transition = { id = id, status = status, extra = extra }
+        return { id = id, status = status }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn)
+      fn()
+      return { cancel = function() cancelled = cancelled + 1 end }
+    end,
+    async = true,
+    wait_turn_end = false,
+    qualify = {}, questions = {}, analyze = {}, checks = {}, converge = {},
+    review = {}, merge = {}, deploy = {}, calibrate = {}, pipeline = {},
+    fence = {}, mode = {}, git = {}, implement = {}, runner = {},
+  }
+  local rt8 = runtime.new(stop_deps)
+  local stopped = rt8.stop({ id = "T1" })
+  eq(stopped and stopped.ok, true, "stop accepts a running task")
+  eq(stop_transition and stop_transition.status, "abandoned", "stop parks the task as abandoned")
+  eq(stop_transition and stop_transition.extra.reason, "stopped by the user",
+    "stop records why in the journal")
+
+  local idle = rt8.stop({ id = "T1" })
+  eq(idle and idle.ok, false, "a task that is not running cannot be stopped")
+  has(tostring(idle and idle.error), "not running", "the refusal says why")
 end

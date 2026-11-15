@@ -92,6 +92,7 @@ return function()
 
   local retried = nil
   local deleted = nil
+  local stopped = nil
   local runtime = {
     retry = function(input)
       retried = input.id
@@ -99,6 +100,10 @@ return function()
     end,
     delete = function(input)
       deleted = input.id
+      return { ok = true }
+    end,
+    stop = function(input)
+      stopped = input.id
       return { ok = true }
     end,
   }
@@ -203,8 +208,8 @@ return function()
   eq(opened[1].opts.cursor_line, true, "the panel highlights the cursor row")
   eq(opened[1].opts.title, "Metronome", "the panel is titled Metronome")
   eq(type(opened[1].opts.footer), "table", "the panel has a footer")
-  eq(#opened[1].opts.footer, 6, "the footer lists six keys")
-  eq(opened[1].opts.footer[5][1], "v", "the footer offers the verbose toggle")
+  eq(#opened[1].opts.footer, 8, "the footer lists every action key")
+  eq(opened[1].opts.footer[7][1], "v", "the footer offers the verbose toggle")
   eq(opened[1].buf ~= nil, true, "the window shows the panel buffer")
   eq(#opened[1].buf.lines > 0, true, "the buffer is filled before the window opens")
   eq(#panel.rows, 4, "open loads every task")
@@ -308,6 +313,22 @@ return function()
   local delete_action = panel_mod.handle_key(panel, "d")
   eq(delete_action and delete_action.action, "delete", "d deletes the selected task")
   eq(deleted, "T-20261114-c9d0", "d deletes the selected task id")
+
+  -- s stops an in-flight task without deleting it --------------------------
+  tasks["T-20261114-a3f2"].status = "running"
+  panel_mod.refresh(panel)
+  local running_index
+  for i, row in ipairs(panel.rows) do
+    if row.id == "T-20261114-a3f2" then
+      running_index = i
+    end
+  end
+  panel_mod.select(panel, running_index)
+  stopped = nil
+  local stop_action = panel_mod.handle_key(panel, "s")
+  eq(stop_action and stop_action.action, "stop", "s stops the selected task")
+  eq(stopped, "T-20261114-a3f2", "s stops the selected task id")
+  eq(deleted, "T-20261114-c9d0", "s does not delete the task")
 
   local answer_action = panel_mod.handle_key(panel, "a")
   eq(answer_action.action, "answer", "a asks to answer")

@@ -9,13 +9,13 @@ return function()
 
   local NAMES = {
     "init", "submit", "status", "answer", "calibrate", "retry",
-    "abandon", "delete", "config", "panel", "resume", "feedback", "on", "off",
+    "abandon", "stop", "delete", "config", "panel", "resume", "feedback", "on", "off",
   }
 
   -- definitions ------------------------------------------------------------
 
   local defs = commands.definitions()
-  eq(#defs, 14, "definitions returns fourteen subcommands")
+  eq(#defs, 15, "definitions returns every subcommand")
   for i, name in ipairs(NAMES) do
     eq(defs[i] and defs[i].name, name, "subcommand " .. i .. " is " .. name)
     eq(type(defs[i] and defs[i].description), "string", name .. " has a description")
@@ -25,10 +25,10 @@ return function()
   end
 
   local names = commands.names()
-  eq(#names, 14, "names returns fourteen names")
+  eq(#names, 15, "names returns every subcommand")
   eq(names[1], "init", "names starts with init")
-  eq(names[12], "feedback", "feedback stays before the mode toggles")
-  eq(names[14], "off", "names ends with off")
+  eq(names[13], "feedback", "feedback stays before the mode toggles")
+  eq(names[15], "off", "names ends with off")
 
   local help = commands.help()
   eq(help:find("/metronome submit <intention>", 1, true) ~= nil, true, "help lists submit")
