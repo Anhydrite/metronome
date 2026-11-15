@@ -707,7 +707,8 @@ function M.new(deps)
 
     -- `max_parallel` is the project's cap, not a hardcoded one: a queue of
     -- independent asks must not take one full pipeline each, end to end.
-    local max_parallel = tonumber(cfg.max_parallel) or 1
+    local max_parallel = tonumber(cfg.project and cfg.project.max_parallel)
+      or tonumber(cfg.max_parallel) or 1
     if max_parallel < 1 then
       max_parallel = 1
     end
