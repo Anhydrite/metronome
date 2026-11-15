@@ -618,6 +618,22 @@ function M.new(deps)
       return { ok = false, error = tostring(merge_err or "merge failed") }
     end
     if not merged.ok then
+      -- A conflict with the base is repairable without a human: move the
+      -- branch back to the fresh base and let the implementer redo the work
+      -- there. One repair only; a second conflict is a real failure.
+      if merged.conflict and not task.conflict_retried then
+        local reset = deps.git.reset_hard
+          and deps.git.reset_hard(worktree, "origin/" .. cfg.project.base_ref)
+        if reset then
+          log(paths, "task " .. task_id .. " hit a merge conflict on "
+            .. tostring(merged.conflict_files) .. "; redoing it on the fresh base")
+          pcall(deps.state.set_fields, paths.root, task_id, { conflict_retried = true })
+          pcall(deps.state.transition, paths.root, task_id, "failed",
+            { reason = "merge conflict: " .. tostring(merged.conflict_files) })
+          pcall(deps.state.transition, paths.root, task_id, "running", { phase = "implement" })
+          return { ok = false, conflict = true, error = merged.error, task_id = task_id }
+        end
+      end
       return merged
     end
 
@@ -709,6 +725,26 @@ function M.new(deps)
     return fn()
   end
 
+  -- A task that will not be merged must not leave an open PR behind: the list
+  -- fills with pull requests nobody will ever look at. The branch stays, so a
+  -- retry can still resume from its checkpoints.
+  local function close_open_pr(paths, task_id)
+    local loaded = deps.state.load(paths.root)
+    local task = loaded and loaded.tasks and loaded.tasks[task_id]
+    local pr = task and task.pr
+    if type(pr) ~= "table" or pr.state ~= "open" then
+      return false
+    end
+    if type(deps.git.pr_close) ~= "function" then
+      return false
+    end
+    local ok = pcall(deps.git.pr_close, pr.number or pr.url, { gh = "gh" })
+    if ok then
+      pcall(deps.state.set_fields, paths.root, task_id, { pr = { number = pr.number, url = pr.url, state = "closed" } })
+    end
+    return ok
+  end
+
   -- Scheduler state. Declared here, before `after_questions`, so the drain and
   -- a task finishing in its own spawn share the same upvalues.
   local scheduler_running = false
@@ -749,16 +785,23 @@ function M.new(deps)
     local function dispatch_one(task)
       local fn = function()
         local result = run_task(opts, task.id, paths, cfg, runner, session)
+        if type(result) == "table" and result.conflict then
+          -- The branch is back on the fresh base: redo the work once.
+          result = run_task(opts, task.id, paths, cfg, runner, session)
+        end
         results[#results + 1] = result
         if not result.ok then
           local reason = tostring(result.error or "task failed")
           log(paths, "task " .. task.id .. " failed: " .. reason)
           pcall(deps.state.transition, paths.root, task.id, "failed", { reason = reason })
+          close_open_pr(paths, task.id)
           notify_failure(opts.ctx, task.id, reason)
         end
-        -- A slot just freed: another ready task may start now.
-        scheduler_dirty = true
+        -- A slot just freed: another ready task may start now. Only in the
+        -- async path, where the drain returned long ago; setting the flag in
+        -- the synchronous path would make its drain loop forever.
         if deps.async then
+          scheduler_dirty = true
           spawn(function()
             pcall(runtime.run_pending)
           end)
@@ -1190,10 +1233,22 @@ function M.new(deps)
     if not fs.read(paths.config) then
       return { ok = false, error = "project is not bound; run /metronome init first" }
     end
+    -- `complexity` is the caller's judgement, not a guess: `fast` skips the
+    -- qualifier, `full` always qualifies, `auto` (or absent) lets the wording
+    -- decide. `fast` stays accepted for the older callers and tests.
+    local complexity = input.complexity
+    local fast = input.fast
+    if complexity == "fast" then
+      fast = true
+    elseif complexity == "full" then
+      fast = false
+    elseif complexity ~= nil and complexity ~= "auto" then
+      return { ok = false, error = "unknown complexity: " .. tostring(complexity) }
+    end
     local opts = {
       intention = input.intention,
       answers = input.answers,
-      fast = input.fast,
+      fast = fast,
       -- Qualify through a background ctx too: the qualifier is a role session,
       -- and a role session opened with the tool's LuaCtx is cancelled with the
       -- turn. `{ session = sid }` opens it as a background session instead.
@@ -1355,6 +1410,7 @@ function M.new(deps)
       pcall(handle.cancel, handle)
     end
     task_handles[input.id] = nil
+    close_open_pr(paths, input.id)
     local moved, err = deps.state.transition(paths.root, input.id, "abandoned", {
       reason = "stopped by the user",
     })
@@ -1366,6 +1422,7 @@ function M.new(deps)
 
   function runtime.abandon(input)
     local paths = p()
+    close_open_pr(paths, input.id)
     local moved, err = deps.state.transition(paths.root, input.id, "abandoned", { reason = "abandoned by the user" })
     if not moved then
       return { ok = false, error = err }
@@ -1377,6 +1434,14 @@ function M.new(deps)
     local paths = p()
     if type(deps.state.delete) ~= "function" then
       return { ok = false, error = "state.delete is not wired" }
+    end
+    local loaded = deps.state.load(paths.root)
+    local task = loaded and loaded.tasks and loaded.tasks[input.id]
+    close_open_pr(paths, input.id)
+    -- The task disappears from the panel: its branch has no reader left.
+    if task and type(task.branch) == "string" and task.branch ~= ""
+      and type(deps.git.delete_branch) == "function" then
+      pcall(deps.git.delete_branch, paths.repo, task.branch, { remote = "origin" })
     end
     local ok, err = deps.state.delete(paths.root, input.id)
     if not ok then
@@ -1540,9 +1605,10 @@ function M.new(deps)
     if not resumed then
       return { ok = false, error = err }
     end
-    if #scheduler_extra > 0 then
-      schedule_job(opts, paths, cfg, runner, session)
-    end
+    -- Always drain after a resume, even when no task was active: a task that
+    -- was queued (`ready`) when the host died has no session to revive, and
+    -- without a drain it would wait for the next submit to be noticed.
+    schedule_job(opts, paths, cfg, runner, session)
     return { ok = true, resumed = resumed.resumed, errors = resumed.errors }
   end
 

@@ -134,6 +134,27 @@ exit 1
     "pr_create re-reads the PR with gh pr view")
   eq(select(2, logtext:gsub("\n", "\n")), 2, "exactly two gh calls were made")
 
+  -- pr_close: a failed task must not leave an open PR behind ---------------
+  local close_gh = fake_gh("gh-close", [[
+if [ "$1" = "pr" ] && [ "$2" = "close" ]; then exit 0; fi
+exit 1
+]])
+  local closed, cerr = git.pr_close(42, { gh = close_gh, worktree = base })
+  eq(cerr, nil, "pr_close has no error: " .. tostring(cerr))
+  eq(closed and closed.closed, true, "pr_close reports the PR closed")
+  has(read_log(), "pr close 42", "pr_close sends gh pr close with the number")
+
+  local already_gh = fake_gh("gh-already-closed", [[
+echo "pull request 42 is already closed" >&2
+exit 1
+]])
+  local already = git.pr_close(42, { gh = already_gh, worktree = base })
+  eq(already and already.already, true, "an already closed PR is not a failure")
+
+  local no_ref, no_ref_err = git.pr_close(nil, { gh = close_gh })
+  eq(no_ref, nil, "pr_close refuses without a reference")
+  eq(type(no_ref_err), "string", "the refusal explains itself")
+
   -- An empty title must be refused before anything runs.
   local before = read_log()
   local empty, eerr = git.pr_create({ title = "   ", worktree = base, gh = ok_gh })

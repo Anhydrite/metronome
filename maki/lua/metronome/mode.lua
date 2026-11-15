@@ -44,6 +44,7 @@ M.DIRECTIVE = table.concat({
   "- an answer the user gave to pending questions -> metronome_answer, with exactly those answers",
   "metronome_submit waits for qualification and returns the created task ids. Report them and stop: the pipeline runs in the background. Never sleep, poll, or use code_execution/bash to wait for a task — questions arrive as prompts, and metronome_status answers instantly when the user asks.",
   "When metronome_submit or metronome_answer returns waiting_questions, ask the user those questions with the `question` tool, then call metronome_answer with the user's answers. Never invent an answer to keep moving.",
+  "Before submitting, judge the complexity yourself and pass `complexity`: `fast` for one obvious change in one place, `full` when the work spans several files, needs a design choice, or the request is ambiguous. `auto` (the default) lets Metronome decide from the wording. When you are in doubt about the scope, ask the user with the `question` tool before submitting — a wrong guess costs a whole pipeline run.",
   "- retry a failed task -> metronome_retry",
   "- abandon or cancel a task -> metronome_abandon",
   "- review-rules calibration -> metronome_calibrate",

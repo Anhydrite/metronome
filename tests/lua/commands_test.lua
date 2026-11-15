@@ -31,7 +31,8 @@ return function()
   eq(names[15], "off", "names ends with off")
 
   local help = commands.help()
-  eq(help:find("/metronome submit <intention>", 1, true) ~= nil, true, "help lists submit")
+  eq(help:find("/metronome submit [--fast|--full|--auto] <intention>", 1, true) ~= nil, true,
+    "help lists submit and its complexity flags")
   eq(help:find("/metronome panel", 1, true) ~= nil, true, "help lists panel")
   eq(help:find("/metronome on", 1, true) ~= nil, true, "help lists on")
   eq(help:find("/metronome off", 1, true) ~= nil, true, "help lists off")
@@ -61,6 +62,15 @@ return function()
   parsed = commands.parse("submit add CSV export")
   eq(parsed.command, "submit", "submit parses")
   eq(parsed.input.intention, "add CSV export", "submit keeps the whole intention")
+  eq(parsed.input.complexity, nil, "submit defaults to auto complexity")
+
+  parsed = commands.parse("submit --fast add a red button")
+  eq(parsed.input.complexity, "fast", "--fast asks for the fast lane")
+  eq(parsed.input.intention, "add a red button", "--fast is stripped from the intention")
+
+  parsed = commands.parse("submit --full redesign the checkout")
+  eq(parsed.input.complexity, "full", "--full forces qualification")
+  eq(parsed.input.intention, "redesign the checkout", "--full is stripped from the intention")
 
   parsed, err = commands.parse("submit")
   eq(parsed, nil, "submit without an intention is refused")
