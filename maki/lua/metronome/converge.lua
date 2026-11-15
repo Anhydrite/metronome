@@ -60,8 +60,66 @@ local function normalize_list(list)
   return out
 end
 
+-- Safety ----------------------------------------------------------------------
+
+-- A path that escapes the worktree can never be a legitimate task change: an
+-- absolute path, a drive letter, or a `..` segment that climbs above the root.
+-- Paths that use `..` but resolve back inside (`src/../x`) are accepted.
+function M.outside_repo(path, worktree)
+  local p = M.normalize_path(path)
+  if p == "" then
+    return false
+  end
+  if p:sub(1, 1) == "/" then
+    return true
+  end
+  if p:match("^%a:[/\\]") then
+    return true
+  end
+  local depth = 0
+  for segment in p:gmatch("[^/]+") do
+    if segment == ".." then
+      depth = depth - 1
+      if depth < 0 then
+        return true
+      end
+    elseif segment ~= "." then
+      depth = depth + 1
+    end
+  end
+  return false
+end
+
+-- Is `path` one of `review.protected_paths`? A directory entry (`deploy/` or
+-- `.metronome/`) protects everything below it; a file entry protects itself.
+function M.is_protected(path, protected_paths)
+  local p = M.normalize_path(path)
+  if p == "" then
+    return false
+  end
+  for _, raw in ipairs(type(protected_paths) == "table" and protected_paths or {}) do
+    local pattern = M.normalize_path(raw)
+    if pattern ~= "" then
+      local bare = pattern:gsub("/+$", "")
+      if p == pattern or (bare ~= "" and p == bare) then
+        return true
+      end
+      if pattern:sub(-1) ~= "/" then
+        pattern = pattern .. "/"
+      end
+      if p:sub(1, #pattern) == pattern then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 -- Comparison -----------------------------------------------------------------
 
+-- `declared` empty means the implementer had not chosen its files up front:
+-- the diff itself is the declaration, so no changed file is "unexpected".
+-- Once a task declares files, the contract is strict again.
 function M.compare(declared, changed)
   local want = normalize_list(declared)
   local got = normalize_list(changed)
@@ -83,7 +141,7 @@ function M.compare(declared, changed)
     end
   end
   for _, path in ipairs(got) do
-    if not in_declared[path] then
+    if not in_declared[path] and #want > 0 then
       unexpected[#unexpected + 1] = path
     end
   end
@@ -174,46 +232,80 @@ end
 
 -- Analysis -------------------------------------------------------------------
 
+local function protected_list(opts)
+  if type(opts.protected_paths) == "table" then
+    return opts.protected_paths
+  end
+  local review = opts.review
+  if type(review) == "table" and type(review.protected_paths) == "table" then
+    return review.protected_paths
+  end
+  return {}
+end
+
 -- Compare the sheet's declared files to the branch diff.
 --
--- A task that declares nothing has nothing to compare: a sheet without files is
--- a qualification problem, not a convergence one, so it passes here.
+-- A task that declares nothing still has its diff inspected: the files it
+-- touched are its declaration, so they are accepted, but a protected path or a
+-- path outside the worktree still blocks. Once files are declared, a missing
+-- or unexpected file blocks as before.
 function M.analyze(task, worktree, base, opts)
   opts = type(opts) == "table" and opts or {}
   task = type(task) == "table" and task or {}
 
   local declared = type(task.files) == "table" and task.files or {}
-  if #normalize_list(declared) == 0 then
-    return { ok = true, findings = {}, comparison = empty_comparison(), stat = "" }
+  local want = normalize_list(declared)
+  local can_diff = type(opts.git) == "table" and type(opts.git.changed_files) == "function"
+
+  local changed = {}
+  if #want > 0 or can_diff then
+    local derr
+    changed, derr = M.diff_files(worktree, base, opts)
+    if not changed then
+      return nil, derr
+    end
   end
 
-  local changed, derr = M.diff_files(worktree, base, opts)
-  if not changed then
-    return nil, derr
-  end
-
-  local stat, serr = M.diff_stat(worktree, base, opts)
-  if not stat then
-    return nil, serr
-  end
-
-  local comparison = M.compare(declared, changed)
+  local comparison = M.compare(want, changed)
   local findings = {}
-  for _, path in ipairs(comparison.missing) do
+  local seen = {}
+  local function flag(rule, path, message)
+    if seen[rule .. "\0" .. path] then
+      return
+    end
+    seen[rule .. "\0" .. path] = true
     findings[#findings + 1] = {
       severity = "blocking",
-      rule = "missing_file",
-      message = "declared file " .. path .. " was not changed",
+      rule = rule,
+      message = message,
       file = path,
     }
+  end
+
+  for _, path in ipairs(comparison.missing) do
+    flag("missing_file", path, "declared file " .. path .. " was not changed")
   end
   for _, path in ipairs(comparison.unexpected) do
-    findings[#findings + 1] = {
-      severity = "blocking",
-      rule = "unexpected_file",
-      message = "file " .. path .. " was changed but is not declared",
-      file = path,
-    }
+    flag("unexpected_file", path, "file " .. path .. " was changed but is not declared")
+  end
+
+  -- Every touched file is checked, declared or declared-after-the-fact.
+  local protected = protected_list(opts)
+  for _, path in ipairs(comparison.changed) do
+    if M.outside_repo(path, worktree) then
+      flag("outside_repo", path, "touched path outside the repository: " .. path)
+    elseif M.is_protected(path, protected) then
+      flag("protected_path", path, "touched protected path " .. path)
+    end
+  end
+
+  local stat = ""
+  if #comparison.changed > 0 then
+    local serr
+    stat, serr = M.diff_stat(worktree, base, opts)
+    if not stat then
+      return nil, serr
+    end
   end
 
   return {

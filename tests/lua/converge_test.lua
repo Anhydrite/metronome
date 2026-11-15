@@ -93,6 +93,12 @@ return function()
   eq(#empty_cmp.unexpected, 0, "empty compare has no unexpected")
   eq(#empty_cmp.touched, 0, "empty compare has no touched")
 
+  -- Declared after the fact: with nothing declared up front, the diff is the
+  -- declaration, so a changed file is not unexpected.
+  local after_fact = converge.compare({}, { "src/new.lua" })
+  eq(#after_fact.unexpected, 0, "a declared-after-the-fact file is not unexpected")
+  eq(table.concat(after_fact.changed, ","), "src/new.lua", "the diff stays visible as changed")
+
   -- diff_files and diff_stat -------------------------------------------------
 
   local wt1, id1 = seed_worktree({ "src/a.lua", "src/c.lua" })
@@ -380,6 +386,81 @@ return function()
   })
   eq(unknown, nil, "gate refuses an unknown task")
   eq(type(unknown_err), "string", "gate explains the unknown task")
+
+  -- Autonomous declaration: converge accepts the implementer's files --------
+
+  local wt_auto = seed_worktree({ "src/auto.lua" })
+  local auto_cmp = converge.compare({}, { "src/auto.lua" })
+  eq(#auto_cmp.unexpected, 0, "compare accepts a file declared by the implementer")
+  local auto_analysis, auto_err = converge.analyze(
+    { id = "T-auto", files = {} }, wt_auto, "main", { git = git, protected_paths = { "AGENTS.md" } })
+  eq(auto_err, nil, "autonomous analyze has no error: " .. tostring(auto_err))
+  eq(auto_analysis and auto_analysis.ok, true, "autonomous analyze accepts the diff")
+  eq(auto_analysis and #auto_analysis.findings, 0, "autonomous analyze has no findings")
+
+  -- Paths -------------------------------------------------------------------
+
+  eq(converge.outside_repo("src/a.lua", "/wt"), false, "a repo-relative path is inside")
+  eq(converge.outside_repo("src/../a.lua", "/wt"), false, "a path that resolves inside is inside")
+  eq(converge.outside_repo("/etc/passwd", "/wt"), true, "an absolute path is outside")
+  eq(converge.outside_repo("../x", "/wt"), true, "a parent escape is outside")
+  eq(converge.outside_repo("src/../../x", "/wt"), true, "a deep escape is outside")
+  eq(converge.outside_repo("C:\\x", "/wt"), true, "a drive path is outside")
+
+  eq(converge.is_protected("AGENTS.md", { "AGENTS.md" }), true, "an exact protected file is protected")
+  eq(converge.is_protected("AGENTS.md", { "AGENTS.md/" }), true, "a trailing slash still protects the file")
+  eq(converge.is_protected(".metronome/rules.md", { ".metronome/" }), true,
+    "a protected directory protects its content")
+  eq(converge.is_protected("src/a.lua", { "AGENTS.md" }), false, "an ordinary file is not protected")
+
+  -- Protected and outside files block ---------------------------------------
+
+  local wt_safe = seed_worktree({ "AGENTS.md" })
+  local protected_analysis, protected_err = converge.analyze(
+    { id = "T-protected", files = {} }, wt_safe, "main",
+    { git = git, protected_paths = { "AGENTS.md" } })
+  eq(protected_err, nil, "protected analyze has no error: " .. tostring(protected_err))
+  eq(protected_analysis and protected_analysis.ok, false, "a touched protected path blocks")
+  eq(protected_analysis and #protected_analysis.findings, 1, "a protected path yields one finding")
+  eq(protected_analysis and protected_analysis.findings[1].rule, "protected_path",
+    "the protected finding names its rule")
+  eq(protected_analysis and protected_analysis.findings[1].severity, "blocking",
+    "the protected finding is blocking")
+  eq(protected_analysis and protected_analysis.findings[1].file, "AGENTS.md",
+    "the protected finding names the file")
+
+  -- A diff cannot contain an absolute or escaping path; a stub git proves the
+  -- gate still refuses one if it ever reaches converge.
+  local stub_git = {
+    changed_files = function() return { "../escape.lua" } end,
+    run = function() return { ok = true, stdout = " stub\n" } end,
+  }
+  local outside_analysis, outside_err = converge.analyze(
+    { id = "T-outside", files = {} }, "/wt", "main", { git = stub_git })
+  eq(outside_err, nil, "outside analyze has no error: " .. tostring(outside_err))
+  eq(outside_analysis and outside_analysis.ok, false, "a path outside the repo blocks")
+  eq(outside_analysis and outside_analysis.findings[1].rule, "outside_repo",
+    "the outside finding names its rule")
+  eq(outside_analysis and outside_analysis.findings[1].severity, "blocking",
+    "the outside finding is blocking")
+
+  -- gate also accepts an autonomous diff ------------------------------------
+
+  local auto_root = maki.fs.joinpath(base, "gate-auto")
+  local auto_id = "T-20261114-cv98"
+  state.create(auto_root, { id = auto_id, title = "Autonomous", status = "ready", files = {} })
+  local wt_gate_auto = seed_worktree({ "src/auto.lua" })
+  local gate_auto, gate_auto_err = converge.gate(state, auto_root, {
+    task_id = auto_id,
+    worktree = wt_gate_auto,
+    base = "main",
+    git = git,
+    protected_paths = { "AGENTS.md" },
+  })
+  eq(gate_auto_err, nil, "autonomous gate has no error: " .. tostring(gate_auto_err))
+  eq(gate_auto and gate_auto.ok, true,
+    "autonomous gate accepts the implementer's declaration")
+  eq(gate_auto and #gate_auto.findings, 0, "autonomous gate has no findings")
 
   -- Cleanup ------------------------------------------------------------------
 

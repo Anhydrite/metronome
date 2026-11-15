@@ -91,6 +91,9 @@ function M.render_prompt(task, sheet, ctx, opts)
   local title = tostring(task.title or "")
   local files = type(task.files) == "table" and task.files or {}
   local checks = type(task.checks) == "table" and task.checks or {}
+  -- No files declared means the implementer is autonomous: it picks the files
+  -- itself and its declaration is the diff of the turn (recorded afterwards).
+  local autonomous = #files == 0
 
   local out = {}
   local function line(s)
@@ -100,7 +103,7 @@ function M.render_prompt(task, sheet, ctx, opts)
   line("# Implementation task")
   line("")
   line("- Task: " .. id .. (title ~= "" and (" — " .. title) or ""))
-  line("- Files: " .. join_list(files))
+  line("- Files: " .. (autonomous and "(none declared — choose them)" or join_list(files)))
   line("- Checks: " .. join_list(checks))
   line("")
   line("## Task sheet")
@@ -122,7 +125,13 @@ function M.render_prompt(task, sheet, ctx, opts)
   line("")
   line("## Rules")
   line("")
-  line("- Stay inside the declared files: if the change genuinely needs another file, stop and report it.")
+  if autonomous then
+    line("- No files are declared: choose the files yourself and keep the change minimal.")
+    line("- Your declaration is the branch diff; it is recorded on the task after your turn.")
+    line("- Do not touch protected paths or anything outside the worktree.")
+  else
+    line("- Stay inside the declared files: if the change genuinely needs another file, stop and report it.")
+  end
   line("- Run the checks and report their exit codes; do not claim work you did not verify.")
   line("- Commit with a conventional message that says what changed and why.")
   line("- Never edit the checks or the rules.")
@@ -349,6 +358,43 @@ function M.commit_message(task, opts)
   return string.format("%s: %s", kind, subject)
 end
 
+-- Autonomous declaration -----------------------------------------------------
+
+-- When the task declares no files, the implementer chose them by working: the
+-- branch diff is the declaration. Persisting it in `task.files` lets converge
+-- accept the change and lets a retry reuse the same contract.
+function M.declare_files(opts, ctx)
+  opts = type(opts) == "table" and opts or {}
+  ctx = type(ctx) == "table" and ctx or {}
+  local files = type(opts.task) == "table" and opts.task.files
+  if type(files) == "table" and #files > 0 then
+    return nil
+  end
+  local git = opts.git
+  if type(git) ~= "table" or type(git.changed_files) ~= "function" then
+    return nil
+  end
+  local state = opts.state
+  if type(state) ~= "table" or type(state.set_fields) ~= "function" then
+    return nil
+  end
+  local called, changed = pcall(git.changed_files, ctx.worktree, ctx.base_ref, { three_dot = true })
+  if not called or type(changed) ~= "table" or #changed == 0 then
+    return nil
+  end
+  local listed = {}
+  for _, path in ipairs(changed) do
+    if type(path) == "string" and path ~= "" then
+      listed[#listed + 1] = path
+    end
+  end
+  if #listed == 0 then
+    return nil
+  end
+  pcall(state.set_fields, opts.root, ctx.task_id, { files = listed })
+  return listed
+end
+
 -- Run ------------------------------------------------------------------------
 
 -- Every change must reach the base through a pull request. The implementer
@@ -451,6 +497,8 @@ local function run_impl(opts)
     end
   end
 
+  local declared_files = M.declare_files(opts, ctx)
+
   if opts.push ~= false then
     local pushed, push_err = opts.git.push(ctx.worktree, ctx.branch, { remote = opts.remote or "origin" })
     if not pushed then
@@ -461,6 +509,7 @@ local function run_impl(opts)
         checkpoint = checkpoint,
         run = run,
         sha = sha,
+        files = declared_files,
       }
     end
   end
@@ -472,6 +521,7 @@ local function run_impl(opts)
     sha = sha,
     no_changes = no_changes or false,
     run = run,
+    files = declared_files,
   }
 end
 

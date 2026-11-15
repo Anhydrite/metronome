@@ -319,4 +319,239 @@ return function()
   eq(no_state, nil, "resume refuses without a state module")
   local no_root = pipeline.resume(state, "")
   eq(no_root, nil, "resume refuses without a root")
+
+  -- Analysis gate ----------------------------------------------------------
+  --
+  -- A single task cannot contradict itself: the cross-task analysis only has
+  -- something to say from two tasks on.
+
+  eq(pipeline.needs_analysis(0), false, "no task needs no analysis")
+  eq(pipeline.needs_analysis(1), false, "one task skips the analysis gate")
+  eq(pipeline.needs_analysis(2), true, "two tasks go through the analysis gate")
+  eq(pipeline.needs_analysis(3), true, "three tasks go through the analysis gate")
+  eq(pipeline.needs_analysis(nil), false, "a missing count means no analysis")
+  eq(pipeline.needs_analysis({ task("T-a", "ready") }), false, "one collected task skips the gate")
+  eq(pipeline.needs_analysis({ task("T-a", "ready"), task("T-b", "ready") }), true,
+    "two collected tasks go through the gate")
+
+  -- Submit and fast mode ---------------------------------------------------
+  --
+  -- The runtime decides when the gate runs and when the qualifier is skipped.
+  -- These cases inject the pipeline and the models so the decisions are proven
+  -- without a session.
+
+  local runtime = load_module("runtime")
+  local implement = load_module("implement")
+  local joinpath = maki.fs.joinpath
+
+  local function make_runtime(label, options)
+    options = options or {}
+    local root = tmp_root(label)
+    local paths = {
+      repo = "/tmp/repo",
+      root = root,
+      tasks = joinpath(root, "tasks"),
+      worktrees = joinpath(root, "worktrees"),
+      runs = joinpath(root, "runs"),
+      prompts = joinpath(root, "prompts"),
+      config = joinpath(root, "config.toml"),
+    }
+    maki.fs.mkdir(paths.tasks, { parents = true })
+    maki.fs.write(paths.config, '[project]\nrepo = "/tmp/repo"\n')
+    local record = { gate = 0, qualifier = 0, implemented = 0, checks = nil }
+    local cfg = {
+      project = { repo = "/tmp/repo", base_ref = "main" },
+      checks = { default = { "true" }, timeout_secs = 10, re_run_after_merge = false },
+      review = { protected_paths = { "AGENTS.md" } },
+      merge = { auto_merge = false },
+      deploy = { auto_deploy = false, plan_file = "deploy.md" },
+    }
+    local deps = {
+      config = { load = function() return cfg end },
+      roles = {
+        session_opts = function()
+          return { system = "", model_spec = "test/model", thinking = "low", tools = {} }
+        end,
+      },
+      state = state,
+      pipeline = pipeline,
+      analyze = {
+        gate = function()
+          record.gate = record.gate + 1
+          return { ok = true }
+        end,
+      },
+      questions = {
+        round = function() return { questions = {} } end,
+        answer = function() return {} end,
+      },
+      implement = {
+        run = function()
+          record.implemented = record.implemented + 1
+          if options.implement_ok then
+            return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+          end
+          return { ok = false, error = "stop after dispatch" }
+        end,
+        read_sheet = function() return "" end,
+      },
+      checks = {
+        verify = function(opts)
+          record.checks = opts.checks
+          return { ok = true }
+        end,
+        write_report = function() end,
+      },
+      converge = { run = function() return { ok = true } end },
+      review = { review = function() return { ok = true, approved = true } end },
+      git = { pr_open = function() return { number = 1, url = "u" } end },
+      merge = { run = function() return { ok = true } end },
+      deploy = { run = function() return { ok = true, deployed = true } end },
+      calibrate = {}, fence = {}, mode = {}, runner = {},
+      qualify = {
+        run = function()
+          record.qualifier = record.qualifier + 1
+          return { ok = true, tasks = options.qualify_tasks or { { title = "one" } } }
+        end,
+        next_id = function() return options.next_id or "T-20260101-0001" end,
+        apply = function(state_mod, state_root, result)
+          local made = {}
+          for i, pending in ipairs(result.tasks or {}) do
+            local id = string.format("T-20260101-%04x", i + 10)
+            local record = { id = id, title = pending.title, status = "draft" }
+            if type(pending.files) == "table" and #pending.files > 0 then
+              record.files = pending.files
+            end
+            local created, err = state_mod.create(state_root, record)
+            if not created then
+              return nil, err
+            end
+            state_mod.transition(state_root, id, "qualifying", { phase = "qualify" })
+            state_mod.transition(state_root, id, "ready", { phase = "qualify" })
+            made[#made + 1] = { id = id, title = pending.title }
+          end
+          return { ok = true, tasks = made }
+        end,
+        sheet_markdown = function(t) return "# " .. tostring(t.title) .. "\n" end,
+      },
+      paths = function() return paths end,
+      spawn = function(fn) fn() end,
+      wait_turn_end = false,
+    }
+    local built, err = runtime.new(deps)
+    eq(type(built), "table", label .. ": runtime builds: " .. tostring(err))
+    return built, record, root, paths
+  end
+
+  -- One task: no gate, straight to implementation -------------------------
+
+  local single, single_record = make_runtime("runtime-single")
+  single.submit({ intention = "add a button" }, { session = "S" })
+  single.run_pending()
+  eq(single_record.qualifier, 1, "a single-task submit still qualifies")
+  eq(single_record.gate, 0, "a single-task submit skips analyze.gate")
+  eq(single_record.implemented, 1, "a single-task submit is dispatched to implementation")
+
+  -- Two tasks: the gate runs ----------------------------------------------
+
+  local batch, batch_record = make_runtime("runtime-batch", {
+    qualify_tasks = { { title = "first" }, { title = "second" } },
+  })
+  batch.submit({ intention = "split the work" }, { session = "S" })
+  batch.run_pending()
+  eq(batch_record.gate, 1, "a multi-task submit calls analyze.gate")
+
+  -- Fast mode: one task, no qualifier, no files, no checks ----------------
+
+  local fast, fast_record, fast_root, fast_paths = make_runtime("runtime-fast", {
+    next_id = "T-20260101-00ff",
+  })
+  local fast_result = fast.submit({ intention = "add a favicon", fast = true }, { session = "S" })
+  eq(fast_record.qualifier, 0, "fast mode does not call the qualifier")
+  eq(fast_record.gate, 0, "fast mode creates one task and skips the gate")
+  eq(fast_result and fast_result.fast, true, "fast mode reports itself")
+  local fast_id = fast_result and fast_result.tasks and fast_result.tasks[1]
+    and fast_result.tasks[1].id
+  eq(type(fast_id), "string", "fast task has an id")
+  local fast_task = fast_id and state.load(fast_root).tasks[fast_id]
+  eq(fast_task and fast_task.title, "add a favicon", "the fast title is the intention verbatim")
+  eq(fast_task and #(fast_task.files or {}), 0, "the fast task declares no files")
+  eq(fast_task and fast_task.checks, nil, "the fast task declares no checks")
+  eq(type(maki.fs.read(joinpath(fast_paths.tasks, tostring(fast_id) .. ".md"))), "string",
+    "fast mode writes a sheet")
+
+  -- Fast mode is explicit and only for a short intention ------------------
+
+  eq(runtime.fast_requested({ intention = "add a favicon" }), false,
+    "fast mode is not implicit")
+  eq(runtime.fast_requested({ intention = "add a favicon", fast = true }), true,
+    "fast=true on a short intention is honoured")
+  local long_intention = string.rep("word ", 30)
+  eq(runtime.is_short_intention("add a favicon"), true, "a short intention is short")
+  eq(runtime.is_short_intention(long_intention), false, "a long intention is not short")
+  eq(runtime.fast_requested({ intention = long_intention, fast = true }), false,
+    "a long intention falls back to qualification even with fast=true")
+
+  -- Default checks ---------------------------------------------------------
+  --
+  -- An empty list is truthy in Lua: it must not shadow config.checks.default.
+
+  eq(table.concat(runtime.task_checks({ checks = {} }, { checks = { default = { "npm test" } } }), ","),
+    "npm test", "an empty task checks list falls back to the default")
+  eq(table.concat(runtime.task_checks({}, { checks = { default = { "npm test" } } }), ","),
+    "npm test", "a missing task checks list falls back to the default")
+  eq(table.concat(runtime.task_checks({ checks = { "make" } }, { checks = { default = { "npm test" } } }), ","),
+    "make", "declared checks win over the default")
+
+  local checks_run, checks_record = make_runtime("runtime-checks", { implement_ok = true })
+  checks_run.submit({ intention = "add a thing" }, { session = "S" })
+  checks_run.run_pending()
+  eq(table.concat(checks_record.checks or {}, ","), "true",
+    "the run path executes config.checks.default when the task declares none")
+
+  -- Autonomous implementer: no files means the diff is the declaration -----
+
+  local autonomous_prompt = implement.render_prompt(
+    { id = "T-1", title = "do it", files = {} }, "sheet", { task_id = "T-1" }, {})
+  has(autonomous_prompt, "choose them", "the autonomous prompt says the files are chosen")
+  has(autonomous_prompt, "Your declaration is the branch diff",
+    "the autonomous prompt says the diff is the declaration")
+  local scoped_prompt = implement.render_prompt(
+    { id = "T-2", title = "do it", files = { "src/a.lua" } }, "sheet", { task_id = "T-2" }, {})
+  has(scoped_prompt, "Stay inside the declared files", "a scoped task keeps the scope rule")
+
+  local persisted = {}
+  local fake_state = {
+    set_fields = function(_, id, fields)
+      persisted[id] = fields
+      return { id = id }
+    end,
+  }
+  local fake_git = {
+    changed_files = function(worktree, base, opts)
+      eq(worktree, "/wt", "the diff is read from the worktree")
+      eq(base, "main", "the diff is read against the base")
+      eq(opts and opts.three_dot, true, "the diff uses the three-dot range")
+      return { "src/a.lua", "src/b.lua" }
+    end,
+  }
+  local declared = implement.declare_files({
+    task = { id = "T-1", files = {} },
+    git = fake_git,
+    state = fake_state,
+    root = "/root",
+  }, { task_id = "T-1", worktree = "/wt", base_ref = "main" })
+  eq(table.concat(declared or {}, ","), "src/a.lua,src/b.lua",
+    "the autonomous declaration is the branch diff")
+  eq(table.concat(persisted["T-1"] and persisted["T-1"].files or {}, ","), "src/a.lua,src/b.lua",
+    "the declaration is persisted on the task")
+
+  local ignored = implement.declare_files({
+    task = { id = "T-2", files = { "src/only.lua" } },
+    git = fake_git,
+    state = fake_state,
+    root = "/root",
+  }, { task_id = "T-2", worktree = "/wt", base_ref = "main" })
+  eq(ignored, nil, "a task that already declares files is not redeclared")
+  eq(persisted["T-2"], nil, "a declared task is not overwritten")
 end

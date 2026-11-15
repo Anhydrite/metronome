@@ -58,6 +58,22 @@ local RESUME_PATH = {
   deploying = { "failed", "running" },
 }
 
+-- Analysis gate -------------------------------------------------------------
+
+-- The analysis pass compares tasks against each other: overlapping files,
+-- contradictory acceptance criteria, dependency cycles. A single task cannot
+-- contradict itself, so the gate only has something to say from two tasks on.
+M.ANALYSIS_MIN_TASKS = 2
+
+-- Should the analysis gate run for a batch of `count` tasks? Accepts a number
+-- or a table of tasks; anything else counts as zero.
+function M.needs_analysis(count)
+  if type(count) == "table" then
+    count = #M.collect(count)
+  end
+  return (tonumber(count) or 0) >= M.ANALYSIS_MIN_TASKS
+end
+
 -- Helpers -------------------------------------------------------------------
 
 local function trim(s)

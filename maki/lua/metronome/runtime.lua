@@ -82,6 +82,59 @@ function M.resolve_ctx(input, ctx)
   return ctx
 end
 
+-- Fast mode -----------------------------------------------------------------
+--
+-- An explicit `fast = true` submit skips the qualifier only for a short
+-- intention. "Short" is bounded on both axes: a handful of words, a single
+-- sentence. A longer intention keeps the normal qualification path, because it
+-- is exactly the kind of demand that needs files and checks chosen for it.
+M.FAST_MAX_WORDS = 20
+M.FAST_MAX_CHARS = 160
+
+function M.is_short_intention(intention, opts)
+  opts = type(opts) == "table" and opts or {}
+  local max_words = tonumber(opts.max_words) or M.FAST_MAX_WORDS
+  local max_chars = tonumber(opts.max_chars) or M.FAST_MAX_CHARS
+  local text = trim(intention)
+  if text == "" then
+    return false
+  end
+  if #text > max_chars then
+    return false
+  end
+  local words = 0
+  for _ in text:gmatch("%S+") do
+    words = words + 1
+  end
+  return words > 0 and words <= max_words
+end
+
+-- The explicit indicator is `fast`; it only wins for a short intention.
+function M.fast_requested(input, opts)
+  input = type(input) == "table" and input or {}
+  local flag = input.fast
+  local wanted = flag == true or flag == "true" or flag == "fast"
+  if not wanted then
+    return false
+  end
+  return M.is_short_intention(input.intention, opts)
+end
+
+-- A task that declares no check (or an empty list, which is truthy in Lua) runs
+-- the project default. This is the only place the fallback is decided.
+local function task_checks(task, cfg)
+  local checks = type(task) == "table" and task.checks or nil
+  if type(checks) == "table" and #checks > 0 then
+    return checks
+  end
+  local default = type(cfg) == "table" and cfg.checks and cfg.checks.default or nil
+  if type(default) == "table" and #default > 0 then
+    return default
+  end
+  return {}
+end
+M.task_checks = task_checks
+
 local DEFAULT_ROLES = {
   qualifier = { model = "ocgo/deepseek-v4.1-flash", thinking = "high" },
   analyst = { model = "ocgo/deepseek-v4.1-flash", thinking = "medium" },
@@ -369,6 +422,79 @@ function M.new(deps)
     return deps.roles.session_opts(config, role, paths.prompts, nil)
   end
 
+  -- Fast mode ---------------------------------------------------------------
+
+  local function fast_sheet(task)
+    if type(deps.qualify.sheet_markdown) == "function" then
+      local ok, sheet = pcall(deps.qualify.sheet_markdown, task)
+      if ok and type(sheet) == "string" then
+        return sheet
+      end
+    end
+    return string.format("# %s\n\n- ID: %s\n- Intent: %s\n- Files: \n- Checks: \n",
+      tostring(task.title or ""), tostring(task.id or ""), tostring(task.intent or ""))
+  end
+
+  -- Create the task straight from the intention: verbatim title, no files, no
+  -- checks declared (so `config.checks.default` applies later), and no
+  -- qualifier turn at all.
+  local function fast_apply(opts, paths)
+    local title = trim(opts.intention)
+    if title == "" then
+      return nil, "fast mode needs an intention"
+    end
+    local made, mkerr = fs.mkdir(paths.tasks, { parents = true })
+    if not made then
+      return nil, "cannot create tasks directory: " .. tostring(mkerr)
+    end
+
+    local loaded = deps.state.load(paths.root)
+    local date = os.date("!%Y%m%d")
+    local id
+    if type(deps.qualify.next_id) == "function" then
+      local ok, value = pcall(deps.qualify.next_id, loaded, date)
+      if ok and type(value) == "string" and value ~= "" then
+        id = value
+      end
+    end
+    if not id then
+      local n = 1
+      id = string.format("T-%s-%04x", date, n)
+      while loaded and loaded.tasks and loaded.tasks[id] do
+        n = n + 1
+        id = string.format("T-%s-%04x", date, n)
+      end
+    end
+
+    -- `files` and `checks` are left absent: the task declares no contract yet,
+    -- and an empty Lua table would encode as `{}`, which the task schema
+    -- rejects where an array is required. Absence means the same thing here.
+    local created, cerr = deps.state.create(paths.root, {
+      id = id,
+      title = title,
+      intent = title,
+      status = "draft",
+    })
+    if not created then
+      return nil, cerr
+    end
+    local qualifying, qerr = deps.state.transition(paths.root, id, "qualifying", { phase = "qualify" })
+    if not qualifying then
+      return nil, qerr
+    end
+    local ready, rerr = deps.state.transition(paths.root, id, "ready", { phase = "qualify" })
+    if not ready then
+      return nil, rerr
+    end
+
+    local sheet = fast_sheet({ id = id, title = title, intent = title, files = {}, checks = {} })
+    local wrote, werr = fs.write(fs.joinpath(paths.tasks, id .. ".md"), sheet)
+    if not wrote then
+      return nil, "cannot write sheet for " .. id .. ": " .. tostring(werr)
+    end
+    return { tasks = { ready } }
+  end
+
   -- Scripted runner ---------------------------------------------------------
 
   local function load_script(paths)
@@ -494,8 +620,13 @@ function M.new(deps)
       return impl
     end
 
+    -- The implementer may have declared its files during the turn when the
+    -- sheet declared none: reread the task so convergence sees the contract.
+    local refreshed = state.load(paths.root)
+    task = (refreshed and refreshed.tasks and refreshed.tasks[task_id]) or task
+
     local worktree = impl.ctx.worktree
-    local checks = task.checks or cfg.checks.default
+    local checks = task_checks(task, cfg)
     local verified = deps.checks.verify({
       checks = checks,
       worktree = worktree,
@@ -523,6 +654,7 @@ function M.new(deps)
       session_opts = session.implementer,
       state_root = paths.runs,
       ctx = opts.ctx,
+      protected_paths = cfg.review and cfg.review.protected_paths,
     })
     if not converged.ok then
       return converged
@@ -670,10 +802,40 @@ function M.new(deps)
   -- the qualified tasks; `answer` reaches it after the pending questions are
   -- answered, so answering resumes the pipeline instead of leaving the tasks
   -- stuck in `qualifying` forever.
+  local TERMINAL_STATUS = {
+    merged = true,
+    deployed = true,
+    failed = true,
+    abandoned = true,
+  }
+
+  -- How many tasks are still part of this delivery. The analysis pass compares
+  -- tasks against each other, so a single task skips it entirely.
+  local function analysis_task_count(opts, paths)
+    local batch = tonumber(type(opts) == "table" and opts.task_count or nil)
+    if batch then
+      return batch
+    end
+    local loaded = deps.state.load(paths.root)
+    local count = 0
+    for _, task in pairs(loaded and loaded.tasks or {}) do
+      if type(task) == "table" and not TERMINAL_STATUS[task.status] then
+        count = count + 1
+      end
+    end
+    return count
+  end
+
   local function after_questions(opts, paths, cfg, runner, session)
-    local gate, gerr = deps.analyze.gate(deps.state, paths.root, { tasks_dir = paths.tasks })
-    if not gate or not gate.ok then
-      return { ok = false, error = gerr or (gate and gate.verdict) or "analysis gate failed" }
+    local gate_count = analysis_task_count(opts, paths)
+    local needs = type(deps.pipeline.needs_analysis) == "function"
+      and deps.pipeline.needs_analysis(gate_count)
+      or gate_count >= 2
+    if needs then
+      local gate, gerr = deps.analyze.gate(deps.state, paths.root, { tasks_dir = paths.tasks })
+      if not gate or not gate.ok then
+        return { ok = false, error = gerr or (gate and gate.verdict) or "analysis gate failed" }
+      end
     end
 
     local results = {}
@@ -924,6 +1086,22 @@ function M.new(deps)
       return { ok = false, error = perr }
     end
 
+    -- Fast mode: an explicit short intention becomes one ready task without a
+    -- qualifier turn. One task skips the analysis gate by construction.
+    if M.fast_requested(opts) then
+      local fast, ferr = fast_apply(opts, paths)
+      if not fast then
+        return { ok = false, error = ferr }
+      end
+      opts.task_count = #fast.tasks
+      if script then
+        return after_questions(opts, paths, cfg, runner, session)
+      end
+      schedule_job({ ctx = background_ctx(opts.ctx), task_count = opts.task_count },
+        paths, cfg, runner, session)
+      return { ok = true, background = true, tasks = fast.tasks, fast = true }
+    end
+
     local qualified = deps.qualify.run({
       intention = opts.intention,
       runner = runner,
@@ -995,12 +1173,17 @@ function M.new(deps)
       end
     end
 
+    -- The analysis gate only has something to compare from two tasks on. Keep
+    -- the count so the scheduled drain makes the same decision.
+    opts.task_count = #(applied.tasks or {})
+
     if script then
       -- The scripted e2e driver expects the whole run to finish before submit
       -- returns; only a real run goes to the background.
       return after_questions(opts, paths, cfg, runner, session)
     end
-    schedule_job({ ctx = background_ctx(opts.ctx) }, paths, cfg, runner, session)
+    schedule_job({ ctx = background_ctx(opts.ctx), task_count = opts.task_count },
+      paths, cfg, runner, session)
     return { ok = true, background = true, tasks = applied.tasks }
   end
 
@@ -1057,6 +1240,7 @@ function M.new(deps)
     local opts = {
       intention = input.intention,
       answers = input.answers,
+      fast = input.fast,
       -- Qualify through a background ctx too: the qualifier is a role session,
       -- and a role session opened with the tool's LuaCtx is cancelled with the
       -- turn. `{ session = sid }` opens it as a background session instead.
