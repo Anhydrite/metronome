@@ -185,6 +185,56 @@ return function()
   eq(count_rule(cycle, "dependency_cycle"), 1, "dependency_cycle reports the cycle once")
   eq(cycle.ok, false, "dependency_cycle blocks")
 
+  -- analyze: gate_cycle and undeclared_gate_dependency ---------------------
+
+  -- A check that runs a file another task owns is an implicit dependency. If
+  -- the owner waits on us, neither task can go green: this is the deadlock
+  -- the declared graph cannot see.
+  local gate_cycle = analyze.analyze({
+    task("T-20261114-h001", "Require a password", { "routes/auth.js" }, { "node check.js" }),
+    task("T-20261114-h002", "Update the gate", { "check.js" }, { "node check.js" }, { "T-20261114-h001" }),
+  })
+  local gate_finding = find_rule(gate_cycle, "gate_cycle")
+  eq(gate_finding and gate_finding.severity, "blocking", "gate_cycle is blocking")
+  local gate_named = named(gate_finding)
+  eq(gate_named["T-20261114-h001"], true, "gate_cycle names the task whose check runs the gate")
+  eq(gate_named["T-20261114-h002"], true, "gate_cycle names the task that owns the gate")
+  has(gate_finding and gate_finding.message or "", "check.js", "gate_cycle names the gate file")
+  eq(gate_cycle.ok, false, "gate_cycle blocks")
+
+  -- The same coupling with the right order is not a cycle: the task that
+  -- runs the gate waits for the task that updates it.
+  local gate_ordered = analyze.analyze({
+    task("T-20261114-h003", "Require a password", { "routes/auth.js" }, { "node check.js" }, { "T-20261114-h004" }),
+    task("T-20261114-h004", "Update the gate", { "check.js" }, { "node check.js" }),
+  })
+  eq(find_rule(gate_ordered, "gate_cycle"), nil, "a declared gate dependency is not a cycle")
+  eq(find_rule(gate_ordered, "undeclared_gate_dependency"), nil, "a declared gate dependency is not undeclared")
+
+  -- No ordering at all: the check would run the old gate. Major, not blocking,
+  -- because adding the dependency is enough to fix it.
+  local gate_undeclared = analyze.analyze({
+    task("T-20261114-h005", "Require a password", { "routes/auth.js" }, { "node check.js" }),
+    task("T-20261114-h006", "Update the gate", { "check.js" }, { "node check.js" }),
+  })
+  local undeclared_finding = find_rule(gate_undeclared, "undeclared_gate_dependency")
+  eq(undeclared_finding and undeclared_finding.severity, "major", "undeclared_gate_dependency is major")
+  eq(find_rule(gate_undeclared, "gate_cycle"), nil, "without an ordering there is no cycle")
+
+  -- A task that owns the file its check runs is not coupled to anyone.
+  local gate_own = analyze.analyze({
+    task("T-20261114-h007", "Update the gate", { "check.js" }, { "node check.js" }),
+  })
+  eq(find_rule(gate_own, "gate_cycle"), nil, "a task that owns its gate is fine")
+  eq(find_rule(gate_own, "undeclared_gate_dependency"), nil, "a task that owns its gate is not coupled")
+
+  -- A check that names no declared file is opaque: no false positive.
+  local gate_opaque = analyze.analyze({
+    task("T-20261114-h008", "Run the suite", { "routes/auth.js" }, { "npm test" }),
+    task("T-20261114-h009", "Update the gate", { "check.js" }, { "node check.js" }, { "T-20261114-h008" }),
+  })
+  eq(find_rule(gate_opaque, "gate_cycle"), nil, "an opaque check produces no gate finding")
+
   -- analyze: empty_files and empty_checks ---------------------------------
 
   local no_files = analyze.analyze({

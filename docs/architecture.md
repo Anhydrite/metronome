@@ -68,7 +68,7 @@ draft -> qualifying -> awaiting_answers -> qualifying
 One task goes through these phases, each owned by a module:
 
 1. **Qualify** — `qualify.lua` turns the intention into task sheets, one per unit of work, with declared files, checks and acceptance criteria. A task that asks a question is parked in `awaiting_answers`; the rest become `ready` after the analysis gate.
-2. **Analyze** — `analyze.lua` checks the sheets against each other: duplicate titles, duplicate file sets, overlapping files without a dependency, missing dependencies, empty checks. A blocking finding keeps the task in `qualifying`.
+2. **Analyze** — `analyze.lua` checks the sheets against each other: duplicate titles, duplicate file sets, overlapping files without a dependency, missing dependencies, dependency cycles, gate coupling (a check that runs a file another task owns, which deadlocks when the owner waits on this task), empty checks. A blocking finding keeps the task in `qualifying`.
 3. **Implement** — `implement.lua` creates the worktree from the base branch, checkpoints the starting SHA, runs the implementer, commits and pushes.
 4. **Verify** — `checks.lua` runs the declared commands in the worktree. A red check rolls back to the checkpoint and sends the task back to `running`.
 5. **Converge** — `converge.lua` compares the diff with the declared files. A missing or unexpected file gets one repair turn; the verdict is the diff after the turn, never the model's word.

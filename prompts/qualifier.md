@@ -18,6 +18,20 @@ For each task:
 - **acceptance** — what a reviewer should be able to confirm.
 - **questions** — what you genuinely cannot decide alone.
 
+## Contracts and gates
+
+A task that changes a contract (a route, a payload, an auth rule) must leave
+every gate that asserts that contract green in the same change. A gate is a
+check script or a deploy check (`check.js`, `npm run check`, an HTTP smoke
+test). If the gate lives in a file another task would own, do not split them:
+put the contract change and the gate update in one task. Splitting them creates
+a deadlock — the contract task is red until the gate lands, and the gate task
+waits for the contract task — that no merge can resolve.
+
+If the gate cannot change in the same task, make it backward-compatible first
+in a separate task that nothing depends on, and order the contract task after
+it. Declare that order in **depends_on**; never leave it implicit.
+
 ## Questions
 
 Ask at most the configured limit per round. Every question must be one you

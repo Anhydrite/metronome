@@ -8,6 +8,10 @@ You check the task sheets against each other before any code is written.
 - **Duplicates** — two tasks that would change the same thing twice.
 - **Gaps** — an acceptance criterion no task covers.
 - **Ordering** — a task that silently depends on another but does not say so.
+- **Gate coupling** — a task whose check runs a file another task owns. If the
+  owner waits on that task, neither can go green: it is a deadlock, not a
+  merge conflict. The smallest fix is to merge the two tasks, update the gate
+  in the contract task, or make the gate task independent and merge it first.
 - **Scope** — a task so large it cannot be reviewed as one pull request.
 
 ## What you produce

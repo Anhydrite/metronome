@@ -94,6 +94,23 @@ local function intersection(a, b)
   return out
 end
 
+-- The file paths a check command mentions. A check such as `node check.js`
+-- runs a file that another task may own; that is an implicit dependency the
+-- declared `depends_on` graph does not show. We only need tokens that are
+-- exactly a declared path (an optional leading `./` is stripped), so quotes,
+-- flags and shell operators do not matter.
+local function command_tokens(command)
+  local tokens = {}
+  for token in tostring(command or ""):gmatch("[^%s;|&<>()]+") do
+    token = token:gsub("^['\"]", ""):gsub("['\"]$", "")
+    token = token:gsub("^%./", "")
+    if token ~= "" then
+      tokens[#tokens + 1] = token
+    end
+  end
+  return tokens
+end
+
 -- Normalization --------------------------------------------------------------
 
 -- Two titles are the same title when they read the same once case, whitespace
@@ -404,6 +421,61 @@ function M.analyze(tasks, opts)
       message = "dependency cycle: " .. path,
       tasks = cycle,
     }
+  end
+
+  -- gate_cycle / undeclared_gate_dependency: a check that runs a file another
+  -- task owns is an implicit dependency on that task. The check sees the file
+  -- as the owner will leave it, not as the base has it. If the owner waits on
+  -- this task, neither can go green: this task is red until the owner lands,
+  -- and the owner cannot start until this task merges. The declared graph
+  -- cannot show this, so the analyst must.
+  local owners = {}
+  local file_sets = {}
+  for i = 1, #ids do
+    file_sets[ids[i]] = {}
+    for _, file in ipairs(filesets[i]) do
+      file_sets[ids[i]][file] = true
+      owners[file] = owners[file] or {}
+      owners[file][ids[i]] = true
+    end
+  end
+  local gate_reported = {}
+  for i = 1, #ids do
+    local me = ids[i]
+    for _, command in ipairs(checksets[i]) do
+      for _, token in ipairs(command_tokens(command)) do
+        local file_owners = owners[token]
+        if file_owners and not file_sets[me][token] then
+          for owner in pairs(file_owners) do
+            local key = me .. "\0" .. owner .. "\0" .. token
+            if not gate_reported[key] then
+              gate_reported[key] = true
+              if reaches(owner, me) then
+                findings[#findings + 1] = {
+                  severity = "blocking",
+                  rule = "gate_cycle",
+                  message = string.format(
+                    "task %s runs %s in its checks, but %s owns that file and depends on %s; neither can go green — merge them, update the gate in %s, or make %s independent and merge it first",
+                    me, token, owner, me, me, owner
+                  ),
+                  tasks = { me, owner },
+                }
+              elseif not reaches(me, owner) then
+                findings[#findings + 1] = {
+                  severity = "major",
+                  rule = "undeclared_gate_dependency",
+                  message = string.format(
+                    "task %s runs %s in its checks, which %s owns; %s should depend on %s, or the gate update belongs in %s",
+                    me, token, owner, me, owner, me
+                  ),
+                  tasks = { me, owner },
+                }
+              end
+            end
+          end
+        end
+      end
+    end
   end
 
   -- empty_files: a sheet that says nothing about what it touches.
