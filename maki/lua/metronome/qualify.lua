@@ -211,6 +211,59 @@ function M.repo_context(repo, opts)
   }
 end
 
+-- Deterministic file inference ------------------------------------------------
+--
+-- The fast lane skips the qualifier, so it has no sheet to declare files. It
+-- can still read the intention: a path or a file name the user wrote is a
+-- declaration, not a guess. Only an exact repository path or a basename that
+-- resolves to exactly one file counts, so "styles.css" is declared and "page"
+-- is not. The result is sorted and capped, so two runs on the same intention
+-- give the same contract.
+function M.infer_files(intention, files, opts)
+  opts = type(opts) == "table" and opts or {}
+  local cap = tonumber(opts.max_files) or 8
+  if type(intention) ~= "string" or intention == "" or type(files) ~= "table" then
+    return {}
+  end
+
+  local paths = {}
+  local by_basename = {}
+  for _, path in ipairs(files) do
+    if type(path) == "string" and path ~= "" then
+      paths[path] = true
+      local base = path:match("([^/]+)$") or path
+      by_basename[base] = by_basename[base] or {}
+      by_basename[base][#by_basename[base] + 1] = path
+    end
+  end
+
+  local found = {}
+  local seen = {}
+  local function add(path)
+    if not seen[path] and #found < cap then
+      seen[path] = true
+      found[#found + 1] = path
+    end
+  end
+
+  for token in intention:gmatch("[%w%._/%-]+") do
+    local clean = token:gsub("^[%./]+", ""):gsub("[%.,;:!?%)]+$", "")
+    if clean ~= "" then
+      if paths[clean] then
+        add(clean)
+      else
+        local matches = by_basename[clean]
+        if matches and #matches == 1 then
+          add(matches[1])
+        end
+      end
+    end
+  end
+
+  table.sort(found)
+  return found
+end
+
 -- Prompt ---------------------------------------------------------------------
 
 function M.build_prompt(intent, context, opts)

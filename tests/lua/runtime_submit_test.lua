@@ -110,6 +110,26 @@ return function()
   eq(fast_applied and fast_applied.tasks[1].checks and #fast_applied.tasks[1].checks, 0,
     "fast task uses the project default checks")
 
+  -- The fast lane declares the files the intention names, so the scheduler can
+  -- prove two tasks disjoint instead of running them one at a time.
+  local listed_ref = nil
+  deps.git.ls_tree = function(_, ref)
+    listed_ref = ref
+    return { "public/styles.css", "README.md" }
+  end
+  local inferred_text, inferred_files = nil, nil
+  deps.qualify.infer_files = function(text, files)
+    inferred_text, inferred_files = text, files
+    return { "public/styles.css" }
+  end
+  local fast_files = rt.submit({ intention = "change public/styles.css to red" }, ctx)
+  eq(fast_files and fast_files.fast, true, "a short intention still takes the fast lane")
+  eq(listed_ref, "origin/main", "the fast lane reads the base ref")
+  eq(inferred_text, "change public/styles.css to red", "infer_files receives the intention")
+  eq(type(inferred_files), "table", "infer_files receives the base tree")
+  eq(fast_applied and fast_applied.tasks[1].files and fast_applied.tasks[1].files[1],
+    "public/styles.css", "the fast task declares the file the intention names")
+
   -- complexity: the caller's judgement overrides the wording heuristic ------
   captured = nil
   local forced_full = rt.submit({ intention = "add a red button", complexity = "full" }, ctx)

@@ -81,7 +81,11 @@ return function()
   local c = task("T-c", "ready", { files = { "README.md" } })
   eq(pipeline.overlaps(a, b), false, "disjoint files do not overlap")
   eq(pipeline.overlaps(a, c), true, "a shared file overlaps")
-  eq(pipeline.overlaps(a, task("T-x", "ready")), false, "an undeclared file set does not overlap")
+  -- An undeclared file set is an unknown blast radius: it overlaps everything,
+  -- so it runs alone.
+  eq(pipeline.overlaps(a, task("T-x", "ready")), true, "an undeclared file set overlaps a declared one")
+  eq(pipeline.overlaps(task("T-x", "ready"), task("T-y", "ready")), true,
+    "two undeclared file sets overlap")
 
   -- schedule: max_parallel -------------------------------------------------
 

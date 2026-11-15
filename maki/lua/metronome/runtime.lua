@@ -1375,6 +1375,14 @@ function M.new(deps)
       return words <= 25
     end
 
+    -- Both lanes read `origin/<base>`, never the local checkout: the fast lane
+    -- to infer the files the intention names, the qualifier to describe the
+    -- tree the worktree will be cut from. Fetch once, here.
+    if deps.git and type(deps.git.fetch) == "function" then
+      deps.git.fetch(paths.repo, "origin")
+    end
+    local base_ref_name = "origin/" .. tostring(cfg.project.base_ref)
+
     -- `fast = false` explicitly forces the qualifier, which is what the
     -- contract tests use; `fast = true` forces the fast lane; nil lets the
     -- short-intention heuristic decide.
@@ -1383,13 +1391,24 @@ function M.new(deps)
       local first_id = deps.qualify.next_id(deps.state.load(paths.root), date)
       local first_hex = tonumber(first_id:match("([0-9a-f]+)$") or "", 16) or 1
       local default_checks = (cfg.checks and cfg.checks.default) or {}
+      -- The fast lane has no sheet, but the intention may name a file. Reading
+      -- that name back is deterministic, and a declared file is what lets the
+      -- scheduler prove two tasks disjoint: without it the task runs alone.
+      local declared = {}
+      if type(deps.qualify.infer_files) == "function"
+        and deps.git and type(deps.git.ls_tree) == "function" then
+        local listed = deps.git.ls_tree(paths.repo, base_ref_name)
+        if type(listed) == "table" then
+          declared = deps.qualify.infer_files(opts.intention, listed)
+        end
+      end
       local applied, apply_err = deps.qualify.apply(deps.state, paths.root, {
         ok = true,
         tasks = { {
           title = opts.intention,
           intent = opts.intention,
           origin = opts.intention,
-          files = {},
+          files = declared,
           checks = default_checks,
         } },
       }, {
@@ -1405,23 +1424,12 @@ function M.new(deps)
       return { ok = true, background = true, fast = true, tasks = applied.tasks }
     end
 
-    -- The qualifier must describe the tree the worktree will be cut from, so it
-    -- reads `origin/<base>` from git rather than the local checkout. Fetch first
-    -- so that ref is as fresh as the worktree will be; a fetch that fails (no
-    -- network, no remote) leaves the last known ref, which is still the truth
-    -- the pipeline would merge into, and the qualifier's own git reads will say
-    -- so if the ref does not exist at all.
-    if deps.git and type(deps.git.fetch) == "function" then
-      deps.git.fetch(paths.repo, "origin")
-    end
-    local qualify_ref = "origin/" .. tostring(cfg.project.base_ref)
-
     local qualified = deps.qualify.run({
       intention = opts.intention,
       runner = runner,
       session_opts = session.qualifier,
       repo = paths.repo,
-      ref = qualify_ref,
+      ref = base_ref_name,
       git = deps.git,
       task_id = "qualify",
       validate = false,

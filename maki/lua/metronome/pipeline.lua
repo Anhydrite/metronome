@@ -148,18 +148,27 @@ end
 
 -- File overlap --------------------------------------------------------------
 
--- Two tasks overlap when they declare at least one common file. A task that
--- declares no files cannot be proven disjoint, so it does not block: the plan
--- makes `files` the contract, and an empty contract is the task author's call.
+-- Two tasks overlap when they declare at least one common file.
+--
+-- A task that declares no files has an unknown blast radius: it could touch
+-- anything, so it cannot be proven disjoint from anything and never runs
+-- beside another task. That is the cost of the fast lane, which skips the
+-- qualifier and therefore the file contract; naming a file in the intention
+-- (or using the full qualifier) buys the parallelism back.
 function M.overlaps(a, b)
   if type(a) ~= "table" or type(b) ~= "table" then
     return false
   end
+  local a_files = type(a.files) == "table" and a.files or {}
+  local b_files = type(b.files) == "table" and b.files or {}
+  if #a_files == 0 or #b_files == 0 then
+    return true
+  end
   local files = {}
-  for _, file in ipairs(type(a.files) == "table" and a.files or {}) do
+  for _, file in ipairs(a_files) do
     files[file] = true
   end
-  for _, file in ipairs(type(b.files) == "table" and b.files or {}) do
+  for _, file in ipairs(b_files) do
     if files[file] then
       return true
     end
@@ -214,7 +223,13 @@ function M.schedule(tasks, running, opts)
         clash, with_id = overlaps_any(task, selected)
       end
       if clash then
-        skipped[#skipped + 1] = { id = task.id, reason = "files overlap with " .. tostring(with_id) }
+        local reason
+        if #(type(task.files) == "table" and task.files or {}) == 0 then
+          reason = "no declared files: runs alone (name a file to run it in parallel)"
+        else
+          reason = "files overlap with " .. tostring(with_id)
+        end
+        skipped[#skipped + 1] = { id = task.id, reason = reason }
       else
         selected[#selected + 1] = task
       end

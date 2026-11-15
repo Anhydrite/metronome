@@ -159,6 +159,37 @@ return function()
   has(ref_prompt, "- src/app.js", "the prompt lists ref files")
   has(ref_prompt, "# Committed", "the prompt carries ref excerpts")
 
+  -- infer_files: the fast lane reads the files the intention names ---------
+  local repo_files = {
+    "README.md", "public/styles.css", "public/index.html",
+    "lib/auth.js", "routes/accounts.js", "routes/orders.js",
+  }
+  local inferred = q.infer_files("change le fond de public/styles.css en violet", repo_files)
+  eq(#inferred, 1, "an exact path is declared")
+  eq(inferred[1], "public/styles.css", "the exact path is kept")
+
+  local by_base = q.infer_files("corrige styles.css", repo_files)
+  eq(by_base[1], "public/styles.css", "a unique basename is resolved")
+
+  local ambiguous = q.infer_files("touche accounts.js et orders.js", repo_files)
+  eq(ambiguous[1], "routes/accounts.js", "a basename with one match is declared")
+  eq(ambiguous[2], "routes/orders.js", "every named file is declared")
+
+  local nothing = q.infer_files("change le fond de page en violet", repo_files)
+  eq(#nothing, 0, "an intention that names no file declares nothing")
+
+  local unknown = q.infer_files("corrige missing.css", repo_files)
+  eq(#unknown, 0, "a name that is not in the repository is not declared")
+
+  local capped = q.infer_files("README.md public/styles.css lib/auth.js", repo_files, { max_files = 2 })
+  eq(#capped, 2, "the declaration is capped")
+  eq(capped[1] < capped[2], true, "the declaration is sorted")
+
+  local empty = q.infer_files("", repo_files)
+  eq(#empty, 0, "an empty intention declares nothing")
+  eq(#q.infer_files(nil, repo_files), 0, "a missing intention declares nothing")
+  eq(#q.infer_files("README.md", nil), 0, "a missing file list declares nothing")
+
   -- extract_json -----------------------------------------------------------
 
   local fenced = q.extract_json('```json\n{"a":1}\n```')
