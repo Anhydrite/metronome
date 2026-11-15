@@ -162,20 +162,25 @@ function M.refresh(panel)
   if not state then
     return nil, err
   end
-  local lines, rows, counts = panel.render.lines(state.tasks, {
+  local lines, rows, counts, row_lines = panel.render.lines(state.tasks, {
     quiet = panel.quiet,
     frame = panel.frame,
   })
   panel.rows = rows
   panel.counts = counts
-  -- The buffer starts with one summary line per non-empty bucket plus a blank
-  -- line, so row i is not buffer line i. Without this map the highlighted line
-  -- and the selected task drift apart: the user sees one task and `d` deletes
-  -- another.
-  panel.row_line = {}
-  local header = #lines - #rows
-  for i = 1, #rows do
-    panel.row_line[i] = header + i
+  -- The renderer returns the buffer line of every row, because group headers
+  -- (one per intention) sit between the bell and the rows. Without this map the
+  -- highlighted line and the selected task drift apart: the user sees one task
+  -- and `d` deletes another.
+  panel.row_line = row_lines or {}
+  if #panel.row_line ~= #rows then
+    -- A renderer without the map (an older injected one in a test): fall back
+    -- to the flat layout, where the rows follow the header directly.
+    panel.row_line = {}
+    local header = #lines - #rows
+    for i = 1, #rows do
+      panel.row_line[i] = header + i
+    end
   end
   if #rows == 0 then
     panel.cursor = 1
@@ -465,6 +470,9 @@ function M.peek(panel, id, opts)
     title = task.title,
     status = task.status,
     phase = task.phase,
+    intent = type(task.intent) == "string" and task.intent or nil,
+    depends_on = type(task.depends_on) == "table" and task.depends_on or nil,
+    branch = type(task.branch) == "string" and task.branch or nil,
     notes = (not quiet and type(task.notes) == "table") and task.notes or {},
     findings = type(task.review) == "table" and type(task.review.findings) == "table"
       and task.review.findings or {},
@@ -482,6 +490,15 @@ function M.peek_text(panel, id, opts)
     "status: " .. tostring(info.status)
       .. (info.phase and ("  phase: " .. tostring(info.phase)) or ""),
   }
+  if info.intent and info.intent ~= "" then
+    lines[#lines + 1] = "asked: " .. tostring(info.intent)
+  end
+  if info.depends_on and #info.depends_on > 0 then
+    lines[#lines + 1] = "depends on: " .. table.concat(info.depends_on, ", ")
+  end
+  if info.branch and info.branch ~= "" then
+    lines[#lines + 1] = "branch: " .. tostring(info.branch)
+  end
   for _, question in ipairs(info.questions) do
     lines[#lines + 1] = "? " .. tostring(question.text)
   end

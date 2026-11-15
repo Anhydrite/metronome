@@ -30,7 +30,7 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `tools.lua` | The twelve agent tools, as thin adapters over an injected runtime. |
 | `commands.lua` | The seventeen `/metronome` subcommands, parsed and forwarded to the runtime. |
 | `ui/panel.lua` | Floating panel lifecycle, key routing, peek/reply, event-driven refresh, quiet mode and its spinner loop. |
-| `ui/render.lua` | Pure attention-bell ordering, row rendering and the quiet-mode spinner. |
+| `ui/render.lua` | Pure attention-bell ordering, intention grouping, dependency and branch rendering, and the quiet-mode spinner. |
 
 `maki/init.lua` loads every module and registers the tools and the `/metronome` dispatcher against `runtime.lua`. The agent card is `agents/metronome.md`, and the operating manual is `system-prompt.md`.
 

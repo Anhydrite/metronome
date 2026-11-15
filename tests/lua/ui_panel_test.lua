@@ -376,6 +376,19 @@ return function()
   eq(peeked:find("which db?", 1, true) ~= nil, true, "peek_text shows the pending question")
   eq(peeked:find("awaiting_answers", 1, true) ~= nil, true, "peek_text shows the status")
 
+  tasks["T-20261114-b7c1"].intent = "add a real login"
+  tasks["T-20261114-b7c1"].depends_on = { "T-20261114-c9d0" }
+  tasks["T-20261114-b7c1"].branch = "metronome/fix-login-redirect-b7c1"
+  local peeked_failed = panel_mod.peek_text(panel, "T-20261114-b7c1", { verbose = true })
+  eq(peeked_failed:find("asked: add a real login", 1, true) ~= nil, true,
+    "peek_text shows the intention")
+  eq(peeked_failed:find("depends on: T-20261114-c9d0", 1, true) ~= nil, true,
+    "peek_text shows the dependencies")
+  eq(peeked_failed:find("branch: metronome/fix-login-redirect-b7c1", 1, true) ~= nil, true,
+    "peek_text shows the branch")
+  tasks["T-20261114-b7c1"].intent = nil
+  tasks["T-20261114-b7c1"].depends_on = nil
+  tasks["T-20261114-b7c1"].branch = nil
   replied = nil
   eq(panel_mod.reply(panel, "T-20261114-b7c1", "retry with the fix"), true, "reply succeeds")
   eq(replied.id, "T-20261114-b7c1", "reply targets the task")

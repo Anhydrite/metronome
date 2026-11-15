@@ -75,6 +75,8 @@ The same surface is exposed to the agent as twelve tools: `metronome_submit`, `m
 
 `Enter` focuses the selected task's transcript, `Space` peeks without attaching and offers a reply, `+`/`-` rates a finding, `j`/`k` move, `q` or `Esc` closes. The keys are bound to the panel's own buffer, so the focused window never swallows them. The panel redraws on `TaskStatusChanged` and `TurnEnd`; it does not poll.
 
+Tasks are **grouped by the intention that produced them**: a header line shows the ask verbatim and how many tasks it created, then its tasks. Each row shows the short id, the title, the status, the phase or review round, the owning role, its `depends_on` (`← T-…0001`) and its branch (`⎇ feature-0001`). Finished tasks are hidden; `Space` on a task shows the full intention, dependencies and branch.
+
 The panel opens in **quiet mode**: a running task shows an animated spinner instead of its phase, progress lines pushed by the agent are dropped, and `Space` hides the agent's notes. What needs you — a blocked question, a failure, a review to read — keeps its detail. Press `v` to switch to verbose and back; the footer shows the current choice.
 
 ## How it works

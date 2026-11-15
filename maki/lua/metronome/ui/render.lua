@@ -180,6 +180,37 @@ function M.role_for(task)
   return M.role_name(STATUS_ROLE[task.status])
 end
 
+-- A dependency is usually a task id, but an older sheet may still carry the
+-- title the qualifier wrote. Shorten an id, keep a title readable, and drop
+-- anything empty.
+local function short_dep(dep)
+  local s = tostring(dep or "")
+  if s == "" then
+    return nil
+  end
+  if s:match("^T%-") then
+    return M.short_id(s)
+  end
+  return s
+end
+
+function M.short_deps(deps)
+  if type(deps) ~= "table" then
+    return nil
+  end
+  local out = {}
+  for _, dep in ipairs(deps) do
+    local short = short_dep(dep)
+    if short then
+      out[#out + 1] = short
+    end
+  end
+  if #out == 0 then
+    return nil
+  end
+  return table.concat(out, ",")
+end
+
 -- Normalise the projection to a list. state.tasks is a map, but the tests and
 -- a future scheduler may hand us an array; accept both and drop anything that
 -- is not a task.
@@ -236,6 +267,9 @@ function M.rows(tasks, opts)
         spinner = M.spinner(frame),
         active = not TERMINAL[task.status],
         waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
+        intent = type(task.intent) == "string" and task.intent or "",
+        depends_on = M.short_deps(task.depends_on),
+        branch = type(task.branch) == "string" and task.branch ~= "" and task.branch or nil,
       }
     end
   end
@@ -249,6 +283,56 @@ function M.rows(tasks, opts)
     return a.id < b.id
   end)
   return rows
+end
+
+-- Group rows by the intention they came from. The user asked one thing; the
+-- qualifier may have split it into several tasks, and the panel must show that
+-- relationship instead of a flat list. Groups are ordered by their most urgent
+-- row, so a blocked task still pulls its whole intention to the top. Rows keep
+-- their urgency order inside a group.
+function M.groups(rows)
+  local order = {}
+  local by_intent = {}
+  for _, row in ipairs(rows or {}) do
+    local intent = row.intent or ""
+    local group = by_intent[intent]
+    if not group then
+      group = { intent = intent, rows = {}, urgency = row.urgency }
+      by_intent[intent] = group
+      order[#order + 1] = group
+    end
+    group.rows[#group.rows + 1] = row
+    if row.urgency < group.urgency then
+      group.urgency = row.urgency
+    end
+  end
+  table.sort(order, function(a, b)
+    if a.urgency ~= b.urgency then
+      return a.urgency < b.urgency
+    end
+    return a.intent < b.intent
+  end)
+  return order
+end
+
+-- The header above an intention's tasks: what the user asked, verbatim, and
+-- how many tasks it produced. `total` counts every task of that intention,
+-- including the finished ones the panel hides, so the split is visible even
+-- when some of its tasks are done.
+function M.intent_line(group, opts, total)
+  opts = type(opts) == "table" and opts or {}
+  local text = M.fit(group.intent, opts.intent_max or 70)
+  local shown = #group.rows
+  total = type(total) == "number" and total or shown
+  local count = total .. (total == 1 and " task" or " tasks")
+  if shown < total then
+    count = count .. " (" .. shown .. " shown)"
+  end
+  return {
+    { "▸ ", "dim" },
+    { '"' .. text .. '"', "bold" },
+    { "  " .. count, "dim" },
+  }
 end
 
 function M.counts(rows)
@@ -353,33 +437,67 @@ function M.row_line(row, opts)
   end
   spans[#spans + 1] = { "  " }
   spans[#spans + 1] = { role, "dim" }
+  if row.depends_on then
+    spans[#spans + 1] = { "  ← " .. row.depends_on, "dim" }
+  end
+  if row.branch then
+    -- The branch is what a human checks out; the `metronome/` prefix is noise
+    -- the panel can drop, and a long slug is cut so it cannot push the row.
+    local branch = row.branch:gsub("^metronome/", "")
+    spans[#spans + 1] = { "  ⎇ " .. M.fit(branch, opts.branch_max or 28), "dim" }
+  end
   return spans
 end
 
--- The whole panel body: bell header, a spacer, then one line per task.
+-- The whole panel body: bell header, a spacer, then the tasks grouped by the
+-- intention that produced them. A group with an intention gets a header line
+-- naming the ask and the number of tasks it produced; a group without one
+-- (older tasks) is rendered flat, as before.
+--
+-- Returns `lines, rows, counts, row_lines`: `rows` is in display order and
+-- `row_lines[i]` is the buffer line of the i-th row, so the panel's cursor and
+-- its highlight stay on the same task even with group headers interleaved.
 function M.lines(tasks, opts)
   opts = type(opts) == "table" and opts or {}
   local rows = M.rows(tasks, opts)
   local lines, counts = M.summary_lines(rows)
   lines[#lines + 1] = ""
+
+  -- Count every task per intention, including the finished ones the panel
+  -- hides, so the header shows the real size of the split.
+  local total = {}
+  for _, task in ipairs(M.collect(tasks)) do
+    local intent = type(task.intent) == "string" and task.intent or ""
+    total[intent] = (total[intent] or 0) + 1
+  end
+
+  local display = {}
+  local row_lines = {}
   if #rows == 0 then
     lines[#lines + 1] = { { "(no tasks)", "dim" } }
   else
-    for _, row in ipairs(rows) do
-      lines[#lines + 1] = M.row_line(row, opts)
+    for _, group in ipairs(M.groups(rows)) do
+      if group.intent ~= "" then
+        lines[#lines + 1] = M.intent_line(group, opts, total[group.intent])
+      end
+      for _, row in ipairs(group.rows) do
+        lines[#lines + 1] = M.row_line(row, opts)
+        display[#display + 1] = row
+        row_lines[#display] = #lines
+      end
     end
   end
-  return lines, rows, counts
+  return lines, display, counts, row_lines
 end
 
 -- Draw into a maki buffer. The buffer is injected so the tests can pass a
 -- plain table and the panel can pass a real `maki.ui.buf()`.
 function M.render(buf, tasks, opts)
-  local lines, rows, counts = M.lines(tasks, opts)
+  local lines, rows, counts, row_lines = M.lines(tasks, opts)
   if buf and type(buf.set_lines) == "function" then
     buf:set_lines(lines)
   end
-  return lines, rows, counts
+  return lines, rows, counts, row_lines
 end
 
 -- Flatten a styled line back to text. Tests and logs use it; the UI does not.

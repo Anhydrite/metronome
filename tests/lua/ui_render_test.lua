@@ -123,6 +123,44 @@ return function()
   local all = render.rows(with_done, { show_done = true })
   eq(#all, 3, "show_done brings the done bucket back")
 
+  -- intentions and dependencies --------------------------------------------
+
+  local grouped = {
+    { id = "T-20261115-0001", title = "auth core", status = "running", intent = "login", depends_on = {}, branch = "metronome/auth-core-0001" },
+    { id = "T-20261115-0002", title = "routes", status = "ready", intent = "login", depends_on = { "T-20261115-0001" } },
+    { id = "T-20261115-0003", title = "export", status = "failed", intent = "export CSV", depends_on = {} },
+  }
+  local grouped_rows = render.rows(grouped)
+  local groups = render.groups(grouped_rows)
+  eq(#groups, 2, "rows group by intention")
+  eq(groups[1].intent, "export CSV", "the most urgent intention comes first")
+  eq(groups[2].intent, "login", "the other intention follows")
+  eq(#groups[2].rows, 2, "the login group holds both tasks")
+
+  local g_lines, g_rows, _, g_row_lines = render.lines(grouped)
+  eq(g_rows[1].id, "T-20261115-0003", "display order puts the failure first")
+  eq(g_rows[2].id, "T-20261115-0001", "then the login group")
+  eq(g_rows[3].id, "T-20261115-0002", "the login group keeps its order")
+  eq(g_row_lines[1] < g_row_lines[2], true, "row_lines maps the display order")
+  local g_text = {}
+  for _, line in ipairs(g_lines) do
+    g_text[#g_text + 1] = render.text(line)
+  end
+  local g_joined = table.concat(g_text, "\n")
+  has(g_joined, '"export CSV"', "the panel shows the intention")
+  has(g_joined, '"login"', "the panel shows the other intention")
+  has(g_joined, "2 tasks", "the header counts the tasks the intention produced")
+  has(g_joined, "← T-…0001", "a row shows its dependency")
+  has(g_joined, "⎇ auth-core-0001", "a row shows its branch")
+
+  -- an intentionless task is rendered flat, with no header
+  local flat = render.lines({ task("T-20261115-0004", "legacy", "ready") })
+  local flat_text = {}
+  for _, line in ipairs(flat) do
+    flat_text[#flat_text + 1] = render.text(line)
+  end
+  eq(table.concat(flat_text, "\n"):find("▸ \"", 1, true), nil, "no header for an intentionless task")
+
   -- counts -----------------------------------------------------------------
 
   local counts = render.counts(rows)
