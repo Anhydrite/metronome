@@ -2,6 +2,17 @@
 
 An autonomous delivery pipeline that runs as a [maki](https://github.com/Anhydrite/maki) plugin.
 
+> [!WARNING]
+> **The `no-mistakes` review gate runs its own agent, not maki.**
+> With `[review] engine = "no-mistakes"`, the gate reads `agent:` from
+> `~/.no-mistakes/config.yaml`. `agent: auto` picks the first native agent it
+> detects — on this machine, `pi` — so the gate's review/fix/test steps run in
+> `pi`, while Metronome's own roles keep running in maki. If `pi` fails with
+> `401 api_key_expired` (provider `opencode-go`), the gate fails even though
+> maki is healthy. To run the gate through maki, use `agent: acp:maki` with an
+> `acp_registry_overrides` entry (`maki: maki acp`); to stay in maki only,
+> switch `[review] engine` to `"model"`.
+
 You bring an intention. Metronome qualifies it into tasks, asks the questions that block work, and drives each task through implementation, checks, review, merge and deploy. You stay the conductor: you set the tempo, answer what only you can answer, and read the delivery report.
 
 Metronome never writes code itself. It orchestrates five roles — qualifier, analyst, implementer, reviewer, deployer — each in its own session and git worktree, and it reports what the pipeline recorded, never what a model claimed.
