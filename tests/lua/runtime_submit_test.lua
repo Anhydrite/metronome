@@ -72,8 +72,14 @@ return function()
         return { tasks = {} }
       end,
     },
-    runner = {}, git = {}, implement = {}, checks = {}, converge = {}, review = {}, merge = {},
+    runner = {}, git = {}, checks = {}, converge = {}, review = {}, merge = {},
     deploy = {}, calibrate = {}, fence = {}, mode = {},
+    -- The real slugger: the epic branch is named after the intention.
+    implement = { slug = function(text, max)
+      local out = tostring(text):lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+      if max and #out > max then out = out:sub(1, max):gsub("%-+$", "") end
+      return out
+    end },
   }
 
   local rt = runtime.new(deps)
@@ -89,6 +95,14 @@ return function()
     "submit waits for qualification and returns its result")
   eq(type(captured), "table", "qualify.run was called")
   eq(captured and captured.ctx, ctx, "submit forwards the positional ctx to qualify")
+
+  -- Each qualification gets its own run directory: two concurrent qualifiers
+  -- must not share runs/qualify/qualify/1.
+  local first_key = captured and captured.task_id
+  eq(type(first_key), "string", "the qualifier receives a run key")
+  rt.submit({ intention = "add another icon", fast = false }, ctx)
+  eq(captured and captured.task_id ~= first_key, true,
+    "each qualification gets its own run key")
 
   -- Fast lane: a short, unambiguous intention skips the qualifier ----------
 
@@ -242,15 +256,52 @@ return function()
       fn()
     end,
     wait_turn_end = false,
-    runner = {}, git = {}, implement = {}, checks = {}, converge = {}, review = {}, merge = {},
+    runner = {}, git = {}, checks = {}, converge = {}, review = {}, merge = {},
     deploy = {}, calibrate = {}, fence = {}, mode = {},
+    -- The real slugger: the epic branch is named after the intention.
+    implement = { slug = function(text, max)
+      local out = tostring(text):lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+      if max and #out > max then out = out:sub(1, max):gsub("%-+$", "") end
+      return out
+    end },
   }
+  -- Two tasks from one intention: the epic branch is created and pushed before
+  -- the tasks exist, and qualify.apply receives the epic options.
+  local created_branch, pushed_branch, epic_opts
+  deps2.git = {
+    branch_create = function(repo, name, from_ref)
+      created_branch = { repo = repo, name = name, from = from_ref }
+      return { ok = true, branch = name, created = true }
+    end,
+    push_branch = function(repo, name)
+      pushed_branch = { repo = repo, name = name }
+      return true
+    end,
+  }
+  local apply_opts
+  local base_apply = deps2.qualify.apply
+  deps2.qualify.apply = function(state_mod, root, result, opts)
+    apply_opts = opts
+    epic_opts = opts and opts.epic
+    return base_apply(state_mod, root, result, opts)
+  end
   local rt2 = runtime.new(deps2)
   local res2 = rt2.submit({ intention = "x", fast = false }, ctx)
   rt2.run_pending()
   eq(type(res2), "table", "submit with dependencies returns a result")
   eq(set_fields["T-2"] and set_fields["T-2"].depends_on and set_fields["T-2"].depends_on[1], "T-1",
     "dependency titles are remapped to task ids")
+  eq(type(created_branch), "table", "a multi-task intention creates an epic branch")
+  eq(created_branch and created_branch.from, "origin/main",
+    "the epic branch is cut from the fresh project base")
+  eq(created_branch and created_branch.name
+    and created_branch.name:match("^metronome/epic/x%-[0-9a-f]+$") ~= nil,
+    true, "the epic branch is named after the intention, with the task suffix")
+  eq(pushed_branch and pushed_branch.name, created_branch and created_branch.name,
+    "the epic branch is pushed before the tasks are created")
+  eq(epic_opts and epic_opts.branch, created_branch and created_branch.name,
+    "qualify.apply receives the epic branch")
+  eq(epic_opts and epic_opts.base, "main", "qualify.apply receives the project base")
 
   -- Retry re-dispatches the task -------------------------------------------
 
@@ -1279,4 +1330,218 @@ auto_deploy = false
   eq(second_resets, 1, "a task with one earlier repair still repairs the next conflict")
   eq(second_impl, 2, "the work is redone on the fresh base")
   eq(second_task.conflict_retries, 2, "the repair counter grows")
+  -- Epic branches ----------------------------------------------------------
+  --
+  -- The base a task is cut from, merged into and diffed against is per task:
+  -- a subtask of an epic carries `base_ref = <epic branch>`, everything else
+  -- falls back to the project base.
+
+  eq(runtime.task_base({ base_ref = "metronome/epic/x" }, { project = { base_ref = "main" } }),
+    "metronome/epic/x", "task_base prefers the task's own base")
+  eq(runtime.task_base({}, { project = { base_ref = "main" } }), "main",
+    "task_base falls back to the project base")
+  eq(runtime.task_base({ base_ref = "" }, { project = { base_ref = "main" } }), "main",
+    "an empty base_ref falls back to the project base")
+  eq(runtime.task_base({ base_ref = "epic" }, nil), "epic", "task_base works without a config")
+
+  -- A subtask runs the whole normal pipeline, but on the epic branch, and it
+  -- never deploys: the epic owns the deploy.
+  local seen = {}
+  local subtask = {
+    id = "T1", status = "ready", title = "sub", checks = { "true" },
+    base_ref = "metronome/epic/demo-0001",
+  }
+  local subtask_deploy = false
+  local subtask_merge_opts = nil
+  local dispatched_sub = false
+  local deps_sub = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = true },
+          deploy = { auto_deploy = true, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function() return { tasks = { T1 = subtask } } end,
+      transition = function(_, id, status) subtask.status = status; return { id = id, status = status } end,
+      set_fields = function(_, _, fields)
+        for k, v in pairs(fields or {}) do subtask[k] = v end
+        return true
+      end,
+    },
+    implement = {
+      run = function(opts)
+        seen.implement_base = opts.base_ref
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function(opts) seen.converge_base = opts.base; return { ok = true } end },
+    review = { review = function(opts) seen.review_base = opts.base; return { ok = true, approved = true } end },
+    git = {
+      pr_open = function(_, _, _, opts) seen.pr_base = opts.base; return { number = 1, url = "u", state = "open" } end,
+    },
+    merge = {
+      rebase = function(opts) seen.rebase_base = opts.base; return { ok = true, sha = "r" } end,
+      run = function(opts)
+        subtask_merge_opts = opts
+        -- The real merger owns the pr_open -> merging -> merged walk.
+        subtask.status = "merged"
+        return { ok = true }
+      end,
+    },
+    deploy = { run = function() subtask_deploy = true; return { ok = true, deployed = true } end },
+    pipeline = {
+      tick = function(opts)
+        if not dispatched_sub then
+          dispatched_sub = true
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_sub = runtime.new(deps_sub)
+  rt_sub.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_sub.run_pending()
+  eq(seen.implement_base, "metronome/epic/demo-0001", "the implementer cuts the worktree from the epic branch")
+  eq(seen.rebase_base, "metronome/epic/demo-0001", "the rebase targets the epic branch")
+  eq(seen.converge_base, "origin/metronome/epic/demo-0001", "the converge diff is read against the epic branch")
+  eq(seen.review_base, "origin/metronome/epic/demo-0001", "the review diff is read against the epic branch")
+  eq(seen.pr_base, "metronome/epic/demo-0001", "the subtask PR targets the epic branch")
+  eq(subtask_merge_opts and subtask_merge_opts.base, "metronome/epic/demo-0001",
+    "the subtask merges into the epic branch")
+  eq(subtask_merge_opts and subtask_merge_opts.deploy_pending, false,
+    "a subtask does not mark the epic branch as a deployable base")
+  eq(subtask_deploy, false, "a subtask never deploys")
+  eq(subtask.status, "merged", "a subtask stops at merged")
+
+  -- An epic task skips implement, converge and review: it pushes the branch,
+  -- opens the single PR to the project base, merges it and deploys.
+  local epic_record = {
+    id = "T1", status = "ready", title = "epic: two things", kind = "epic",
+    branch = "metronome/epic/demo-0001", base_ref = "main", checks = { "true" },
+  }
+  local epic_seen = { implement = 0, review = 0, converge = 0, deploy = 0 }
+  local epic_merge_opts = nil
+  local dispatched_epic = false
+  local deps_epic = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = true, auto_rebase = true },
+          deploy = { auto_deploy = true, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    state = {
+      load = function() return { tasks = { T1 = epic_record } } end,
+      transition = function(_, id, status) epic_record.status = status; return { id = id, status = status } end,
+      set_fields = function(_, _, fields)
+        for k, v in pairs(fields or {}) do epic_record[k] = v end
+        return true
+      end,
+    },
+    implement = {
+      run = function() epic_seen.implement = epic_seen.implement + 1; return { ok = false } end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() epic_seen.converge = epic_seen.converge + 1; return { ok = true } end },
+    review = { review = function() epic_seen.review = epic_seen.review + 1; return { ok = true } end },
+    git = {
+      -- The epic branch already exists on the remote after the subtask merges:
+      -- the local ref is aligned to it instead of pushing a stale tip.
+      fetch = function() epic_seen.fetched = true; return true end,
+      rev_parse = function(_, ref) epic_seen.rev_parse = ref; return "abc123" end,
+      branch_reset = function(_, name, ref)
+        epic_seen.reset = { name = name, ref = ref }
+        return true
+      end,
+      push_branch = function(repo, name) epic_seen.pushed = name; return true end,
+      pr_open = function(_, _, _, opts)
+        epic_seen.pr = opts
+        return { number = 7, url = "https://example.test/pr/7", state = "open" }
+      end,
+      worktree_add = function(repo, wt, branch) epic_seen.worktree = wt; return wt end,
+      worktree_remove = function() return true end,
+    },
+    merge = {
+      run = function(opts) epic_merge_opts = opts; return { ok = true } end,
+    },
+    deploy = {
+      run = function()
+        epic_seen.deploy = epic_seen.deploy + 1
+        -- The real deployer owns the merged -> deploying -> deployed walk.
+        epic_record.status = "deployed"
+        return { ok = true, deployed = true }
+      end,
+    },
+    pipeline = {
+      tick = function(opts)
+        if not dispatched_epic then
+          dispatched_epic = true
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_epic = runtime.new(deps_epic)
+  rt_epic.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic.run_pending()
+  eq(epic_seen.implement, 0, "an epic never calls the implementer")
+  eq(epic_seen.converge, 0, "an epic never converges a diff")
+  eq(epic_seen.review, 0, "an epic never enters the review loop")
+  eq(epic_seen.fetched, true, "the epic fetches the remote before touching its branch")
+  eq(epic_seen.rev_parse, "origin/metronome/epic/demo-0001",
+    "the epic reads the remote tip of its branch")
+  eq(epic_seen.reset and epic_seen.reset.name, "metronome/epic/demo-0001",
+    "the epic aligns its local branch with the remote")
+  eq(epic_seen.reset and epic_seen.reset.ref, "origin/metronome/epic/demo-0001",
+    "the local branch is moved to the remote tip")
+  eq(epic_seen.pushed, nil, "an existing remote branch is not pushed again")
+  eq(epic_seen.pr and epic_seen.pr.base, "main", "the epic PR targets the project base")
+  eq(epic_seen.pr and epic_seen.pr.head, "metronome/epic/demo-0001", "the epic PR head is the epic branch")
+  eq(epic_seen.pr and epic_seen.pr.attach_only, true, "the epic opens the PR before moving the task")
+  eq(epic_merge_opts and epic_merge_opts.base, "main", "the epic merges into the project base")
+  eq(epic_merge_opts and epic_merge_opts.worktree, maki.fs.joinpath(paths.worktrees, "T1"),
+    "the epic is rebased in an isolated worktree, not the project checkout")
+  eq(epic_merge_opts and epic_merge_opts.auto_rebase, true, "the epic honours the configured auto_rebase")
+  eq(epic_seen.deploy, 1, "the epic deploys after its merge")
+  eq(epic_record.status, "deployed", "the epic ends deployed")
+
 end

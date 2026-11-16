@@ -67,6 +67,8 @@ The user states an intention. You capture it verbatim — no paraphrase that los
 
 The qualifier reads the repository and turns the intention into task sheets and questions. It may raise at most **15 questions** per round. A sheet declares its files, its checks, and its acceptance. If questions remain, the task waits in `awaiting_answers`; otherwise it is ready for analysis.
 
+`submit` does not wait for this: it returns `queued=true` immediately and the qualifier runs in the background, because a qualifier turn can take a minute or more. Read the created tasks with `metronome_status` when you need them; the questions arrive in the chat when the round is ready.
+
 ### QUESTIONS — `questions.lua`
 
 When the qualifier raises questions, you synthesize them: deduplicate the same question asked by several tasks, prioritize the ones that unblock the most work, cap the round at 15, and present them in the chat. When the user answers, you redistribute each answer to every task that asked it. No answer is dropped, no question is asked twice.
@@ -89,11 +91,13 @@ Before a pull request, the diff is compared to the sheet. A declared file that d
 
 ### REVIEW — `review.lua`
 
-The reviewer gates the change before it becomes a pull request. It never reviews "the branch": it reviews **the exact SHA** read before the turn, and a branch that moved while the model was thinking invalidates the answer. Protected paths are checked before the model is called. The loop is bounded at N rounds (default 3); at the limit the task escalates to a human instead of spinning. A clean review returns `approved`; findings return `changes_requested` and the task goes back to implementation.
+The reviewer gates the change on a pull request that already exists: with the `model` engine the pipeline opens it in `attach_only` mode before the review, so a human can follow it while the review runs. It never reviews "the branch": it reviews **the exact SHA** read before the turn, and a branch that moved while the model was thinking invalidates the answer. Protected paths are checked before the model is called. The loop is bounded at N rounds (default 3); at the limit the task escalates to a human instead of spinning. A clean review returns `approved`; findings return `changes_requested` and the task goes back to implementation. Each round's findings are mirrored onto the pull request with `gh pr comment` (one summary comment per round, including minor and nit findings), so a human reads them on GitHub.
+
+With `review.engine = "no-mistakes"`, the local `no-mistakes` gate replaces the reviewer loop: it rebases, reviews, tests, documents and lints the branch, pushes it and opens the PR itself. A clean gate is approved and merged immediately; a failed gate fails the task with its output instead of bouncing back to implementation, which removes the review/implement loop.
 
 ### PR — `git.pr_open`
 
-A clean review opens the pull request with `gh pr create` and stores `{number, url, state}` on the task. The task moves from `reviewing` to `pr_open`.
+With the `model` engine the pull request is opened before the review in `attach_only` mode; with `no-mistakes` the gate opens it. Either way `{number, url, state}` is stored on the task and the task moves from `reviewing` to `pr_open`.
 
 The implementer refuses to commit on the base branch (`main`/`master`): every change reaches it through a pull request. The end-to-end proof checks that every code commit a run adds to `main` has a merged PR.
 
@@ -104,6 +108,10 @@ The branch is rebased onto the fresh base, the PR is squash-merged through `gh`,
 ### DEPLOY — `deploy.lua`
 
 Deploy is the one step that touches the real world, so it is deliberately conservative. It starts only from `merged`, refuses unless the PR is really merged and the checks are green, requires `deploy.md` to exist, and asks for confirmation before it moves anything. The deployer is guided by the plan verbatim; the module never invents a step. Logs are written and the task ends `deployed`.
+
+### EPIC — the epic branch rule
+
+When one intention qualifies into more than one task, those tasks never merge into the project base. Qualification cuts an epic branch `metronome/epic/<slug>-<first-task-suffix>` from the fresh base and pushes it; every subtask is cut from it (`task.base_ref`), opens its PR against it, merges into it, re-runs its checks there and stops at `merged` — a subtask never deploys. The qualification also creates one `epic` task that depends on every subtask: once they are all merged, it pushes the epic branch, opens the single PR from the epic branch to the project base, merges it, re-runs the declared checks on the merged base, and only then deploys. The epic has no implementation, convergence or review of its own — it goes `running -> pr_open` directly. An intention that produces exactly one task is unchanged: it merges into the project base and deploys as today.
 
 ## Roles
 
@@ -173,7 +181,7 @@ You report what the pipeline recorded. If a check is red, you say red. If a revi
 
 You drive the pipeline through twelve tools:
 
-- `metronome_submit` — create an intent from an intention and start qualification.
+- `metronome_submit` — create an intent and start qualification; returns at once, qualification runs in the background.
 - `metronome_status` — read the state of all tasks, or the detail of one.
 - `metronome_answer` — deliver answers to the pending question round.
 - `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase.
@@ -233,30 +241,14 @@ have the layer silently skipped.
 `/metronome panel` opens a floating window anchored north-east. It is a view,
 not a second pipeline: every key routes to an action the tools already expose.
 
-The attention bell orders the list by what needs you, never by date:
-
-1. **questions** — tasks blocked on an answer (`a` to answer).
-2. **failures** — `failed` or `stalled` tasks (`r` to retry).
-3. **review ready** — `reviewing`, `changes_requested` or `pr_open` (`Enter` to read).
-4. **in progress** — everything still moving.
-
-Each row shows the short task id, its title, its phase or review round, and the
-role that owns it. The panel redraws on `TaskStatusChanged` and `TurnEnd`; it
-does not poll.
-
-The panel opens in quiet mode, the mode the user asked for: a running task shows
-an animated spinner instead of its phase, `push` drops the agent's progress
-lines, and `Space` omits the agent's notes. Blocked questions, failures and
-reviews keep their detail, because those are what needs the human, not the
-agent's narration. `v` toggles verbose; the spinner advances on a deferred loop
-that stops when the panel closes.
-
-Keys: `Enter` focuses the selected task's transcript, `Space` peeks at the task
-(record, pending questions, notes, findings) without attaching and offers a
-reply, `r` retries a failed task, `a` answers the pending round, `+`/`-` rates
-a finding, `v` toggles quiet/verbose, `j`/`k` move, `q` or `Esc` closes. The
-keys are bound to the panel's own buffer in normal mode, so the focused window
-never swallows them.
+The panel is deliberately simple: one request per line on the left, a
+separator, and the selected request's PERT schema on the right. `j`/`k` move
+between requests and redraw the schema; `v` toggles quiet/verbose; `q` or `Esc`
+closes. The schema is the request's dependency tree, indented with
+`├─▶`/`└─▶`, with terminal tasks dimmed so an edge to an already-merged
+prerequisite stays visible. The keys are bound to the panel's own buffer in
+normal mode, so the focused window never swallows them. The panel redraws on
+`TaskStatusChanged` and `TurnEnd`; it does not poll.
 
 ## Installation
 

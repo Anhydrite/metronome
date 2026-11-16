@@ -165,6 +165,70 @@ return function()
   local chain = render.critical_chain(pert_rows)
   eq(#chain >= 2, true, "the critical path has at least one edge")
 
+  -- diamond ---------------------------------------------------------------
+  -- A diamond DAG (A->B, A->C, B->D, C->D) plus a multi-parent node and an
+  -- already-merged prerequisite. The schema must draw every node, terminal
+  -- ones dimmed, so no declared edge disappears; the navigable list below
+  -- stays filtered to non-terminal tasks.
+  local diamond_tasks = {
+    { id = "T-20261115-0100", title = "schema", status = "merged", origin = "login", depends_on = {} },
+    { id = "T-20261115-0101", title = "hash", status = "merged", origin = "login", depends_on = { "T-20261115-0100" } },
+    { id = "T-20261115-0102", title = "routes", status = "running", origin = "login", depends_on = { "T-20261115-0100" } },
+    { id = "T-20261115-0103", title = "session", status = "ready", origin = "login", depends_on = { "T-20261115-0101", "T-20261115-0102" } },
+  }
+  local diamond_rows = render.rows(diamond_tasks, { show_done = true })
+  local diamond_lines, diamond_order, diamond_node_line = render.pert(diamond_rows, { right_width = 39 })
+  eq(#diamond_order, 4, "the diamond schema draws every task, terminal included")
+  eq(diamond_node_line["T-20261115-0100"], 1, "the merged root maps to its line")
+  local diamond_text = {}
+  for _, spans in ipairs(diamond_lines) do
+    diamond_text[#diamond_text + 1] = render.text(spans)
+  end
+  local diamond_joined = table.concat(diamond_text, "\n")
+  has(diamond_joined, "T-…0100", "the merged prerequisite is drawn")
+  has(diamond_joined, "T-…0101", "the merged dependency is drawn")
+  has(diamond_joined, "├─▶", "the schema draws a branch")
+  has(diamond_joined, "└─▶", "the schema draws a closing branch")
+
+  local function style_of(lines, needle)
+    for _, spans in ipairs(lines) do
+      for _, span in ipairs(spans) do
+        if tostring(span[1]):find(needle, 1, true) then
+          return span[2]
+        end
+      end
+    end
+  end
+  eq(style_of(diamond_lines, "T-…0100"), "dim", "a merged node is dimmed")
+  eq(style_of(diamond_lines, "T-…0103"), "run", "a critical active node is highlighted")
+
+  -- The selected node is the panel's only selector: it turns bold, terminal
+  -- nodes included, and the other nodes keep their own style.
+  local sel_lines = render.pert(diamond_rows, { right_width = 39, selected_id = "T-20261115-0100" })
+  eq(style_of(sel_lines, "T-…0100"), "bold", "the selected node is highlighted")
+  eq(style_of(sel_lines, "T-…0102"), "run", "the other nodes keep their style")
+
+  -- panes highlights the node of the cursor row, and the request column stays
+  -- dim so there is exactly one selector.
+  local sel_pane = render.panes(diamond_tasks, { right_width = 39, selected_row = 2 })
+  eq(style_of(sel_pane, "T-…0103"), "bold", "panes highlights the selected task's node")
+  eq(style_of(sel_pane, "login"), "dim", "the request column is not a second selector")
+
+  -- panes: the simple two-column layout, full schema on the right.
+  local pane_lines, pane_rows, _, pane_row_lines = render.panes(diamond_tasks, { right_width = 39 })
+  eq(#pane_rows, 2, "the cursor model keeps the non-terminal tasks")
+  eq(pane_rows[1].id, "T-20261115-0102", "the running task leads the cursor model")
+  eq(#pane_row_lines, 2, "each cursor row maps to a schema line")
+  eq(pane_row_lines[1] < pane_row_lines[2], true, "the mapping follows the schema")
+  local pane_text = {}
+  for _, line in ipairs(pane_lines) do
+    pane_text[#pane_text + 1] = render.text(line)
+  end
+  local pane_joined = table.concat(pane_text, "\n")
+  has(pane_joined, "PERT", "the right column is the PERT schema")
+  has(pane_joined, "login", "the left column lists the request")
+  has(pane_joined, "T-…0100", "the merged prerequisite stays in the schema")
+
   local g_lines, g_rows, _, g_row_lines = render.lines(grouped)
   eq(g_rows[1].id, "T-20261115-0003", "display order puts the failure first")
   eq(g_rows[2].id, "T-20261115-0001", "then the login group")
@@ -226,20 +290,17 @@ return function()
     render.panes(pane_tasks, { selected_intent = 2 })
   eq(#pane_groups, 2, "panes groups by intention")
   eq(pane_selected, 2, "panes honours the selected intention")
-  eq(#pane_rows, 2, "panes shows the selected intention's tasks")
-  eq(pane_row_lines[1] < pane_row_lines[2], true, "panes maps rows to buffer lines")
+  eq(#pane_rows, 2, "the cursor model holds the selected request's tasks")
+  eq(#pane_row_lines, 2, "each cursor row maps to a schema line")
   local pane_text = {}
   for _, line in ipairs(pane_lines) do
     pane_text[#pane_text + 1] = render.text(line)
   end
   local pane_joined = table.concat(pane_text, "\n")
-  has(pane_joined, "REQUESTS", "panes renders the left column")
-  -- The left column answers "where is this request?" in words, not only icons.
-  has(pane_joined, "running", "the left column names a running request")
-  has(pane_joined, "failed", "the left column names a failed request")
-  -- The per-state counts live on the selected request's header.
-  has(pane_joined, "▶1", "the header counts the running task")
-  has(pane_joined, "☐1", "the header counts the todo task")
+  has(pane_joined, "login", "the left column lists the request")
+  has(pane_joined, "export", "the left column lists the other request")
+  has(pane_joined, "PERT", "the right column is the PERT schema")
+  has(pane_joined, "T-1", "the selected request's schema is drawn")
 
   -- request_status: the word a request carries, by what needs the human first.
   local rs = render.request_status

@@ -16,7 +16,7 @@ function M.definitions()
   return {
     {
       name = "metronome_submit",
-      description = "Create an intent from an intention and start qualification. Call it as soon as the request is clear, with the intention verbatim: do not explore, read or analyze the repository first — the qualifier does that. Blocks until qualification returns, then answers with the created tasks (or the questions the qualifier raised). The pipeline then runs in the background: do not poll with sleeps, call metronome_status only when you need it.",
+      description = "Create an intent from an intention and start qualification. Call it as soon as the request is clear, with the intention verbatim: do not explore, read or analyze the repository first — the qualifier does that. Returns at once with queued=true; qualification (a git fetch plus the qualifier session) runs in the background. Call metronome_status to read the created tasks, or wait for the questions to arrive in chat. Set wait=true only when you must block until the qualifier returns the tasks.",
       permission = "run",
       schema = {
         type = "object",
@@ -29,6 +29,10 @@ function M.definitions()
             type = "string",
             enum = { "auto", "fast", "full" },
             description = "Leave it at `auto` unless the user explicitly asks for `fast` or `full`. Do not read the repository to choose it: `auto` lets Metronome decide from the wording, and a wrong guess costs less than an analysis turn.",
+          },
+          wait = {
+            type = "boolean",
+            description = "Block until qualification returns (true), or return immediately with queued=true (false, the default).",
           },
         },
         required = { "intention" },
@@ -211,6 +215,18 @@ end
 -- returns a table with an `llm_output`, and failures set `is_error` instead of
 -- raising, so a broken runtime surfaces as a tool error and not a crash.
 function M.call(runtime, name, input, ctx)
+  -- `metronome_submit` is asynchronous by default: the caller gets
+  -- `queued=true` at once and the qualifier runs in the background. Blocking
+  -- is opt-in (`wait = true`), so a submit never holds the agent for the
+  -- length of a qualifier model turn.
+  if name == "metronome_submit" and type(input) == "table" and input.wait == nil then
+    local copy = {}
+    for key, value in pairs(input) do
+      copy[key] = value
+    end
+    copy.wait = false
+    input = copy
+  end
   -- The tool surface names are prefixed (`metronome_submit`); the runtime
   -- table the commands share uses the bare verb (`submit`). Accept both so a
   -- single runtime can serve both adapters.

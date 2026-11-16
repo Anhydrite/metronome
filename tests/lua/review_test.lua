@@ -371,6 +371,50 @@ return function()
   eq(after_minor.status, "reviewing", "a non-gating review does not move the task")
   eq(after_minor.review and after_minor.review.findings[2].severity, "nit", "non-gating findings are stored")
 
+  -- review: findings are mirrored on the PR --------------------------------
+  local posted = {}
+  local capture = {}
+  for key, value in pairs(git) do
+    capture[key] = value
+  end
+  capture.pr_comment = function(ref, body, opts)
+    posted[#posted + 1] = { ref = ref, body = body, opts = opts }
+    return { commented = true }
+  end
+
+  local format_body = review.format_comment({
+    { severity = "blocking", message = "bad", path = "src/a.lua", line = 2, rule = "tests" },
+  }, 1, "deadbeef", { title = "Review me" })
+  has(format_body, "round 1", "the comment names the round")
+  has(format_body, "deadbeef", "the comment names the sha")
+  has(format_body, "`src/a.lua:2`", "the comment names the location")
+  has(format_body, "**blocking**", "the comment names the severity")
+  has(format_body, "tests", "the comment names the rule")
+  eq(review.format_comment({}, 1, "deadbeef"), nil, "no findings formats to nothing")
+
+  local wt_post, id_post, sha_post = seed_worktree({ ["src/post.lua"] = "return 6\n" })
+  make_task(id_post, { pr = { number = 7, url = "https://github.com/example/repo/pull/7", state = "open" } })
+  local post_result = review.review(review_opts(id_post, wt_post, function()
+    return {
+      ok = true,
+      text = '{"findings":[{"severity":"minor","message":"clearer please"},{"severity":"nit","message":"taste"}]}',
+    }
+  end, { git = capture }))
+  eq(post_result.approved, true, "the commented review still approves")
+  eq(#posted, 1, "one summary comment is posted per round")
+  eq(posted[1].ref, 7, "the comment targets the PR number")
+  has(posted[1].body, sha_post, "the comment names the reviewed sha")
+  has(posted[1].body, "clearer please", "the comment carries the finding message")
+  has(posted[1].body, "taste", "the comment carries every finding")
+
+  local wt_nopr, id_nopr = seed_worktree({ ["src/nopr.lua"] = "return 7\n" })
+  make_task(id_nopr)
+  local nopr_result = review.review(review_opts(id_nopr, wt_nopr, function()
+    return { ok = true, text = CLEAN }
+  end, { git = capture }))
+  eq(nopr_result.approved, true, "a clean review without a PR still approves")
+  eq(#posted, 1, "no PR means no comment")
+
   -- review: a protected path -------------------------------------------------
 
   local wt_prot, id_prot = seed_worktree({ ["AGENTS.md"] = "# rules\n" })

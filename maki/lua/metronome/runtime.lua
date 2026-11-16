@@ -42,6 +42,20 @@ local function slug_of(path)
   return slug
 end
 
+-- The branch a task is cut from and merges into.
+--
+-- A subtask of a multi-task intention carries `base_ref = <epic branch>`: its
+-- worktree, its PR base, its merge target and its diff base are all the epic
+-- branch, never the project base. Everything else falls back to the project
+-- base, which is why the whole pipeline reads this one helper instead of
+-- `cfg.project.base_ref` directly.
+function M.task_base(task, cfg)
+  if type(task) == "table" and is_non_empty(task.base_ref) then
+    return task.base_ref
+  end
+  return cfg and cfg.project and cfg.project.base_ref or "main"
+end
+
 -- Paths ---------------------------------------------------------------------
 
 function M.paths(opts)
@@ -115,6 +129,7 @@ local function init_questions(repo, current)
     { key = "base_ref", question = "base branch", default = current.base_ref or "main" },
     { key = "checks", question = "checks, comma separated", default = checks },
     { key = "max_parallel", question = "max parallel tasks", default = tostring(current.max_parallel or 1) },
+    { key = "max_parallel_qualifiers", question = "max parallel qualifier sessions", default = tostring(current.max_parallel_qualifiers or 4) },
   }
   for _, role in ipairs(ROLE_ORDER) do
     local role_current = current_roles[role] or {}
@@ -280,12 +295,15 @@ local function normalize_init(input, paths, current)
     repo = value("repo") or current.repo or paths.repo,
     base_ref = value("base_ref") or current.base_ref or "main",
     max_parallel = as_number(value("max_parallel"), current.max_parallel or 1),
+    max_parallel_qualifiers = as_number(value("max_parallel_qualifiers"), current.max_parallel_qualifiers or 4),
     checks = checks,
     auto_merge = bool("merge.auto_merge", current_merge.auto_merge ~= nil and current_merge.auto_merge or current.auto_merge, false),
     auto_deploy = bool("deploy.auto_deploy", current_deploy.auto_deploy ~= nil and current_deploy.auto_deploy or current.auto_deploy, false),
     deploy_confirm = deploy_confirm,
     roles = {},
     review = {
+      engine = pick(flat, current_review, "review.engine", "model"),
+      no_mistakes_bin = pick(flat, current_review, "review.no_mistakes_bin", "no-mistakes"),
       max_rounds = as_number(pick(flat, current_review, "review.max_rounds", 3), 3),
       require_checks_green = pick(flat, current_review, "review.require_checks_green", true) == true
         or pick(flat, current_review, "review.require_checks_green", true) == "true",
@@ -336,6 +354,7 @@ local function render_config(answers)
     "repo = " .. toml_string(answers.repo),
     "base_ref = " .. toml_string(answers.base_ref),
     "max_parallel = " .. s(answers.max_parallel),
+    "max_parallel_qualifiers = " .. s(answers.max_parallel_qualifiers),
     "",
     "[git]",
     'branch_prefix = "metronome/"',
@@ -355,6 +374,8 @@ local function render_config(answers)
   lines[#lines + 1] = "timeout_secs = 600"
   lines[#lines + 1] = ""
   lines[#lines + 1] = "[review]"
+  lines[#lines + 1] = "engine = " .. toml_string(review.engine or "model")
+  lines[#lines + 1] = "no_mistakes_bin = " .. toml_string(review.no_mistakes_bin or "no-mistakes")
   lines[#lines + 1] = "max_rounds = " .. s(review.max_rounds or 3)
   lines[#lines + 1] = "require_checks_green = " .. b(review.require_checks_green ~= false)
   lines[#lines + 1] = "protected_paths = " .. toml_array(review.protected_paths
@@ -622,6 +643,53 @@ function M.new(deps)
     return result
   end
 
+  -- Qualifier concurrency. Every submit spawns its own background job, so
+  -- without a gate N submits would open N qualifier sessions at once. The cap
+  -- is `project.max_parallel_qualifiers`; the semaphore is cached per limit so
+  -- a config change never leaks permits.
+  local qualify_gates = {}
+  local function qualifier_gate(limit)
+    if not (deps.async == true and maki.async and type(maki.async.semaphore) == "function") then
+      return nil
+    end
+    limit = tonumber(limit) or 4
+    if limit < 1 then
+      limit = 1
+    end
+    if not qualify_gates[limit] then
+      qualify_gates[limit] = maki.async.semaphore(limit)
+    end
+    return qualify_gates[limit]
+  end
+
+  -- Id allocation is a read-modify-write: `next_id` reads the max, `apply`
+  -- creates the tasks. Two qualifiers finishing together would compute the
+  -- same ids and one would fail on "task already exists". One permit
+  -- serialises that short section; the model calls stay parallel.
+  local id_gate = (deps.async == true and maki.async and type(maki.async.semaphore) == "function")
+    and maki.async.semaphore(1) or nil
+
+  local function with_id_gate(fn)
+    if not id_gate then
+      return fn()
+    end
+    local permit = id_gate:acquire()
+    local ok, first, second = pcall(fn)
+    permit:release()
+    if not ok then
+      return nil, first
+    end
+    return first, second
+  end
+
+  -- A qualification run needs its own artifact directory. `runs/<key>/...` is
+  -- keyed by this id, so two concurrent qualifiers must not share "qualify".
+  local qualify_seq = 0
+  local function next_qualify_key()
+    qualify_seq = qualify_seq + 1
+    return string.format("qualify-%d-%d", os.time(), qualify_seq)
+  end
+
   -- How many times a task may be redone on a fresh base. A base that keeps
   -- moving is a real situation (several PRs merging), so the bound is a count,
   -- not a lifetime flag: a task that repaired one conflict can still repair
@@ -636,6 +704,220 @@ function M.new(deps)
     return (task and task.conflict_retried) and 1 or 0
   end
 
+  -- An epic task owns the single PR from the epic branch to the project base.
+  --
+  -- It has no implementation, no checks and no review of its own: the subtasks
+  -- already ran those on the epic branch, and the scheduler only starts the
+  -- epic once every one of them is `merged`. So this path is: push the branch
+  -- (it exists from qualification), open the PR, merge it, re-run the declared
+  -- checks on the merged base, and only then deploy. Implement, converge and
+  -- review are never called.
+  local function run_epic(opts, task_id, paths, cfg, runner, session)
+    local state = deps.state
+    local loaded = state.load(paths.root)
+    local task = loaded and loaded.tasks and loaded.tasks[task_id]
+    if not task then
+      return { ok = false, error = "unknown task: " .. tostring(task_id) }
+    end
+    local base = M.task_base(task, cfg)
+    local branch = is_non_empty(task.branch) and task.branch or nil
+    if not branch then
+      return { ok = false, error = "epic task " .. task_id .. " has no branch" }
+    end
+
+    -- A resumed epic whose PR is already merged only has the post-merge
+    -- verification and the deploy left: re-opening or re-merging the PR would
+    -- be refused. This is the path a deploy that failed for a missing checks
+    -- report takes on retry.
+    local already_merged = type(task.pr) == "table" and task.pr.state == "merged"
+    local pr = task.pr
+    local merged = nil
+
+    if not already_merged then
+      local moved, merr = state.transition(paths.root, task_id, "running", { phase = "merge" })
+      if not moved then
+        return { ok = false, error = merr or "cannot start the epic" }
+      end
+
+      -- The epic branch lives on the remote: qualification pushed it, and
+      -- every subtask merge landed there through GitHub. The local ref is
+      -- therefore behind after a squash merge, and pushing it as-is is refused
+      -- as non-fast-forward. Fetch, move the local ref to the remote tip, and
+      -- push only when the remote does not have the branch yet.
+      if deps.git and type(deps.git.fetch) == "function" then
+        pcall(deps.git.fetch, paths.repo, "origin")
+      end
+      local remote_ref = "origin/" .. branch
+      local remote_sha = type(deps.git.rev_parse) == "function"
+        and deps.git.rev_parse(paths.repo, remote_ref) or nil
+      if remote_sha then
+        if type(deps.git.branch_reset) == "function" then
+          local aligned, aerr = deps.git.branch_reset(paths.repo, branch, remote_ref)
+          if not aligned then
+            return { ok = false, error = "cannot align the epic branch: " .. tostring(aerr) }
+          end
+        end
+      elseif type(deps.git.push_branch) == "function" then
+        local pushed, perr = deps.git.push_branch(paths.repo, branch, { remote = "origin" })
+        if not pushed then
+          return { ok = false, error = "cannot push the epic branch: " .. tostring(perr) }
+        end
+      end
+
+      pr = deps.git.pr_open(state, paths.root, task_id, {
+        repo = paths.repo,
+        worktree = paths.repo,
+        base = base,
+        head = branch,
+        title = task.title,
+        body = "Metronome epic " .. task_id,
+        gh = "gh",
+        attach_only = true,
+      })
+      if not pr then
+        return { ok = false, error = "cannot open the epic pull request" }
+      end
+
+      local opened, oerr = state.transition(paths.root, task_id, "pr_open", { phase = "merge" })
+      if not opened then
+        return { ok = false, error = oerr or "cannot mark the epic pr_open" }
+      end
+
+      -- `auto_merge` off means a human merges the epic PR; the pipeline stops
+      -- here with the PR open, exactly like a normal task.
+      if not (cfg.merge and cfg.merge.auto_merge) then
+        return { ok = true, task_id = task_id, pr = pr, pr_open = true, epic = true }
+      end
+
+      -- The epic branch is never checked out, so the merge needs a worktree
+      -- that holds it: rebasing from the project's own checkout would move
+      -- whatever branch happens to be checked out there instead. Without a
+      -- worktree the rebase is skipped and GitHub judges the merge.
+      local epic_wt = fs.joinpath(paths.worktrees, task_id)
+      local worktree = paths.repo
+      local auto_rebase = cfg.merge.auto_rebase
+      if type(deps.git.worktree_add) == "function" then
+        local added = deps.git.worktree_add(paths.repo, epic_wt, branch, nil, { existing = true })
+        if added then
+          worktree = epic_wt
+        else
+          auto_rebase = false
+        end
+      else
+        auto_rebase = false
+      end
+
+      local merge_err
+      merged, merge_err = with_merge_gate(function()
+        return deps.merge.run({
+          task = task_id,
+          worktree = worktree,
+          repo = paths.repo,
+          git = deps.git,
+          state = state,
+          root = paths.root,
+          remote = "origin",
+          base = base,
+          checks = deps.checks,
+          gh = "gh",
+          method = cfg.merge.method,
+          auto_rebase = auto_rebase,
+          verify = cfg.checks.re_run_after_merge ~= false,
+          commands = task.checks or cfg.checks.default,
+        })
+      end)
+      if not merged then
+        return { ok = false, error = tostring(merge_err or "epic merge failed") }
+      end
+      if not merged.ok then
+        -- A red base or a refused merge is a real failure: there is no
+        -- implementer to bounce back to, the subtasks are already merged.
+        if worktree == epic_wt and type(deps.git.worktree_remove) == "function" then
+          pcall(deps.git.worktree_remove, paths.repo, epic_wt, { force = true })
+        end
+        return merged
+      end
+    end
+
+    -- The deploy guard reads `checks/<task>.json`, which the normal flow
+    -- writes during its verify phase. An epic has no verify phase, so the
+    -- post-merge result is written here; a resumed epic re-runs the checks on
+    -- the merged base to produce it.
+    local checks_result = merged and merged.checks or nil
+    if already_merged then
+      -- A retry walks the task back to `running` before dispatching it, but
+      -- the deploy guard only deploys from `merged`. Walk it forward again
+      -- through the epic's legal path; the PR is already merged, so no work
+      -- is redone.
+      local current = state.load(paths.root)
+      local status = current and current.tasks and current.tasks[task_id]
+        and current.tasks[task_id].status or nil
+      if status ~= "merged" then
+        for _, step in ipairs({ "pr_open", "merging", "merged" }) do
+          local ok, serr = state.transition(paths.root, task_id, step, { phase = "merge" })
+          if not ok then
+            return { ok = false, error = serr or ("cannot restore the epic to merged") }
+          end
+        end
+      end
+      if type(deps.merge.verify_after_merge) ~= "function" then
+        return { ok = false, error = "cannot verify the merged base" }
+      end
+      local cres, cerr = deps.merge.verify_after_merge({
+        git = deps.git,
+        checks = deps.checks,
+        repo = paths.repo,
+        root = paths.root,
+        task_id = task_id,
+        base = base,
+        remote = "origin",
+        commands = task.checks or cfg.checks.default,
+      })
+      if not cres then
+        return { ok = false, error = "cannot verify the merged base: " .. tostring(cerr) }
+      end
+      if cres.ok == false then
+        return { ok = false, error = "post-merge checks failed", checks = cres }
+      end
+      checks_result = cres
+    end
+    if checks_result and type(deps.checks.write_report) == "function" then
+      deps.checks.write_report(paths.root, task_id, checks_result)
+    end
+
+    if cfg.deploy and cfg.deploy.auto_deploy then
+      local deployed = deps.deploy.run({
+        task = task_id,
+        root = paths.root,
+        state = state,
+        repo = paths.repo,
+        plan_path = fs.joinpath(paths.repo, cfg.deploy.plan_file or "deploy.md"),
+        runner = runner,
+        script = true,
+        confirm = false,
+        confirmed = true,
+        session_opts = session.deployer,
+        state_root = paths.runs,
+        ctx = opts.ctx,
+        checks = deps.checks,
+      })
+      if not deployed.ok then
+        return {
+          ok = false,
+          error = "deploy failed: " .. tostring(deployed.error),
+          task_id = task_id,
+          pr = pr,
+          merged = merged,
+          deployed = deployed,
+          epic = true,
+        }
+      end
+      return { ok = true, task_id = task_id, pr = pr, merged = merged, deployed = deployed, epic = true }
+    end
+
+    return { ok = true, task_id = task_id, pr = pr, merged = merged, epic = true }
+  end
+
   local function run_task(opts, task_id, paths, cfg, runner, session)
     local state = deps.state
     local loaded = state.load(paths.root)
@@ -643,6 +925,21 @@ function M.new(deps)
     if not task then
       return { ok = false, error = "unknown task: " .. tostring(task_id) }
     end
+
+    -- An epic is a different shape of work: one PR, no implementation. The
+    -- dispatch lives here so every caller (scheduler, retry, resume) gets the
+    -- same behaviour.
+    if task.kind == "epic" then
+      return run_epic(opts, task_id, paths, cfg, runner, session)
+    end
+
+    -- Every base-dependent step below reads this, not cfg.project.base_ref: a
+    -- subtask of an epic is cut from, reviewed against, merged into and
+    -- diffed against the epic branch.
+    local base = M.task_base(task, cfg)
+    -- A subtask whose base is not the project base merges into the epic branch
+    -- and stops at `merged`: it never deploys, the epic does.
+    local epic_subtask = is_non_empty(task.base_ref) and task.base_ref ~= cfg.project.base_ref
 
     -- One implementation turn plus everything that must hold before a review:
     -- the rebase onto the fresh base, the declared checks and the convergence
@@ -664,7 +961,7 @@ function M.new(deps)
         worktree_root = paths.worktrees,
         tasks_dir = paths.tasks,
         remote = "origin",
-        base_ref = cfg.project.base_ref,
+        base_ref = base,
         runner = runner,
         session_opts = session.implementer,
         state_root = paths.runs,
@@ -687,7 +984,7 @@ function M.new(deps)
           repo = paths.repo,
           worktree = worktree,
           remote = "origin",
-          base = cfg.project.base_ref,
+          base = base,
           git = deps.git,
         })
         if not rebased then
@@ -702,7 +999,7 @@ function M.new(deps)
               -- first, or the reset is refused and the repair silently does
               -- nothing.
               local base_sha = type(deps.git.rev_parse) == "function"
-                and deps.git.rev_parse(worktree, "origin/" .. cfg.project.base_ref) or nil
+                and deps.git.rev_parse(worktree, "origin/" .. base) or nil
               local reset = base_sha and deps.git.reset_hard(worktree, base_sha) or nil
               if reset then
                 log(paths, "task " .. task_id .. " conflicted with the fresh base on "
@@ -763,7 +1060,7 @@ function M.new(deps)
       -- The worktree is cut from origin/<base>, so the diff must be read
       -- against the same ref. The local base branch is not advanced by a
       -- GitHub merge.
-      local diff_base = "origin/" .. cfg.project.base_ref
+      local diff_base = "origin/" .. base
       local sheet = deps.implement.read_sheet(paths.root, task, { tasks_dir = paths.tasks })
       local converged = deps.converge.run({
         task = task,
@@ -799,84 +1096,151 @@ function M.new(deps)
 
     local worktree = impl.ctx.worktree
     local checks = task.checks or cfg.checks.default
-    local diff_base = "origin/" .. cfg.project.base_ref
+    local diff_base = "origin/" .. base
 
     state.transition(paths.root, task_id, "verifying", { phase = "verify" })
     state.transition(paths.root, task_id, "reviewing", { phase = "review" })
 
-    -- Open the pull request before the review: the reviewer reads the exact
-    -- SHA on a real PR, and a human can follow it while the review runs. The
-    -- task stays in `reviewing` until the review approves it.
-    local pr = deps.git.pr_open(state, paths.root, task_id, {
-      repo = paths.repo,
-      worktree = worktree,
-      base = cfg.project.base_ref,
-      head = impl.ctx.branch,
-      title = task.title,
-      body = "Metronome task " .. task_id,
-      gh = "gh",
-      attach_only = true,
-    })
-    if not pr then
-      return { ok = false, error = "cannot open the pull request" }
-    end
-
-    -- A review that asks for changes is not a failure: it is the next round's
-    -- work. The loop re-implements with the findings, re-runs the checks and
-    -- the convergence diff, then reviews again, up to `review.max_rounds`.
-    -- Only an exhausted bound escalates, and only a real error (a dead
-    -- reviewer, an invalid answer) ends the task before that.
-    local function fix(result)
-      local findings = type(result) == "table" and result.findings or nil
-      local moved, merr = state.transition(paths.root, task_id, "running", { phase = "implement" })
-      if not moved then
-        return { ok = false, error = merr or "cannot resume after review" }
-      end
-      log(paths, string.format("task %s: review round %s requested changes, re-implementing",
-        task_id, tostring(result and result.round or "?")))
-      local again, err = implement_and_verify(findings)
-      if not again then
-        return { ok = false, error = (err and err.error) or "fix failed" }
-      end
-      state.transition(paths.root, task_id, "verifying", { phase = "verify" })
-      state.transition(paths.root, task_id, "reviewing", { phase = "review" })
-      return true
-    end
-
-    local review_opts = {
-      task = task_id,
-      worktree = worktree,
-      base = diff_base,
-      git = deps.git,
-      state = state,
-      root = paths.root,
-      runner = runner,
-      tasks_dir = paths.tasks,
-      repo = paths.repo,
-      state_root = paths.runs,
-      ctx = opts.ctx,
-      session_opts = session.reviewer,
-      fence = deps.fence,
-      max_rounds = (cfg.review and cfg.review.max_rounds) or 3,
-      fix = fix,
-    }
+    -- Two review engines. `model` opens the PR first and runs the bounded
+    -- reviewer loop. `no-mistakes` lets the local gate clean, push and open
+    -- the PR itself, then merges it: no review/implement loop at all.
+    local engine = (cfg.review and cfg.review.engine) or "model"
+    local pr
     local reviewed
-    if type(deps.review.loop) == "function" then
-      reviewed = deps.review.loop(review_opts)
-    else
-      reviewed = deps.review.review(review_opts)
-    end
-    if not reviewed.ok or not reviewed.approved then
-      local reason = (reviewed and reviewed.error) or "review not approved"
-      if type(reviewed) == "table" and reviewed.escalated then
-        reason = string.format("review escalated after %s round(s)", tostring(reviewed.round or "?"))
-      end
-      return { ok = false, error = reason, review = reviewed, pr = pr }
-    end
+    local approved_sha = impl.sha
 
-    -- The SHA the reviewer approved is the one that ships, not the first
-    -- round's: a fix round moved the branch.
-    local approved_sha = (reviewed and reviewed.sha) or impl.sha
+    if engine == "no-mistakes" then
+      local nm = deps.no_mistakes
+      if type(nm) ~= "table" or type(nm.run) ~= "function" then
+        return { ok = false, error = "review.engine is no-mistakes but the module is not loaded" }
+      end
+      local timeout = (cfg.limits and cfg.limits.timeout_minutes and cfg.limits.timeout_minutes * 60000)
+        or 1800000
+      -- A cancelled gate run leaves its fix commits in the private
+      -- `no-mistakes` mirror while the live branch is reset to the pre-run
+      -- head. The next run refuses to reconcile that gap ("at-risk commits
+      -- absent from live head"), so bring the live branch up to the mirror
+      -- head first: the gate's work is never dropped. Only a fast-forward is
+      -- allowed, so a local commit the mirror does not have is never lost.
+      if type(deps.git.fetch) == "function" and type(deps.git.rev_parse) == "function"
+        and type(deps.git.reset_hard) == "function" then
+        pcall(deps.git.fetch, paths.repo, "no-mistakes")
+        local mirror = deps.git.rev_parse(worktree, "no-mistakes/" .. impl.ctx.branch)
+        local live = type(deps.git.head_sha) == "function" and deps.git.head_sha(worktree) or nil
+        if mirror and live and mirror ~= live and type(deps.git.is_ancestor) == "function" then
+          local ancestor = deps.git.is_ancestor(worktree, live, mirror)
+          if ancestor then
+            pcall(deps.git.reset_hard, worktree, mirror)
+          end
+        end
+      end
+
+      local gate, gerr = nm.run({
+        worktree = worktree,
+        intent = task.intent or task.title,
+        base = base,
+        bin = cfg.review and cfg.review.no_mistakes_bin,
+        timeout_ms = timeout,
+        -- Match the CLI's hold to the task timeout, so a gate that is still
+        -- fixing is not mistaken for a failed gate.
+        wait = string.format("%dm", math.max(10, math.floor(timeout / 60000))),
+      })
+      if not gate then
+        return { ok = false, error = gerr or "no-mistakes could not run" }
+      end
+      if not gate.ok then
+        -- The gate reports; the task fails. It never bounces back to the
+        -- implementer, which is the loop this engine exists to remove.
+        return { ok = false, error = gate.error, no_mistakes = gate }
+      end
+      reviewed = { ok = true, approved = true, no_mistakes = gate }
+      approved_sha = (deps.git.head_sha and deps.git.head_sha(worktree)) or impl.sha
+      -- no-mistakes pushed the branch and opened the PR itself; read it back
+      -- and attach it to the task before the merge step.
+      pr = deps.git.pr_view(impl.ctx.branch, {
+        repo = paths.repo,
+        worktree = worktree,
+        gh = "gh",
+        timeout_ms = 60000,
+      })
+      if not pr then
+        return { ok = false, error = "no-mistakes passed but its pull request cannot be found", no_mistakes = gate }
+      end
+      deps.git.pr_attach(state, paths.root, task_id, pr)
+    else
+      -- Open the pull request before the review: the reviewer reads the exact
+      -- SHA on a real PR, and a human can follow it while the review runs. The
+      -- task stays in `reviewing` until the review approves it.
+      pr = deps.git.pr_open(state, paths.root, task_id, {
+        repo = paths.repo,
+        worktree = worktree,
+        base = base,
+        head = impl.ctx.branch,
+        title = task.title,
+        body = "Metronome task " .. task_id,
+        gh = "gh",
+        attach_only = true,
+      })
+      if not pr then
+        return { ok = false, error = "cannot open the pull request" }
+      end
+
+      -- A review that asks for changes is not a failure: it is the next round's
+      -- work. The loop re-implements with the findings, re-runs the checks and
+      -- the convergence diff, then reviews again, up to `review.max_rounds`.
+      -- Only an exhausted bound escalates, and only a real error (a dead
+      -- reviewer, an invalid answer) ends the task before that.
+      local function fix(result)
+        local findings = type(result) == "table" and result.findings or nil
+        local moved, merr = state.transition(paths.root, task_id, "running", { phase = "implement" })
+        if not moved then
+          return { ok = false, error = merr or "cannot resume after review" }
+        end
+        log(paths, string.format("task %s: review round %s requested changes, re-implementing",
+          task_id, tostring(result and result.round or "?")))
+        local again, err = implement_and_verify(findings)
+        if not again then
+          return { ok = false, error = (err and err.error) or "fix failed" }
+        end
+        state.transition(paths.root, task_id, "verifying", { phase = "verify" })
+        state.transition(paths.root, task_id, "reviewing", { phase = "review" })
+        return true
+      end
+
+      local review_opts = {
+        task = task_id,
+        worktree = worktree,
+        base = diff_base,
+        git = deps.git,
+        state = state,
+        root = paths.root,
+        runner = runner,
+        tasks_dir = paths.tasks,
+        repo = paths.repo,
+        state_root = paths.runs,
+        ctx = opts.ctx,
+        session_opts = session.reviewer,
+        fence = deps.fence,
+        max_rounds = (cfg.review and cfg.review.max_rounds) or 3,
+        fix = fix,
+      }
+      if type(deps.review.loop) == "function" then
+        reviewed = deps.review.loop(review_opts)
+      else
+        reviewed = deps.review.review(review_opts)
+      end
+      if not reviewed.ok or not reviewed.approved then
+        local reason = (reviewed and reviewed.error) or "review not approved"
+        if type(reviewed) == "table" and reviewed.escalated then
+          reason = string.format("review escalated after %s round(s)", tostring(reviewed.round or "?"))
+        end
+        return { ok = false, error = reason, review = reviewed, pr = pr }
+      end
+
+      -- The SHA the reviewer approved is the one that ships, not the first
+      -- round's: a fix round moved the branch.
+      approved_sha = (reviewed and reviewed.sha) or impl.sha
+    end
 
     -- The review passed on the exact SHA: move the task to `pr_open` now.
     state.transition(paths.root, task_id, "pr_open", { phase = "review" })
@@ -884,7 +1248,7 @@ function M.new(deps)
     -- `auto_merge` is the project's switch. Off means the task stops at
     -- `pr_open` with a PR a human can review and merge; on means the merger
     -- takes it the rest of the way (and redeploys when `auto_deploy` is set).
-    if not (cfg.merge and cfg.merge.auto_merge) then
+    if engine ~= "no-mistakes" and not (cfg.merge and cfg.merge.auto_merge) then
       return { ok = true, task_id = task_id, sha = approved_sha, pr = pr, pr_open = true }
     end
 
@@ -897,12 +1261,16 @@ function M.new(deps)
         state = state,
         root = paths.root,
         remote = "origin",
-        base = cfg.project.base_ref,
+        base = base,
         checks = deps.checks,
         gh = "gh",
         method = cfg.merge.method,
         verify = cfg.checks.re_run_after_merge ~= false,
         commands = checks,
+        -- A subtask merges into the epic branch, which is not a deployable
+        -- base: recording it as deploy-pending would ship work that never
+        -- reached the project base.
+        deploy_pending = not epic_subtask,
       })
     end)
     if not merged then
@@ -914,7 +1282,7 @@ function M.new(deps)
       -- there. One repair only; a second conflict is a real failure.
       if merged.conflict and conflict_repairs(task) < MAX_CONFLICT_REPAIRS then
         local base_sha = deps.git.rev_parse
-          and deps.git.rev_parse(worktree, "origin/" .. cfg.project.base_ref) or nil
+          and deps.git.rev_parse(worktree, "origin/" .. base) or nil
         local reset = base_sha and deps.git.reset_hard
           and deps.git.reset_hard(worktree, base_sha) or nil
         if reset then
@@ -931,6 +1299,22 @@ function M.new(deps)
         end
       end
       return merged
+    end
+
+    -- A subtask of an epic stops at `merged`: its work is on the epic branch,
+    -- not on the project base, so there is nothing to deploy yet. The epic
+    -- task owns the single PR to the project base and the deploy that follows.
+    if epic_subtask then
+      log(paths, "task " .. task_id .. " merged into " .. tostring(base)
+        .. "; the epic deploys, not this subtask")
+      return {
+        ok = true,
+        task_id = task_id,
+        sha = approved_sha,
+        pr = pr,
+        merged = merged,
+        epic_subtask = true,
+      }
     end
 
     -- The merger redeploys: once the PR is merged and the checks are green on
@@ -1147,7 +1531,11 @@ function M.new(deps)
     local pending = {}
     for _, task in pairs(loaded and loaded.tasks or {}) do
       if task.status == "merged" then
-        last = task
+        -- Only a task that merged into the project base is deployable here. A
+        -- subtask merged into an epic branch waits for the epic.
+        if M.task_base(task, cfg) == cfg.project.base_ref then
+          last = task
+        end
       elseif task.status ~= "deployed" and task.status ~= "abandoned" then
         pending[#pending + 1] = task.id
       end
@@ -1383,13 +1771,44 @@ function M.new(deps)
     end
     local base_ref_name = "origin/" .. tostring(cfg.project.base_ref)
 
+    -- One intention that qualifies into several tasks must not merge them
+    -- straight into the project base. They land on an epic branch instead, and
+    -- a single epic task owns the PR from that branch to the base. The branch
+    -- is created from the fresh base and pushed before the tasks exist, so
+    -- every subtask worktree can be cut from it. `branch_create` reuses an
+    -- existing branch rather than resetting it: a resumed submit must not lose
+    -- the subtasks already merged into the epic.
+    local function ensure_epic_branch(first_id, intention)
+      local git = deps.git
+      if type(git) ~= "table" or type(git.branch_create) ~= "function"
+        or type(git.push_branch) ~= "function" then
+        return nil, "the git module cannot create the epic branch"
+      end
+      -- Name the branch after the request, not after the checkout directory:
+      -- `metronome/epic/refonte-du-login-002c` reads like the work it holds.
+      local slug = type(deps.implement.slug) == "function"
+        and deps.implement.slug(intention, 40) or ""
+      if slug == "" then
+        slug = "epic"
+      end
+      local suffix = tostring(first_id):match("([0-9a-f]+)$") or tostring(first_id)
+      local name = string.format("metronome/epic/%s-%s", slug, suffix)
+      local created, cerr = git.branch_create(paths.repo, name, base_ref_name)
+      if not created then
+        return nil, "cannot create the epic branch: " .. tostring(cerr)
+      end
+      local pushed, perr = git.push_branch(paths.repo, name)
+      if not pushed then
+        return nil, "cannot push the epic branch: " .. tostring(perr)
+      end
+      return { branch = name, base = cfg.project.base_ref }
+    end
+
     -- `fast = false` explicitly forces the qualifier, which is what the
     -- contract tests use; `fast = true` forces the fast lane; nil lets the
     -- short-intention heuristic decide.
     if opts.fast == true or (opts.fast ~= false and short_intention(opts.intention)) then
       local date = os.date("!%Y%m%d")
-      local first_id = deps.qualify.next_id(deps.state.load(paths.root), date)
-      local first_hex = tonumber(first_id:match("([0-9a-f]+)$") or "", 16) or 1
       local default_checks = (cfg.checks and cfg.checks.default) or {}
       -- The fast lane has no sheet, but the intention may name a file. Reading
       -- that name back is deterministic, and a declared file is what lets the
@@ -1402,21 +1821,25 @@ function M.new(deps)
           declared = deps.qualify.infer_files(opts.intention, listed)
         end
       end
-      local applied, apply_err = deps.qualify.apply(deps.state, paths.root, {
-        ok = true,
-        tasks = { {
-          title = opts.intention,
-          intent = opts.intention,
-          origin = opts.intention,
-          files = declared,
-          checks = default_checks,
-        } },
-      }, {
-        tasks_dir = paths.tasks,
-        id_factory = function(index)
-          return string.format("T-%s-%04x", date, first_hex + index - 1)
-        end,
-      })
+      local applied, apply_err = with_id_gate(function()
+        local first_id = deps.qualify.next_id(deps.state.load(paths.root), date)
+        local first_hex = tonumber(first_id:match("([0-9a-f]+)$") or "", 16) or 1
+        return deps.qualify.apply(deps.state, paths.root, {
+          ok = true,
+          tasks = { {
+            title = opts.intention,
+            intent = opts.intention,
+            origin = opts.intention,
+            files = declared,
+            checks = default_checks,
+          } },
+        }, {
+          tasks_dir = paths.tasks,
+          id_factory = function(index)
+            return string.format("T-%s-%04x", date, first_hex + index - 1)
+          end,
+        })
+      end)
       if not applied then
         return { ok = false, error = apply_err }
       end
@@ -1424,31 +1847,52 @@ function M.new(deps)
       return { ok = true, background = true, fast = true, tasks = applied.tasks }
     end
 
-    local qualified = deps.qualify.run({
+    local gate = qualifier_gate(cfg.project and cfg.project.max_parallel_qualifiers)
+    local permit = gate and gate:acquire() or nil
+    local run_ok, qualified = pcall(deps.qualify.run, {
       intention = opts.intention,
       runner = runner,
       session_opts = session.qualifier,
       repo = paths.repo,
       ref = base_ref_name,
       git = deps.git,
-      task_id = "qualify",
+      task_id = next_qualify_key(),
       validate = false,
       state_root = paths.runs,
       ctx = opts.ctx,
     })
+    if permit then
+      permit:release()
+    end
+    if not run_ok then
+      return { ok = false, error = tostring(qualified) }
+    end
     if not qualified.ok then
       return qualified
     end
 
     local date = os.date("!%Y%m%d")
-    local first_id = deps.qualify.next_id(deps.state.load(paths.root), date)
-    local first_hex = tonumber(first_id:match("([0-9a-f]+)$"), 16) or 1
-    local applied, apply_err = deps.qualify.apply(deps.state, paths.root, qualified, {
-      tasks_dir = paths.tasks,
-      id_factory = function(index)
-        return string.format("T-%s-%04x", date, first_hex + index - 1)
-      end,
-    })
+    local applied, apply_err = with_id_gate(function()
+      local first_id = deps.qualify.next_id(deps.state.load(paths.root), date)
+      local first_hex = tonumber(first_id:match("([0-9a-f]+)$"), 16) or 1
+      -- Several tasks from one intention: they go through an epic branch. A
+      -- single task keeps the old behaviour and merges into the project base.
+      local epic = nil
+      if #(qualified.tasks or {}) > 1 then
+        local eerr
+        epic, eerr = ensure_epic_branch(first_id, opts.intention)
+        if not epic then
+          return nil, eerr
+        end
+      end
+      return deps.qualify.apply(deps.state, paths.root, qualified, {
+        tasks_dir = paths.tasks,
+        id_factory = function(index)
+          return string.format("T-%s-%04x", date, first_hex + index - 1)
+        end,
+        epic = epic,
+      })
+    end)
     if not applied then
       return { ok = false, error = apply_err }
     end

@@ -37,6 +37,29 @@ return function()
   eq(state.is_terminal("deployed"), true, "deployed is terminal")
   eq(state.is_terminal("running"), false, "running is not terminal")
 
+  -- Epic tasks --------------------------------------------------------------
+  --
+  -- An epic owns one PR and nothing else, so it goes straight from `running`
+  -- to `pr_open`. The shortcut is kind-aware: a normal task still cannot skip
+  -- verification and review.
+  eq(state.can_transition("running", "pr_open", "epic"), true,
+    "an epic may open its PR without implementing")
+  eq(state.can_transition("running", "pr_open"), false,
+    "a normal task still cannot skip verification and review")
+  eq(state.can_transition("ready", "running", "epic"), true, "an epic still starts at running")
+  eq(state.can_transition("pr_open", "merging", "epic"), true, "an epic merges through the normal path")
+  eq(state.can_transition("merged", "deploying", "epic"), true, "an epic deploys through the normal path")
+  eq(state.can_transition("verifying", "reviewing", "epic"), true,
+    "the epic table adds to the normal transitions, it does not replace them")
+  eq(state.can_transition("ready", "pr_open", "epic"), false,
+    "an epic cannot skip running")
+  local epic_allowed = {}
+  for _, v in ipairs(state.allowed_from("running", "epic")) do epic_allowed[v] = true end
+  eq(epic_allowed.pr_open, true, "allowed_from lists pr_open for an epic")
+  local normal_allowed = {}
+  for _, v in ipairs(state.allowed_from("running")) do normal_allowed[v] = true end
+  eq(normal_allowed.pr_open, nil, "allowed_from does not list pr_open for a normal task")
+
   -- The refusal must be actionable: a caller that hit an illegal transition
   -- needs to know what it could have asked for instead.
   local allowed = state.allowed_from("qualifying")
@@ -140,6 +163,26 @@ return function()
   local unknown, uerr = state.transition(root, "nope", "ready")
   eq(unknown, nil, "unknown task returns nil")
   eq(uerr and uerr:find("unknown task") ~= nil, true, "unknown task explains itself")
+
+  -- The epic shortcut is read from the task on disk, not from the caller: a
+  -- task created with kind = "epic" may go running -> pr_open, a normal one
+  -- is still refused.
+  state.create(root, { id = "T-20261114-e001", title = "epic", kind = "epic" })
+  state.transition(root, "T-20261114-e001", "qualifying")
+  state.transition(root, "T-20261114-e001", "ready")
+  state.transition(root, "T-20261114-e001", "running")
+  local epic_pr, epic_pr_err = state.transition(root, "T-20261114-e001", "pr_open")
+  eq(epic_pr_err, nil, "an epic task may move running -> pr_open")
+  eq(epic_pr and epic_pr.status, "pr_open", "the epic task reached pr_open")
+
+  state.create(root, { id = "T-20261114-e002", title = "normal" })
+  state.transition(root, "T-20261114-e002", "qualifying")
+  state.transition(root, "T-20261114-e002", "ready")
+  state.transition(root, "T-20261114-e002", "running")
+  local normal_pr, normal_pr_err = state.transition(root, "T-20261114-e002", "pr_open")
+  eq(normal_pr, nil, "a normal task still cannot move running -> pr_open")
+  eq(normal_pr_err ~= nil and normal_pr_err:find("illegal transition") ~= nil, true,
+    "the refusal for a normal task explains itself")
 
   local fielded = state.set_fields(root, "T-20261114-a3f2", { branch = "metronome/T-20261114-a3f2", files = { "a.lua" } })
   eq(fielded and fielded.branch, "metronome/T-20261114-a3f2", "field set")

@@ -81,6 +81,7 @@ return function()
   end
 
   eq(required_has(map.metronome_submit.schema, "intention"), true, "submit requires intention")
+  eq(map.metronome_submit.schema.properties.wait ~= nil, true, "submit exposes wait")
   eq(required_has(map.metronome_answer.schema, "answers"), true, "answer requires answers")
   eq(required_has(map.metronome_retry.schema, "id"), true, "retry requires id")
   eq(required_has(map.metronome_abandon.schema, "id"), true, "abandon requires id")
@@ -152,7 +153,11 @@ return function()
   eq(sub.llm_output, "submitted ship it", "call returns the runtime string")
   eq(sub.is_error, nil, "a successful call is not an error")
   eq(seen.submit and seen.submit.intention, "ship it", "submit receives the input")
+  eq(seen.submit and seen.submit.wait, false, "submit defaults to non-blocking")
   eq(seen.submit_ctx, ctx, "submit receives the maki ctx as the second argument")
+
+  tools.call(runtime, "metronome_submit", { intention = "block", wait = true }, ctx)
+  eq(seen.submit and seen.submit.wait, true, "submit honours an explicit wait")
 
   local st = tools.call(runtime, "metronome_status", nil, ctx)
   eq(type(seen.status), "table", "status receives a table when no input is given")

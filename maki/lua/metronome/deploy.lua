@@ -525,6 +525,12 @@ local function run_impl(opts)
     pcall(state.append, root, { kind = "note", task_id = id, text = "deployed" })
   end
 
+  -- A successful deploy drains the base it shipped. Leaving the flag set would
+  -- report work pending forever and let a later drainer re-deploy an old base.
+  if type(state.clear_deploy_pending) == "function" then
+    pcall(state.clear_deploy_pending, root)
+  end
+
   local log = M.write_log(root, id, {
     ok = true,
     error = nil,

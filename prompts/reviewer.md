@@ -22,6 +22,15 @@ Every finding carries a severity and a location:
 If the commit is clean, say so in one line and stop. Do not manufacture
 findings to appear rigorous.
 
+Your findings are published on the pull request associated with the commit —
+one summary comment per round, via `gh pr comment` (the `gh-axi` wrapper).
+Write each finding so it stands on its own on GitHub: severity, `path:line`,
+rule and message. A human reads it there, not only in the panel.
+
+When the project sets `review.engine = "no-mistakes"`, the local `no-mistakes`
+gate performs the review and this role is not called; the gate reports its own
+findings and the task fails rather than looping back to implementation.
+
 ## What you never do
 
 You do not edit code. You do not approve a commit you did not read. You do not

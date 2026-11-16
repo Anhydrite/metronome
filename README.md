@@ -75,9 +75,9 @@ The same surface is exposed to the agent as twelve tools: `metronome_submit`, `m
 
 `Enter` focuses the selected task's transcript, `Space` peeks without attaching and offers a reply, `+`/`-` rates a finding, `j`/`k` move, `q` or `Esc` closes. The keys are bound to the panel's own buffer, so the focused window never swallows them. The panel redraws on `TaskStatusChanged` and `TurnEnd`; it does not poll.
 
-The panel is **two columns**: the requests on the left, the detail of the selected one on the right. Each request is one compact line with four status icons — `✓` done, `▶` running, `✗` failed, `☐` todo. The detail draws the request's dependency tree as a PERT: a task sits under its first dependency, indented with `├─▶`/`└─▶`, its status icon and its branch, and the critical path (zero slack) is highlighted. `j`/`k` move between tasks and cross to the next request at the edge; `Tab` jumps to the next request. Finished tasks are hidden; `Space` on a task shows the full intention, dependencies and branch.
+The panel is **two columns**: one request per line on the left, a separator, and the selected request's PERT schema on the right. `j`/`k` move between requests and redraw the schema; `v` toggles quiet/verbose and `q` closes. The schema draws the request's dependency tree as an indented `├─▶`/`└─▶` tree, with terminal tasks dimmed so an edge to an already-merged prerequisite stays visible.
 
-The panel opens in **quiet mode**: a running task shows an animated spinner instead of its phase, progress lines pushed by the agent are dropped, and `Space` hides the agent's notes. What needs you — a blocked question, a failure, a review to read — keeps its detail. Press `v` to switch to verbose and back; the footer shows the current choice.
+The panel opens in **quiet mode**: progress lines pushed by the agent are dropped, and `Space` hides the agent's notes. What needs you — a blocked question, a failure, a review to read — keeps its detail. Press `v` to switch to verbose and back; the footer shows the current choice.
 
 ## How it works
 
@@ -103,6 +103,10 @@ draft -> qualifying -> awaiting_answers -> qualifying
 9. **Deploy** — `deploy.lua` requires a merged PR, a green checks report and an existing `deploy.md`, asks for confirmation, then runs the plan.
 
 The scheduler (`pipeline.lua`) decides what may run, never how a step runs: dependencies must be `merged` or `deployed`, two tasks that share a declared file never run together, `max_parallel` is a hard cap, and a stale task is flagged and surfaced in the panel.
+
+### Epic branches
+
+One intention can qualify into several tasks. Those tasks never merge into the project base directly: qualification cuts an epic branch `metronome/epic/<slug>-<first-task-suffix>` from the fresh base, pushes it, and cuts every subtask from it. A subtask opens its PR against the epic branch, merges there, re-runs its checks on that branch and stops at `merged` — it never deploys. Once every subtask is merged, a single `epic` task opens the one PR from the epic branch to the project base, merges it, re-runs the declared checks on the merged base, and only then deploys. An intention that produces exactly one task is unchanged: it merges into the project base and deploys as before.
 
 ## Architecture
 

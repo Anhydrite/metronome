@@ -441,4 +441,71 @@ return function()
   local failed_apply, failed_err = q.apply(state, root, { ok = false, error = "nope" }, {})
   eq(failed_apply, nil, "apply refuses an unsuccessful result")
   eq(failed_err, "cannot apply an unsuccessful qualification", "the refusal is explicit")
+
+  -- Epic branch -------------------------------------------------------------
+  --
+  -- One intention that qualifies into several tasks must not merge them into
+  -- the project base: every subtask is cut from the epic branch and one epic
+  -- task owns the single PR from that branch to the base.
+
+  local epic_root = maki.fs.joinpath(base, "epic-state")
+  local epic_opts = { branch = "metronome/epic/demo-0001", base = "main" }
+  local epic_applied, epic_err = q.apply(state, epic_root, apply_result, {
+    epic = epic_opts,
+    id_factory = function(index)
+      return string.format("T-20261114-%04x", index)
+    end,
+  })
+  eq(epic_err, nil, "apply with epic options has no error")
+  eq(#(epic_applied and epic_applied.tasks or {}), 2, "the subtasks are still created")
+  eq(epic_applied and epic_applied.tasks[1].base_ref, epic_opts.branch,
+    "a subtask is cut from the epic branch")
+  eq(epic_applied and epic_applied.tasks[2].base_ref, epic_opts.branch,
+    "every subtask is cut from the epic branch")
+
+  local epic_task = epic_applied and epic_applied.epic
+  eq(type(epic_task), "table", "a multi-task intention creates one epic task")
+  eq(epic_task and epic_task.kind, "epic", "the epic task is tagged kind = epic")
+  eq(epic_task and epic_task.status, "ready", "the epic has no questions and is ready")
+  eq(epic_task and epic_task.branch, epic_opts.branch, "the epic carries the epic branch")
+  eq(epic_task and epic_task.base_ref, "main", "the epic merges into the project base")
+  eq(epic_task and epic_task.title, "epic: intent one", "the epic title names the origin")
+  eq(#(epic_task and epic_task.depends_on or {}), 2, "the epic depends on both subtasks")
+  eq(epic_task and epic_task.depends_on[1], epic_applied.tasks[1].id,
+    "the epic depends on the first subtask id")
+  eq(epic_task and epic_task.depends_on[2], epic_applied.tasks[2].id,
+    "the epic depends on the second subtask id")
+
+  local epic_files = {}
+  for _, f in ipairs(epic_task and epic_task.files or {}) do epic_files[f] = true end
+  eq(epic_files["src/app.js"], true, "the epic files are the union of the subtask files")
+  eq(epic_files["package.json"], true, "the epic files include every subtask file")
+  eq(#(epic_task and epic_task.files or {}), 2, "the epic files are deduplicated")
+  local epic_checks = {}
+  for _, c in ipairs(epic_task and epic_task.checks or {}) do epic_checks[c] = true end
+  eq(epic_checks["npm test"], true, "the epic checks are the union of the subtask checks")
+  eq(epic_checks["npm run lint"], true, "the epic checks include every subtask check")
+
+  local epic_sheet = maki.fs.read(maki.fs.joinpath(epic_root, "tasks", tostring(epic_task and epic_task.id) .. ".md"))
+  eq(type(epic_sheet), "string", "the epic has a sheet")
+
+  -- A single task keeps the old behaviour: no epic, no base_ref.
+  local single_root = maki.fs.joinpath(base, "single-state")
+  local single, single_err = q.apply(state, single_root, {
+    ok = true,
+    tasks = { apply_norm.tasks[2] },
+    questions = {},
+  }, { epic = epic_opts, id_factory = function() return "T-20261114-00ff" end })
+  eq(single_err, nil, "a single-task apply has no error")
+  eq(single and single.epic, nil, "a single-task intention creates no epic")
+  eq(single and single.tasks[1].base_ref, nil, "a single task is not cut from an epic branch")
+
+  -- Two tasks without epic options keep the old behaviour too.
+  local plain_root = maki.fs.joinpath(base, "plain-state")
+  local plain, plain_err = q.apply(state, plain_root, apply_result, {
+    id_factory = function(index) return string.format("T-20261114-%04x", index) end,
+  })
+  eq(plain_err, nil, "apply without epic options has no error")
+  eq(plain and plain.epic, nil, "apply without epic options creates no epic")
+  eq(plain and plain.tasks[1].base_ref, nil, "apply without epic options sets no base_ref")
 end

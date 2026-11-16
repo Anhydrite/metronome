@@ -6,6 +6,7 @@
 repo = "/absolute/path/to/your/repo"
 base_ref = "master"
 max_parallel = 2
+max_parallel_qualifiers = 4
 
 [git]
 branch_prefix = "metronome/"
@@ -48,6 +49,8 @@ re_run_after_merge = true
 timeout_secs = 600
 
 [review]
+engine = "model"
+no_mistakes_bin = "no-mistakes"
 max_rounds = 3
 require_checks_green = true
 # A diff touching any of these is a blocking finding: an agent must not be

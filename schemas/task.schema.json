@@ -85,7 +85,15 @@
     },
     "base_ref": {
       "type": "string",
-      "description": "Branch the task was cut from."
+      "description": "Branch the task was cut from. A subtask of a multi-task intention is cut from the epic branch, not the project base."
+    },
+    "kind": {
+      "type": "string",
+      "description": "An epic task owns the single PR from the epic branch to the project base. Absent means an ordinary task.",
+      "enum": [
+        "task",
+        "epic"
+      ]
     },
     "files": {
       "type": "array",

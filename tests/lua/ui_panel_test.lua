@@ -202,22 +202,56 @@ return function()
   eq(panel.open, true, "open marks the panel open")
   eq(#opened, 1, "open creates exactly one window")
   eq(opened[1].opts.anchor, "NE", "the panel anchors north-east")
-  eq(opened[1].opts.width, "60%", "the panel is 60% wide")
-  eq(opened[1].opts.height, "60%", "the panel is 60% tall")
+  eq(type(opened[1].opts.width), "number", "the panel width is derived from the terminal")
+  eq(type(opened[1].opts.height), "number", "the panel height fits its content")
   eq(opened[1].opts.stack, false, "the panel does not stack")
-  eq(opened[1].opts.cursor_line, true, "the panel highlights the cursor row")
+  eq(opened[1].opts.cursor_line, false, "the panel has no second cursor line")
   eq(opened[1].opts.title, "Metronome", "the panel is titled Metronome")
   eq(type(opened[1].opts.footer), "table", "the panel has a footer")
-  eq(#opened[1].opts.footer, 9, "the footer lists every action key")
-  eq(opened[1].opts.footer[8][1], "v", "the footer offers the verbose toggle")
+  eq(#opened[1].opts.footer, 3, "the footer lists the remaining keys")
+  eq(opened[1].opts.footer[2][1], "v", "the footer offers the verbose toggle")
   eq(opened[1].buf ~= nil, true, "the window shows the panel buffer")
   eq(#opened[1].buf.lines > 0, true, "the buffer is filled before the window opens")
   eq(#panel.rows, 4, "open loads every task")
   eq(panel.cursor, 1, "the cursor starts on the first row")
-  -- The highlighted line is the selection, so it must start on the first task,
-  -- never on the bell header above it.
-  eq(opened[1].cursor, panel.row_line[1], "the window cursor starts on the first task row")
-  eq(opened[1].cursor > 1, true, "the window cursor is not on the header")
+  eq(opened[1].cursor, panel.row_line[1], "the window cursor starts on the first task node")
+  eq(opened[1].cursor > 1, true, "the window cursor is not on the PERT header")
+
+  -- Layout: 90% of the terminal, split 25/75 --------------------------------
+  -- The window takes 90% of the terminal in both directions, and the content
+  -- area is split 25/75 between the request column and the PERT schema, so the
+  -- separator sits at a fixed column whatever the request title is.
+  local sized_opened = {}
+  local sized_ui = {
+    buf = ui.buf,
+    open_win = function(buf, opts)
+      local win = fake_win(buf, opts)
+      sized_opened[#sized_opened + 1] = win
+      return win
+    end,
+    terminal_size = function()
+      return { cols = 100, rows = 40 }
+    end,
+  }
+  -- A private keymap, so the sized panel does not shadow the bindings the
+  -- key-scoping assertions below read from the shared fake.
+  local sized_keymap = { set = function() end, del = function() end }
+  local sized = new_panel({
+    ui = sized_ui,
+    keymap = sized_keymap,
+    autocmd = function() return 0 end,
+    del_autocmd = function() end,
+  })
+  eq(panel_mod.open(sized), true, "the sized panel opens")
+  eq(sized_opened[1].opts.width, 90, "the panel takes 90% of the terminal width")
+  eq(sized_opened[1].opts.height, 36, "the panel takes 90% of the terminal height")
+  local first_line = render.text(sized.buf.lines[1])
+  local bar = first_line:find("│", 1, true)
+  eq(type(bar), "number", "the first line carries the column separator")
+  -- Every character before the bar is ASCII once the marker glyph is folded
+  -- to one cell, so the byte count is the display column.
+  local prefix = first_line:sub(1, bar - 1):gsub("▸", "x")
+  eq(#prefix, 22, "the separator sits at a fixed 25% of the content area")
 
   -- A task with no phase must not print a JSON null as a userdata.
   local peek_state = {
@@ -273,7 +307,9 @@ return function()
   eq(panel_mod.move(panel, -10), 1, "move up clamps at the first row")
   eq(panel_mod.move(panel, 10), 4, "move down clamps at the last row")
 
-  eq(panel_mod.select(panel, 3).id, "T-20261114-a3f2", "select jumps to a row")
+  eq(panel_mod.select(panel, panel.row_line[3]).id, "T-20261114-a3f2", "select jumps to a row")
+  eq(panel_mod.select(panel, 1).id, panel.rows[1].id,
+    "a click on a request line selects its first task")
   eq(panel_mod.select(panel, 0), nil, "select refuses row zero")
   eq(panel_mod.select(panel, 99), nil, "select refuses a row past the end")
   eq(panel_mod.select(panel, "x"), nil, "select refuses a non-number")
@@ -283,7 +319,7 @@ return function()
   eq(panel_mod.handle_key(panel, "j"), "down", "j moves down")
   eq(panel_mod.handle_key(panel, "k"), "up", "k moves up")
 
-  panel_mod.select(panel, 1)
+  panel_mod.select(panel, panel.row_line[1])
   eq(panel_mod.handle_key(panel, "<CR>"), "focus", "Enter focuses the selected task")
   eq(focused, "T-20261114-d1e2", "Enter focuses the blocked task's transcript")
 
@@ -291,13 +327,13 @@ return function()
   eq(peek_action.action, "peek", "Space asks to peek")
   eq(peek_action.id, "T-20261114-d1e2", "Space peeks at the selected task")
 
-  panel_mod.select(panel, 2)
+  panel_mod.select(panel, panel.row_line[2])
   retried = nil
   local retry_action = panel_mod.handle_key(panel, "r")
   eq(retry_action.action, "retry", "r retries a failed task")
   eq(retried, "T-20261114-b7c1", "r retries the selected failure")
 
-  panel_mod.select(panel, 1)
+  panel_mod.select(panel, panel.row_line[1])
   local refused_retry, refused_retry_err = panel_mod.handle_key(panel, "r")
   eq(refused_retry, nil, "r refuses a task that is not failed")
   eq(type(refused_retry_err), "string", "the refusal explains why")
@@ -339,7 +375,7 @@ return function()
       selected_index = i
     end
   end
-  panel_mod.select(panel, selected_index)
+  panel_mod.select(panel, panel.row_line[selected_index])
   deleted = nil
   local delete_action = panel_mod.handle_key(panel, "d")
   eq(delete_action and delete_action.action, "delete", "d deletes the selected task")
@@ -354,7 +390,7 @@ return function()
       running_index = i
     end
   end
-  panel_mod.select(panel, running_index)
+  panel_mod.select(panel, panel.row_line[running_index])
   stopped = nil
   local stop_action = panel_mod.handle_key(panel, "s")
   eq(stop_action and stop_action.action, "stop", "s stops the selected task")
@@ -476,7 +512,7 @@ return function()
   eq(panel.quiet, false, "v turned quiet off")
   eq(panel_mod.handle_key(panel, "v"), "quiet", "v switches back to quiet")
   eq(panel.quiet, true, "v turned quiet on")
-  eq(#scheduled > 0, true, "opening the panel schedules the spinner")
+  eq(#scheduled, 0, "the static panel schedules no spinner")
 
   -- Close and toggle -------------------------------------------------------
 

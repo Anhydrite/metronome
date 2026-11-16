@@ -16,12 +16,14 @@ The contract is `schemas/config.schema.json`. Unknown keys are refused, every ro
 | `repo` | string, absolute path | required | The git repository Metronome drives. |
 | `base_ref` | string | required | The branch every task is cut from. |
 | `max_parallel` | integer, 1–16 | `2` | How many tasks may run at once. The scheduler also refuses two tasks whose declared files overlap. |
+| `max_parallel_qualifiers` | integer, 1–16 | `4` | How many qualifier sessions may run at once when several intentions are submitted together. |
 
 ```toml
 [project]
 repo = "/home/you/src/shop"
 base_ref = "main"
 max_parallel = 2
+max_parallel_qualifiers = 4
 ```
 
 ## `[git]`
@@ -90,6 +92,8 @@ A task is done when these commands exit 0, not when a model says so. A red check
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
+| `engine` | `model` or `no-mistakes` | `model` | `model` runs the reviewer loop; `no-mistakes` runs the local gate, then merges a clean branch without looping back to implementation. |
+| `no_mistakes_bin` | string | `no-mistakes` | The `no-mistakes` executable used by the gate engine. |
 | `max_rounds` | integer, 1–10 | `3` | Review rounds before escalation. |
 | `require_checks_green` | boolean | `true` | Refuse a review when the checks report is red or missing. |
 | `protected_paths` | array of strings | `["review-rules.md", "AGENTS.md", ".metronome/", "deploy.md"]` | A diff touching any of these is a blocking finding, decided before the reviewer model is called. |
@@ -111,6 +115,10 @@ A task is done when these commands exit 0, not when a model says so. A red check
 | `plan_file` | string | `"deploy.md"` | The plan the deployer follows, relative to the repository root. |
 
 Deploy also refuses unless the PR is merged (stored and live) and the checks report is green.
+
+## Epic branches
+
+An intention that qualifies into several tasks goes through an epic branch, and no key configures it: the rule is structural. Qualification cuts `metronome/epic/<slug>-<first-task-suffix>` from `project.base_ref` and pushes it; every subtask is cut from it, its PR targets it, and it stops at `merged` without deploying. One `epic` task then owns the single PR from the epic branch to `project.base_ref`. `merge.auto_merge` governs both levels: off, the subtask PRs and the epic PR are left open for a human; on, the pipeline merges the subtasks, then the epic, and `deploy.auto_deploy` decides whether the epic deploys. A single-task intention is unaffected.
 
 ## `[quality]`
 
@@ -134,6 +142,7 @@ Deploy also refuses unless the PR is merged (stored and live) and the checks rep
 repo = "/home/you/src/shop"
 base_ref = "main"
 max_parallel = 2
+max_parallel_qualifiers = 4
 
 [git]
 branch_prefix = "metronome/"
@@ -166,6 +175,8 @@ re_run_after_merge = true
 timeout_secs = 600
 
 [review]
+engine = "model"
+no_mistakes_bin = "no-mistakes"
 max_rounds = 3
 require_checks_green = true
 protected_paths = ["review-rules.md", "AGENTS.md", ".metronome/", "deploy.md"]

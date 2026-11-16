@@ -498,7 +498,31 @@ local function run_impl(opts)
   -- deploy, it hands the base off through the persistent deploy-pending flag
   -- and returns at `merged`. Recording it before the transition means a task
   -- that cannot be marked merged is retried rather than silently undeployed.
+  --
+  -- A subtask merging into an epic branch opts out (`deploy_pending = false`):
+  -- the epic branch is not a deployable base, and marking it pending would
+  -- have the deployer ship work that never reached the project base.
   local pending = nil
+  if opts.deploy_pending == false then
+    local final, ferr = state.transition(root, id, "merged", { phase = "merge" })
+    if not final then
+      return {
+        ok = false,
+        error = ferr,
+        rebase = rebase,
+        merge = merged,
+        checks = checks_result,
+        branch_cleanup = branch_cleanup,
+      }
+    end
+    return {
+      ok = true,
+      rebase = rebase,
+      merge = merged,
+      checks = checks_result,
+      branch_cleanup = branch_cleanup,
+    }
+  end
   if type(state.set_deploy_pending) ~= "function" then
     return {
       ok = false,

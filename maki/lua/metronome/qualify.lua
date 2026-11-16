@@ -940,6 +940,12 @@ end
 -- where it belongs: awaiting answers if it asked something, ready otherwise.
 -- The sheet is written last, so a task never points at a sheet that is not
 -- there yet.
+--
+-- `opts.epic = { branch, base }` is the multi-task rule: when one intention
+-- qualifies into several tasks they must not merge into the project base
+-- directly. Every subtask is cut from the epic branch, and one extra `epic`
+-- task owns the single PR from that branch to the project base. A single-task
+-- intention keeps the old behaviour and gets no epic.
 function M.apply(state, root, result, opts)
   opts = opts or {}
   if type(result) ~= "table" or result.ok ~= true then
@@ -953,6 +959,23 @@ function M.apply(state, root, result, opts)
   local made, mkerr = fs.mkdir(tasks_dir, { parents = true })
   if not made then
     return nil, "cannot create tasks directory: " .. tostring(mkerr)
+  end
+
+  -- The epic options are validated once: a half-specified epic would create
+  -- subtasks cut from a branch nobody pushed. The rule only applies when the
+  -- intention really produced several tasks: a single task has no epic branch
+  -- to merge into, so it keeps the project base.
+  local epic = opts.epic
+  if epic ~= nil and #(result.tasks or {}) <= 1 then
+    epic = nil
+  end
+  if epic ~= nil then
+    if type(epic) ~= "table" or type(epic.branch) ~= "string" or epic.branch == "" then
+      return nil, "epic options need a branch"
+    end
+    if type(epic.base) ~= "string" or epic.base == "" then
+      return nil, "epic options need a base"
+    end
   end
 
   local created = {}
@@ -991,6 +1014,11 @@ function M.apply(state, root, result, opts)
     end
     if #questions > 0 then
       record.questions = questions
+    end
+    -- A subtask of a multi-task intention is cut from the epic branch, never
+    -- from the project base: its PR must target the epic branch.
+    if epic and epic.branch then
+      record.base_ref = epic.branch
     end
     local created_task, cerr = state.create(root, record)
     if not created_task then
@@ -1036,8 +1064,106 @@ function M.apply(state, root, result, opts)
     current = state.load(root)
   end
 
+  -- One epic per multi-task intention. It is created after the subtasks so its
+  -- `depends_on` can name their real ids: the scheduler only starts it once
+  -- every subtask is `merged` (into the epic branch), and a failed subtask
+  -- blocks it with a named reason instead of opening a half-empty PR.
+  local epic_task = nil
+  if epic and #created > 1 then
+    local origin = created[1].origin
+    if type(origin) ~= "string" or origin == "" then
+      origin = created[1].intent or ""
+    end
+    -- The title is a panel line, and the schema caps it at 200 characters.
+    local title = "epic: " .. origin
+    if #title > 200 then
+      title = title:sub(1, 200)
+    end
+
+    -- The epic declares the union of what its subtasks touch, so the scheduler
+    -- sees its blast radius. Deduplicated, order preserved: the sheet reads
+    -- like the subtasks it came from.
+    local function union(field)
+      local seen, list = {}, {}
+      for _, task in ipairs(created) do
+        for _, value in ipairs(type(task[field]) == "table" and task[field] or {}) do
+          if not seen[value] then
+            seen[value] = true
+            list[#list + 1] = value
+          end
+        end
+      end
+      return list
+    end
+
+    local epic_id
+    if type(opts.id_factory) == "function" then
+      epic_id = opts.id_factory(#created + 1)
+    end
+    if type(epic_id) ~= "string" or epic_id == "" then
+      epic_id = M.next_id(current, opts.date)
+    end
+
+    local depends_on = {}
+    for _, task in ipairs(created) do
+      depends_on[#depends_on + 1] = task.id
+    end
+
+    local record = {
+      id = epic_id,
+      kind = "epic",
+      title = title,
+      intent = origin,
+      origin = origin,
+      branch = epic.branch,
+      base_ref = epic.base,
+      depends_on = depends_on,
+      status = "draft",
+    }
+    -- An empty Lua table encodes as `{}`, which the task schema rejects where
+    -- an array is required: omit the field instead of writing an object.
+    local files = union("files")
+    if #files > 0 then
+      record.files = files
+    end
+    local checks = union("checks")
+    if #checks > 0 then
+      record.checks = checks
+    end
+
+    local epic_record, eerr = state.create(root, record)
+    if not epic_record then
+      return nil, eerr
+    end
+    local moved, terr = state.transition(root, epic_id, "qualifying", { phase = "qualify" })
+    if not moved then
+      return nil, terr
+    end
+    -- The epic asks nothing: its scope is exactly the subtasks it depends on.
+    local settled, serr = state.transition(root, epic_id, "ready", { phase = "qualify" })
+    if not settled then
+      return nil, serr
+    end
+
+    local sheet = M.sheet_markdown({
+      id = epic_id,
+      title = title,
+      intent = origin,
+      origin = origin,
+      files = files,
+      checks = checks,
+      depends_on = depends_on,
+    })
+    local wrote, werr = fs.write(fs.joinpath(tasks_dir, epic_id .. ".md"), sheet)
+    if not wrote then
+      return nil, "cannot write sheet for " .. epic_id .. ": " .. tostring(werr)
+    end
+    epic_task = settled
+  end
+
   return {
     tasks = created,
+    epic = epic_task,
     questions = result.questions or {},
     truncated_questions = result.truncated_questions or 0,
   }

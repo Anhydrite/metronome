@@ -12,14 +12,15 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `state.lua` | Append-only journal, projection, task CRUD and the legal transition table. |
 | `roles.lua` | Resolve a role name to its model, thinking level, tool whitelist and prompt files. |
 | `runner.lua` | Open a maki subagent session for one role, with retry, timeout and logs. |
-| `git.lua` | Fetch, worktree, branch, commit, push, diff and the `gh` PR calls. |
+| `git.lua` | Fetch, worktree, branch, commit, push, diff and the `gh` PR calls (`pr_create`, `pr_view`, `pr_close`, `pr_comment`). |
 | `qualify.lua` | Turn an intention into task sheets, with a repair pass and a question list. |
 | `questions.lua` | Deduplicate, rank and cap a question round; write answers back to every source. |
 | `analyze.lua` | Cross-task structural and semantic analysis; gate `qualifying -> ready`. |
 | `implement.lua` | Prepare the worktree, checkpoint, run the implementer turn, commit and push. |
 | `checks.lua` | Run the declared commands, capture the report, roll back on red. |
 | `converge.lua` | Compare the diff with the task's declared files; one repair turn if they differ. |
-| `review.lua` | Review one exact SHA, store findings, bound the rounds, escalate. |
+| `review.lua` | Review one exact SHA, store findings, bound the rounds, escalate, and mirror findings onto the PR. |
+| `no_mistakes.lua` | Run the local `no-mistakes` gate as the review engine: clean, push, open the PR, then merge without a review/implement loop. |
 | `merge.lua` | Rebase on the fresh base, merge the PR, re-run the checks on the merged base. |
 | `deploy.lua` | Run `deploy.md` with the user in the loop, guarded by a merged PR and green checks. |
 | `calibrate.lua` | Analyze the repository and generate `review-rules.md`; ingest feedback. |
@@ -73,10 +74,14 @@ One task goes through these phases, each owned by a module:
 3. **Implement** — `implement.lua` creates the worktree from the base branch, checkpoints the starting SHA, runs the implementer, commits and pushes.
 4. **Verify** — `checks.lua` runs the declared commands in the worktree. A red check rolls back to the checkpoint and sends the task back to `running`.
 5. **Converge** — `converge.lua` compares the diff with the declared files. A missing or unexpected file gets one repair turn; the verdict is the diff after the turn, never the model's word.
-6. **Review** — `review.lua` reads the exact HEAD SHA, lists the changed files, refuses a protected path before any model call, then asks the reviewer for structured findings. Blocking or major findings send the task to `changes_requested`; the loop is bounded, then escalates.
+6. **Review** — `review.lua` reads the exact HEAD SHA, lists the changed files, refuses a protected path before any model call, then asks the reviewer for structured findings. Blocking or major findings send the task to `changes_requested`; the loop is bounded, then escalates. Each round's findings are mirrored onto the PR with `gh pr comment`. With `review.engine = "no-mistakes"`, the local `no-mistakes` gate replaces the loop: it cleans, pushes and opens the PR, and a clean gate is merged without re-entering implementation.
 7. **PR** — `git.pr_open` creates the pull request, stores it on the task and moves it to `pr_open`.
 8. **Merge** — `merge.lua` rebases on the fresh base, merges through `gh`, and re-runs the checks on the merged base. A red base fails the task.
 9. **Deploy** — `deploy.lua` requires a merged PR (stored and live), a green checks report and an existing `deploy.md`, asks for confirmation, then runs the plan.
+
+### Epic branches
+
+An intention that qualifies into more than one task does not merge those tasks into the project base. Qualification creates an epic branch `metronome/epic/<slug>-<first-task-suffix>` from the fresh base and pushes it; every subtask is cut from it (`task.base_ref = <epic branch>`), opens its PR against it, merges into it, re-runs its checks there and stops at `merged` — a subtask never deploys. The subtasks also produce one extra `epic` task (`kind = "epic"`) that depends on all of them: once they are merged, it pushes the epic branch, opens the single PR from the epic branch to the project base, merges it, re-runs the declared checks on the merged base and then deploys. An epic task has no implementation, convergence or review of its own — its state machine goes `running -> pr_open` directly. A single-task intention keeps the old behaviour: it merges into the project base and deploys.
 
 ## Scheduler
 

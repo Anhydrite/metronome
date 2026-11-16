@@ -505,6 +505,30 @@ function M.rev_parse(worktree, ref)
   return sha
 end
 
+-- True when `ref` is an ancestor of (or equal to) `of`. A branch may only be
+-- fast-forwarded to another ref when this holds: resetting past a commit that
+-- is not in the target would silently drop work.
+function M.is_ancestor(worktree, ref, of)
+  if type(worktree) ~= "string" or worktree == "" then
+    return nil, "is_ancestor needs a worktree"
+  end
+  if type(ref) ~= "string" or ref == "" or type(of) ~= "string" or of == "" then
+    return nil, "is_ancestor needs two refs"
+  end
+  local result, err = run({ "git", "-C", worktree, "merge-base", "--is-ancestor", ref, of })
+  if not result then
+    return nil, err
+  end
+  if result.ok then
+    return true
+  end
+  -- exit 1 is the "not an ancestor" answer; anything else is a real failure.
+  if result.code == 1 then
+    return false
+  end
+  return nil, tostring(result.stderr or result.stdout or "merge-base failed")
+end
+
 function M.head_sha(worktree)
   local result, err = run({ "git", "-C", worktree, "rev-parse", "HEAD" })
   if not result then
@@ -565,6 +589,91 @@ function M.rebase(worktree, upstream)
       { conflict = #conflicts > 0 and conflicts or nil }
   end
   return M.head_sha(worktree)
+end
+
+-- Create a branch from `from_ref`, idempotently.
+--
+-- The epic branch outlives one run: a retry or a resumed submit must reuse it,
+-- never reset it, or the subtasks already merged into it would be lost. So an
+-- existing local branch is returned untouched, and a branch that only exists
+-- on the remote is re-created as a tracking branch from that remote ref.
+function M.branch_create(repo, name, from_ref, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(repo) ~= "string" or repo == "" then
+    return nil, "branch_create needs a repo"
+  end
+  if type(name) ~= "string" or name == "" then
+    return nil, "branch_create needs a branch name"
+  end
+  local local_ref = "refs/heads/" .. name
+  local existing = run({ "git", "-C", repo, "rev-parse", "--verify", "--quiet", local_ref })
+  if existing and existing.ok then
+    return { ok = true, branch = name, created = false, ref = local_ref }
+  end
+  local remote = opts.remote or "origin"
+  local remote_ref = "refs/remotes/" .. remote .. "/" .. name
+  local on_remote = run({ "git", "-C", repo, "rev-parse", "--verify", "--quiet", remote_ref })
+  local start = (on_remote and on_remote.ok) and remote_ref or from_ref
+  if type(start) ~= "string" or start == "" then
+    return nil, "branch_create needs a start ref"
+  end
+  local result, err = run({ "git", "-C", repo, "branch", name, start })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("branch create", result)
+  end
+  return { ok = true, branch = name, created = true, ref = local_ref, from = start }
+end
+
+-- Push a branch by name, from the repository itself rather than a worktree.
+--
+-- The epic branch has no worktree of its own (nothing is implemented on it),
+-- so it is pushed from the repo. `--force-with-lease` is not used here: the
+-- branch is only ever advanced by merges, so a plain push is correct and a
+-- non-fast-forward means someone else moved it.
+function M.push_branch(repo, name, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(repo) ~= "string" or repo == "" then
+    return nil, "push_branch needs a repo"
+  end
+  if type(name) ~= "string" or name == "" then
+    return nil, "push_branch needs a branch name"
+  end
+  local result, err = run({ "git", "-C", repo, "push", "-u", opts.remote or "origin", name },
+    { timeout_ms = opts.timeout_ms })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("push", result)
+  end
+  return true
+end
+
+-- Move a local branch to a ref without checking it out. The epic branch lives
+-- on the remote and every subtask merge lands there through GitHub, so the
+-- local ref is behind after a squash merge; the merge worktree must start from
+-- the tip GitHub actually holds, not from a stale local branch.
+function M.branch_reset(repo, name, ref)
+  if type(repo) ~= "string" or repo == "" then
+    return nil, "branch_reset needs a repo"
+  end
+  if type(name) ~= "string" or name == "" then
+    return nil, "branch_reset needs a branch name"
+  end
+  if type(ref) ~= "string" or ref == "" then
+    return nil, "branch_reset needs a ref"
+  end
+  local result, err = run({ "git", "-C", repo, "branch", "-f", name, ref })
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("branch reset", result)
+  end
+  return true
 end
 
 -- Push a task branch. The pipeline owns `metronome/*` branches and rewrites
@@ -818,6 +927,30 @@ function M.pr_close(ref, opts)
     return fail("gh pr close", result)
   end
   return { closed = true }
+end
+
+-- Post one comment on a pull request. The reviewer's findings are mirrored
+-- onto the PR so a human reads them on GitHub, not only in the panel. The
+-- default binary is the `gh-axi` wrapper; `opts.gh` overrides it for tests.
+function M.pr_comment(ref, body, opts)
+  opts = type(opts) == "table" and opts or {}
+  if ref == nil or tostring(ref) == "" then
+    return nil, "pr_comment needs a pull request"
+  end
+  if type(body) ~= "string" or body:gsub("%s", "") == "" then
+    return nil, "pr_comment needs a non-empty body"
+  end
+  local result, err = run(
+    { opts.gh or "gh-axi", "pr", "comment", tostring(ref), "--body", body },
+    { cwd = opts.worktree, timeout_ms = opts.timeout_ms }
+  )
+  if not result then
+    return nil, err
+  end
+  if not result.ok then
+    return fail("gh pr comment", result)
+  end
+  return { commented = true, ref = tostring(ref) }
 end
 
 -- Open a PR for the task branch, then read it back so the caller gets

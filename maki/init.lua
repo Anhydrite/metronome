@@ -56,6 +56,7 @@ local function wire()
     checks = require("metronome.checks"),
     converge = require("metronome.converge"),
     review = require("metronome.review"),
+    no_mistakes = require("metronome.no_mistakes"),
     merge = require("metronome.merge"),
     calibrate = require("metronome.calibrate"),
     deploy = require("metronome.deploy"),

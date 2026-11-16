@@ -28,6 +28,13 @@
           "minimum": 1,
           "maximum": 16,
           "default": 2
+        },
+        "max_parallel_qualifiers": {
+          "type": "integer",
+          "description": "How many qualifier sessions may run at once when several intentions are submitted together.",
+          "minimum": 1,
+          "maximum": 16,
+          "default": 4
         }
       }
     },
@@ -75,6 +82,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "engine": {
+          "type": "string",
+          "enum": ["model", "no-mistakes"],
+          "description": "The review engine. `no-mistakes` runs the local gate instead of the reviewer model loop, then merges a clean branch.",
+          "default": "model"
+        },
+        "no_mistakes_bin": { "type": "string", "minLength": 1, "default": "no-mistakes" },
         "max_rounds": { "type": "integer", "minimum": 1, "maximum": 10, "default": 3 },
         "require_checks_green": { "type": "boolean", "default": true },
         "protected_paths": {

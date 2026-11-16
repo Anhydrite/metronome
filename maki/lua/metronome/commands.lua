@@ -70,7 +70,7 @@ M.COMMANDS = {
       if text == "" then
         return nil, "submit needs an intention"
       end
-      return { intention = text, complexity = complexity }
+      return { intention = text, complexity = complexity, wait = false }
     end,
   },
   {

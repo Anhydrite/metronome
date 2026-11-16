@@ -44,24 +44,54 @@ local TRANSITIONS = {
   abandoned = { running = true, failed = true },
 }
 
-function M.can_transition(from, to)
+-- An epic task owns the single PR from the epic branch to the project base.
+-- It has no implementation, no checks and no review of its own: the subtasks
+-- already did that work on the epic branch, so the epic goes straight from
+-- `running` to `pr_open`. This is an *addition* to TRANSITIONS, never a
+-- replacement: a normal task still cannot skip verification and review.
+local EPIC_TRANSITIONS = {
+  running = { pr_open = true },
+}
+
+local function transitions_for(kind)
+  if kind == "epic" then
+    return EPIC_TRANSITIONS
+  end
+  return nil
+end
+
+function M.can_transition(from, to, kind)
   if from == to then
     return true
   end
   local allowed = TRANSITIONS[from]
-  return allowed ~= nil and allowed[to] == true
+  if allowed ~= nil and allowed[to] == true then
+    return true
+  end
+  local extra = transitions_for(kind)
+  local epic_allowed = extra and extra[from] or nil
+  return epic_allowed ~= nil and epic_allowed[to] == true
 end
 
 -- The statuses reachable from `from`, sorted. A caller that hit a refusal
 -- needs this to say what it could have asked for instead, and the panel uses
 -- it to show what a task can do next.
-function M.allowed_from(from)
+function M.allowed_from(from, kind)
   local allowed = TRANSITIONS[from]
-  if not allowed then
+  local extra = transitions_for(kind)
+  local epic_allowed = extra and extra[from] or nil
+  if not allowed and not epic_allowed then
     return {}
   end
+  local seen = {}
+  for status in pairs(allowed or {}) do
+    seen[status] = true
+  end
+  for status in pairs(epic_allowed or {}) do
+    seen[status] = true
+  end
   local list = {}
-  for status in pairs(allowed) do
+  for status in pairs(seen) do
     list[#list + 1] = status
   end
   table.sort(list)
@@ -485,11 +515,11 @@ function M.transition(root, task_id, to, extra)
   if not task then
     return nil, "unknown task: " .. task_id
   end
-  if not M.can_transition(task.status, to) then
+  if not M.can_transition(task.status, to, task.kind) then
     -- Name the task, both statuses, and what was allowed instead: a bare
     -- "illegal transition" leaves the caller guessing, and a pipeline that
     -- guesses retries the same illegal move forever.
-    local allowed = M.allowed_from(task.status)
+    local allowed = M.allowed_from(task.status, task.kind)
     local hint = #allowed > 0 and table.concat(allowed, ", ") or "nothing (terminal)"
     return nil, string.format(
       "illegal transition %s -> %s for %s (allowed from %s: %s)",

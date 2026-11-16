@@ -572,7 +572,7 @@ function M.tree(rows)
   return out
 end
 
--- PERT graph ----------------------------------------------------------------
+-- PERT schema ---------------------------------------------------------------
 
 -- The four-hex tail of an id, the label a node carries in the graph.
 local function node_label(id)
@@ -584,243 +584,59 @@ local function node_label(id)
   return tail
 end
 
--- Draw one request's dependency graph left to right, the way a PERT chart
--- reads: nodes in columns by earliest start, arrows between them, the critical
--- path in the running style. A shared child is drawn once and every parent
--- points at it, so the picture is the DAG, not a spanning tree.
+local TERMINAL_STATUS = { merged = true, deployed = true, abandoned = true }
+
+-- Draw one request's dependency schema as the indented tree the README
+-- describes: one node per line, indented under its first prerequisite with
+-- `├─▶`/`└─▶`, carrying the status icon, the short id and the branch. The tree
+-- is the schema because it always fits: unlike the retired multi-column
+-- canvas it cannot be clipped away by a narrow right column.
 --
--- Returns `lines, order, node_line`: styled lines, the reading order of rows
--- (topological, layer by layer), and the 1-based line each row starts on.
--- `node_line` is what lets the panel keep its cursor on a task even though a
--- line may hold several nodes.
+-- Terminal tasks are drawn too, dimmed, so an edge to an already-merged
+-- prerequisite stays visible instead of dropping out of the graph.
+--
+-- Returns `lines, order, node_line, layer, row_of`: styled lines, the display
+-- order of the rows, the 1-based line of each row, its depth, and its 0-based
+-- row. `node_line` is what lets the panel keep its cursor on a task.
 function M.pert(rows, opts)
   rows = rows or {}
   opts = type(opts) == "table" and opts or {}
-  local by_id = {}
-  for _, row in ipairs(rows) do
-    by_id[row.id] = row
-  end
-  local deps, kids = {}, {}
-  for _, row in ipairs(rows) do
-    deps[row.id] = {}
-    kids[row.id] = {}
-  end
-  for _, row in ipairs(rows) do
-    for _, dep in ipairs(row.depends_on_ids or {}) do
-      if by_id[dep] and dep ~= row.id then
-        deps[row.id][#deps[row.id] + 1] = dep
-        kids[dep][#kids[dep] + 1] = row.id
+  local entries = M.tree(rows)
+  local lines, order, node_line, layer, row_of = {}, {}, {}, {}, {}
+  for i, entry in ipairs(entries) do
+    local row = entry.row
+    local done = TERMINAL_STATUS[row.status] == true
+    local spans = {}
+    spans[#spans + 1] = { entry.prefix or "", "dim" }
+    local icon_style = done and "dim" or M.status_icon_style(row.status)
+    spans[#spans + 1] = { M.status_icon(row.status), icon_style }
+    local id_style = done and "dim" or (entry.critical and "run" or "dim")
+    spans[#spans + 1] = { M.short_id(row.id), id_style }
+    if type(row.title) == "string" and row.title ~= "" then
+      spans[#spans + 1] = { "  " .. M.fit(row.title, opts.title_max or 22), "dim" }
+    end
+    if type(row.branch) == "string" and row.branch ~= "" then
+      local branch = row.branch:gsub("^metronome/", "")
+      spans[#spans + 1] = { "  ⎇ " .. M.fit(branch, opts.branch_max or 20), "dim" }
+    end
+    if entry.extra_deps then
+      spans[#spans + 1] = { "  ← " .. entry.extra_deps, "dim" }
+    end
+    -- The selected task is the panel's only selector: the whole node turns
+    -- bold (the theme's highlight) instead of a second cursor line.
+    if opts.selected_id ~= nil and row.id == opts.selected_id then
+      for _, span in ipairs(spans) do
+        span[2] = "bold"
       end
     end
-  end
-
-  -- Layer = longest path from a root (the earliest start column). A cycle is
-  -- broken at the back edge so the panel never hangs.
-  local layer, visiting = {}, {}
-  local function lay(id)
-    if layer[id] then
-      return layer[id]
-    end
-    if visiting[id] then
-      return 0
-    end
-    visiting[id] = true
-    local l = 0
-    for _, dep in ipairs(deps[id]) do
-      l = math.max(l, lay(dep) + 1)
-    end
-    visiting[id] = nil
-    layer[id] = l
-    return l
-  end
-  for _, row in ipairs(rows) do
-    lay(row.id)
-  end
-
-  local max_layer = 0
-  for _, row in ipairs(rows) do
-    if layer[row.id] > max_layer then
-      max_layer = layer[row.id]
-    end
-  end
-
-  local layers = {}
-  for _, row in ipairs(rows) do
-    local l = layer[row.id]
-    layers[l] = layers[l] or {}
-    layers[l][#layers[l] + 1] = row
-  end
-
-  -- Rows: a node sits near the barycenter of its parents, then the first free
-  -- row, so a child lands between its parents instead of far below them.
-  local row_of, used, next_row = {}, {}, 0
-  for l = 0, max_layer do
-    local list = layers[l] or {}
-    local desired = {}
-    for _, row in ipairs(list) do
-      local sum, n = 0, 0
-      for _, dep in ipairs(deps[row.id]) do
-        if row_of[dep] then
-          sum = sum + row_of[dep]
-          n = n + 1
-        end
-      end
-      desired[row.id] = n > 0 and (sum / n) or nil
-    end
-    table.sort(list, function(a, b)
-      local da, db = desired[a.id], desired[b.id]
-      if da and db and da ~= db then
-        return da < db
-      end
-      if da and not db then
-        return true
-      end
-      if db and not da then
-        return false
-      end
-      return a.id < b.id
-    end)
-    for _, row in ipairs(list) do
-      local r
-      if desired[row.id] then
-        r = math.floor(desired[row.id] + 0.5)
-        while used[r] do
-          r = r + 1
-        end
-      else
-        r = next_row
-        while used[r] do
-          r = r + 1
-        end
-      end
-      used[r] = true
-      row_of[row.id] = r
-      if r >= next_row then
-        next_row = r + 1
-      end
-    end
-  end
-
-  local NODE_W = 5
-  local COL_W = 12
-  local width = (max_layer + 1) * COL_W
-  -- The graph is drawn on a canvas; a graph wider than the column is clipped
-  -- here, never by the window border.
-  if type(opts.right_width) == "number" and opts.right_width > 0 then
-    width = math.min(width, opts.right_width)
-  end
-  local height = math.max(next_row, 1)
-  local canvas = {}
-  for r = 0, height - 1 do
-    canvas[r] = {}
-    for c = 0, width - 1 do
-      canvas[r][c] = { " ", "dim" }
-    end
-  end
-  local function put(r, c, ch, style)
-    if r >= 0 and r < height and c >= 0 and c < width then
-      canvas[r][c] = { ch, style or "dim" }
-    end
-  end
-  local function hline(r, c1, c2, ch)
-    for c = c1, c2 do
-      put(r, c, ch or "─")
-    end
-  end
-  local function vline(c, r1, r2, ch)
-    for r = r1, r2 do
-      put(r, c, ch or "│")
-    end
-  end
-
-  local pos = {}
-  for _, row in ipairs(rows) do
-    local r, c = row_of[row.id], layer[row.id] * COL_W
-    pos[row.id] = { r, c }
-    local label = node_label(row.id)
-    local style = M.status_icon_style(row.status)
-    put(r, c, M.status_icon(row.status), style)
-    for i = 1, #label do
-      put(r, c + i, label:sub(i, i), style)
-    end
-  end
-
-  for _, row in ipairs(rows) do
-    local pr, pc = pos[row.id][1], pos[row.id][2]
-    local ks = kids[row.id] or {}
-    for _, kid in ipairs(ks) do
-      local cr, cc = pos[kid][1], pos[kid][2]
-      local sx = pc + NODE_W
-      local vx = cc - 2
-      local ax = cc - 1
-      if pr == cr then
-        if vx - 1 >= sx then
-          hline(pr, sx, vx - 1)
-        end
-        put(pr, ax, "▶")
-      else
-        if vx - 1 >= sx then
-          hline(pr, sx, vx - 1)
-        end
-        put(pr, vx, cr > pr and "┐" or "┘")
-        local from, to = math.min(pr, cr) + 1, math.max(pr, cr) - 1
-        if from <= to then
-          vline(vx, from, to)
-        end
-        put(cr, vx, cr > pr and "┴" or "┬")
-        if ax - 1 >= vx + 1 then
-          hline(cr, vx + 1, ax - 1)
-        end
-        put(cr, ax, "▶")
-      end
-    end
-    if #ks > 1 then
-      put(pr, pc + NODE_W, "┬")
-    end
-  end
-
-  local lines = {}
-  for r = 0, height - 1 do
-    local last = 0
-    for c = 0, width - 1 do
-      if canvas[r][c][1] ~= " " then
-        last = c
-      end
-    end
-    local spans, buf, style = {}, {}, nil
-    for c = 0, last do
-      local cell = canvas[r][c]
-      if cell[2] ~= style then
-        if #buf > 0 then
-          spans[#spans + 1] = { table.concat(buf), style }
-        end
-        buf = {}
-        style = cell[2]
-      end
-      buf[#buf + 1] = cell[1]
-    end
-    if #buf > 0 then
-      spans[#spans + 1] = { table.concat(buf), style }
+    if type(opts.right_width) == "number" and opts.right_width > 0 then
+      spans = M.fit_spans(spans, opts.right_width)
     end
     lines[#lines + 1] = spans
-  end
-
-  local order = {}
-  for _, row in ipairs(rows) do
     order[#order + 1] = row
-  end
-  table.sort(order, function(a, b)
-    if layer[a.id] ~= layer[b.id] then
-      return layer[a.id] < layer[b.id]
-    end
-    if row_of[a.id] ~= row_of[b.id] then
-      return row_of[a.id] < row_of[b.id]
-    end
-    return a.id < b.id
-  end)
-  local node_line = {}
-  for _, row in ipairs(rows) do
-    node_line[row.id] = row_of[row.id] + 1
+    node_line[row.id] = i
+    layer[row.id] = entry.depth or 0
+    row_of[row.id] = i - 1
   end
   return lines, order, node_line, layer, row_of
 end
@@ -1143,112 +959,101 @@ end
 -- actions keep working on a task. `row_lines[i]` is the buffer line of row i.
 function M.panes(tasks, opts)
   opts = type(opts) == "table" and opts or {}
-  local rows = M.rows(tasks, opts)
-  local groups = M.groups(rows)
-  local counts = M.counts(rows)
-
-  local total = {}
-  for _, task in ipairs(M.collect(tasks)) do
-    local intent = M.request_of(task)
-    total[intent] = (total[intent] or 0) + 1
+  -- The schema must see the whole request, terminal tasks included; the left
+  -- column is the request index.
+  local all_opts = {}
+  for key, value in pairs(opts) do
+    all_opts[key] = value
   end
+  all_opts.show_done = true
+  local all = M.rows(tasks, all_opts)
+  local groups = M.groups(all)
+  local counts = M.counts(all)
 
   local selected = tonumber(opts.selected_intent) or 1
-  if selected < 1 then selected = 1 end
-  if selected > #groups then selected = #groups end
+  if selected < 1 then
+    selected = 1
+  end
+  if selected > #groups then
+    selected = #groups
+  end
 
   local left_width = tonumber(opts.left_width) or 40
 
-  -- Left column: one compact line per intention, with the request's status in
-  -- words -- running, failed, done, not started -- because that is what the
-  -- human needs at a glance. The per-state counts live on the right pane's
-  -- header, where there is room for them.
+  -- Left column: one request per line. No status word, no counts: the request
+  -- itself is the index. The active request carries a marker, but the marker is
+  -- dim: the selector is the highlighted node in the PERT, not a second cursor.
   local left = {}
-  left[#left + 1] = { text = "REQUESTS", style = "bold" }
   for i, group in ipairs(groups) do
-    local word, wstyle = M.request_status(group.rows)
     local marker = i == selected and "▸ " or "  "
-    local label = group.intent ~= "" and ('"' .. group.intent .. '"') or "(no intention)"
+    local label = group.intent ~= "" and group.intent or "(no intention)"
     left[#left + 1] = {
-      spans = {
-        { marker .. M.fit(label, left_width - 18), i == selected and "bold" or "dim" },
-        { "  " },
-        { word, wstyle },
-      },
+      spans = { { marker .. M.fit(label, left_width - 2), "dim" } },
     }
   end
 
-  -- Right column: the selected intention's schema.
+  -- Right column: the selected request's PERT schema, nothing else.
   local right = {}
+  local rows = {}
+  local row_lines = {}
   if #groups == 0 then
     right[#right + 1] = { spans = { { "(no tasks)", "dim" } } }
   else
     local group = groups[selected]
-    if group.intent ~= "" then
-      right[#right + 1] = { spans = M.intent_line(group, opts, total[group.intent]) }
-      right[#right + 1] = { spans = M.intent_counts_line(group, total[group.intent]) }
-    end
-
-    -- The PERT graph: the dependency schema of the request, drawn left to
-    -- right with the arrows the DAG actually has.
-    local pert_lines, order = M.pert(group.rows, opts)
-    if #pert_lines > 0 then
-      right[#right + 1] = {
-        spans = { { "PERT", "bold" }, { "  " .. #group.rows .. " nodes", "dim" } },
-      }
-      for _, spans in ipairs(pert_lines) do
-        right[#right + 1] = { spans = spans }
-      end
-      local chain = M.critical_chain(group.rows)
-      if #chain > 1 then
-        local parts = {}
-        for _, id in ipairs(chain) do
-          parts[#parts + 1] = node_label(id)
-        end
-        right[#right + 1] = {
-          spans = { { "critical path  ", "dim" }, { table.concat(parts, " → "), "keyword" } },
-        }
+    -- The cursor model is the active tasks of this request, in schema order.
+    -- Build it first: the selected row names the node the PERT highlights.
+    local active = M.rows(tasks, opts)
+    local group_active = {}
+    for _, row in ipairs(active) do
+      if row.intent == group.intent then
+        group_active[#group_active + 1] = row
       end
     end
-
-    -- The navigable list: one line per task. The graph is the schema; this is
-    -- where the cursor and the actions (Enter, Space, r, d, s) work.
-    right[#right + 1] = { spans = { { "", "dim" } } }
-    for _, row in ipairs(group.rows) do
-      row.prefix = nil
-      row.extra_deps = nil
-      row.icon = M.status_icon(row.status)
-      row.critical = false
-      right[#right + 1] = { spans = M.row_line(row, opts), row = row }
+    local selected_row = tonumber(opts.selected_row) or 1
+    if selected_row < 1 or selected_row > #group_active then
+      selected_row = 1
+    end
+    local selected_id = group_active[selected_row] and group_active[selected_row].id or nil
+    local pert_lines, _, node_line = M.pert(group.rows, {
+      title_max = opts.title_max,
+      branch_max = opts.branch_max,
+      right_width = opts.right_width,
+      selected_id = selected_id,
+    })
+    right[#right + 1] = { spans = { { "PERT", "bold" } } }
+    for _, spans in ipairs(pert_lines) do
+      right[#right + 1] = { spans = spans }
+    end
+    -- Each task row maps to the schema line where its node sits, so j/k and the
+    -- actions still target the task the user sees highlighted.
+    for _, row in ipairs(group_active) do
+      if node_line[row.id] then
+        rows[#rows + 1] = row
+        row_lines[#row_lines + 1] = node_line[row.id] + 1
+      end
     end
   end
 
+  -- Join the two columns with the separator. Every line is clipped to its
+  -- column so the window border never eats a character.
   local lines = {}
-  for _, line in ipairs((M.summary_lines(rows))) do
-    lines[#lines + 1] = line
-  end
-  lines[#lines + 1] = ""
-
-  local display = {}
-  local row_lines = {}
   local height = math.max(#left, #right)
   for i = 1, height do
     local l = left[i]
-    local ltext = l and (l.text or (l.spans and M.text(l.spans)) or "") or ""
-    local lstyle = l and l.style or "dim"
+    local ltext = l and M.text(l.spans) or ""
     local fitted = M.fit(ltext, left_width)
     local pad = left_width - display_width(fitted)
-    if pad < 0 then pad = 0 end
+    if pad < 0 then
+      pad = 0
+    end
     local spans = {}
-    if l and type(l.spans) == "table" then
-      -- A left line with styled parts (the request status word) keeps them:
-      -- only the padding is appended.
+    if l then
       for _, span in ipairs(l.spans) do
         spans[#spans + 1] = span
       end
       spans[#spans + 1] = { string.rep(" ", pad), "dim" }
     else
-      spans[#spans + 1] = { fitted .. string.rep(" ", pad), lstyle }
+      spans[#spans + 1] = { string.rep(" ", left_width), "dim" }
     end
     spans[#spans + 1] = { " │ ", "dim" }
     local r = right[i]
@@ -1262,13 +1067,9 @@ function M.panes(tasks, opts)
       end
     end
     lines[#lines + 1] = spans
-    if r and r.row then
-      display[#display + 1] = r.row
-      row_lines[#display] = #lines
-    end
   end
 
-  return lines, display, counts, row_lines, groups, selected
+  return lines, rows, counts, row_lines, groups, selected
 end
 
 -- Draw into a maki buffer. The buffer is injected so the tests can pass a

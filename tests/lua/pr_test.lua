@@ -153,6 +153,34 @@ exit 1
 
   local no_ref, no_ref_err = git.pr_close(nil, { gh = close_gh })
   eq(no_ref, nil, "pr_close refuses without a reference")
+
+  -- pr_comment: findings are mirrored on the PR -----------------------------
+  local comment_gh = fake_gh("gh-comment", [[
+if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then
+  echo "commented"
+  exit 0
+fi
+echo "unexpected: $*" >&2
+exit 2
+]])
+  maki.fs.write(log, "")
+  local commented, comerr = git.pr_comment(42, "## review\n- **blocking** — nope", { gh = comment_gh, worktree = base })
+  eq(comerr, nil, "pr_comment has no error: " .. tostring(comerr))
+  eq(commented and commented.commented, true, "pr_comment reports the comment")
+  has(read_log(), "pr comment 42 --body ## review", "pr_comment sends gh pr comment with the body")
+  local no_body, no_body_err = git.pr_comment(42, "   ", { gh = comment_gh })
+  eq(no_body, nil, "pr_comment refuses an empty body")
+  has(tostring(no_body_err), "non-empty body", "pr_comment names the empty body")
+  local no_pr, no_pr_err = git.pr_comment(nil, "hi", { gh = comment_gh })
+  eq(no_pr, nil, "pr_comment refuses without a reference")
+  has(tostring(no_pr_err), "pull request", "pr_comment names the missing reference")
+  local fail_gh = fake_gh("gh-comment-fail", [[
+echo "boom" >&2
+exit 1
+]])
+  local failed, ferr = git.pr_comment(42, "hi", { gh = fail_gh, worktree = base })
+  eq(failed, nil, "pr_comment reports a non-zero gh")
+  has(tostring(ferr), "gh pr comment failed", "pr_comment names the command")
   eq(type(no_ref_err), "string", "the refusal explains itself")
 
   -- An empty title must be refused before anything runs.

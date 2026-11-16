@@ -491,6 +491,100 @@ local function validate_review(review)
   }
 end
 
+-- Review comments on the PR ---------------------------------------------------
+
+-- The PR a review belongs to. Runtime opens it before the review (attach_only),
+-- so the task carries it; `opts.pr` lets a caller pass it explicitly.
+local function pr_number_of(opts, task_id)
+  if type(opts.pr) == "table" and opts.pr.number then
+    return opts.pr.number
+  end
+  if type(opts.state) == "table" and type(opts.state.load) == "function" then
+    local ok, loaded = pcall(opts.state.load, opts.root)
+    if ok and type(loaded) == "table" and type(loaded.tasks) == "table" then
+      local task = loaded.tasks[task_id]
+      local pr = type(task) == "table" and task.pr or nil
+      if type(pr) == "table" and pr.number then
+        return pr.number
+      end
+    end
+  end
+  return nil
+end
+
+-- One markdown comment per review round: the exact commit, then one bullet per
+-- finding with its severity, path:line, rule and message. A human reads this
+-- on GitHub, so every finding must stand on its own.
+function M.format_comment(findings, round, sha, task)
+  if type(findings) ~= "table" or #findings == 0 then
+    return nil
+  end
+  local lines = {
+    string.format("## Metronome review — round %s", tostring(round or "?")),
+    "",
+    string.format("Reviewed commit `%s`.", tostring(sha or "?")),
+  }
+  if type(task) == "table" and is_non_empty(task.title) then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "**" .. tostring(task.title) .. "**"
+  end
+  lines[#lines + 1] = ""
+  for _, finding in ipairs(findings) do
+    local where = ""
+    if is_non_empty(finding.path) then
+      where = " `" .. tostring(finding.path)
+      if type(finding.line) == "number" then
+        where = where .. ":" .. tostring(finding.line)
+      end
+      where = where .. "`"
+    end
+    local rule = is_non_empty(finding.rule) and (" (" .. tostring(finding.rule) .. ")") or ""
+    lines[#lines + 1] = string.format("- **%s**%s%s — %s",
+      tostring(finding.severity or "finding"), where, rule, tostring(finding.message or ""))
+  end
+  return table.concat(lines, "\n")
+end
+
+-- Publish a round's findings on the PR. Best effort by contract: a missing PR,
+-- a git module without `pr_comment`, or a failed post never changes the
+-- verdict. Returns `(ok, err)` so the caller can surface `comment_error`.
+local function post_findings(opts, task_id, findings, round, sha)
+  if type(findings) ~= "table" or #findings == 0 then
+    return nil
+  end
+  local git = opts.git
+  if type(git) ~= "table" or type(git.pr_comment) ~= "function" then
+    return nil
+  end
+  local number = pr_number_of(opts, task_id)
+  if not number then
+    return nil
+  end
+  local task = nil
+  if type(opts.state) == "table" and type(opts.state.load) == "function" then
+    local ok, loaded = pcall(opts.state.load, opts.root)
+    if ok and type(loaded) == "table" and type(loaded.tasks) == "table" then
+      task = loaded.tasks[task_id]
+    end
+  end
+  local body = M.format_comment(findings, round, sha, task)
+  if not body then
+    return nil
+  end
+  local called, result, err = pcall(git.pr_comment, number, body, {
+    worktree = opts.repo,
+    gh = opts.gh,
+    timeout_ms = opts.comment_timeout_ms,
+  })
+  if not called then
+    return nil, tostring(result)
+  end
+  if not result then
+    return nil, err
+  end
+  return result
+end
+
 -- Store the review on the task. An empty findings array is omitted: maki
 -- encodes an empty table as `{}`, which the schema rejects as an array, so the
 -- only schema-safe way to say "no findings" is to leave the key out.
@@ -716,6 +810,7 @@ local function review_impl(opts)
         round = round, sha = sha, protected = true,
       }
     end
+    local _, comment_error = post_findings(opts, task_id, protected, round, sha)
 
     if round >= max_rounds then
       local escalated, eerr = M.escalate(opts.state, root, task_id, {
@@ -725,11 +820,13 @@ local function review_impl(opts)
         return {
           ok = false, error = eerr, findings = protected,
           round = round, sha = sha, protected = true,
+          comment_error = comment_error,
         }
       end
       return {
         ok = false, findings = protected, round = round, sha = sha,
         protected = true, escalated = true,
+        comment_error = comment_error,
       }
     end
 
@@ -738,11 +835,13 @@ local function review_impl(opts)
       return {
         ok = false, error = merr, findings = protected,
         round = round, sha = sha, protected = true,
+        comment_error = comment_error,
       }
     end
     return {
       ok = false, findings = protected, round = round, sha = sha,
       protected = true, escalated = false,
+      comment_error = comment_error,
     }
   end
 
@@ -836,6 +935,7 @@ local function review_impl(opts)
       round = round, sha = sha, run = run,
     }
   end
+  local _, comment_error = post_findings(opts, task_id, findings, round, sha)
 
   local unresolved = {}
   for _, finding in ipairs(findings) do
@@ -849,6 +949,7 @@ local function review_impl(opts)
     return {
       ok = true, approved = true, findings = findings,
       round = round, sha = sha, run = run,
+      comment_error = comment_error,
     }
   end
 
@@ -860,11 +961,13 @@ local function review_impl(opts)
       return {
         ok = false, error = eerr, findings = findings,
         round = round, sha = sha, run = run,
+        comment_error = comment_error,
       }
     end
     return {
       ok = false, escalated = true, findings = findings,
       round = round, sha = sha, run = run,
+      comment_error = comment_error,
     }
   end
 
@@ -873,11 +976,13 @@ local function review_impl(opts)
     return {
       ok = false, error = merr, findings = findings,
       round = round, sha = sha, run = run,
+      comment_error = comment_error,
     }
   end
   return {
     ok = false, changes_requested = true, findings = findings,
     round = round, sha = sha, run = run,
+    comment_error = comment_error,
   }
 end
 

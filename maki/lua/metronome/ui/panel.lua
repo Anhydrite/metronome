@@ -38,9 +38,30 @@ local function ui_of(panel)
   return { buf = maki.ui.buf, open_win = maki.ui.open_win }
 end
 
--- The panel takes 60% of the terminal, the left column 40 cells and the
--- separator 3. Everything the right column draws must fit in what is left, or
--- the layout silently clips the role, the branch and the tail of a PERT graph.
+-- The buffer's line count, for sizing the window to its content. A real
+-- `Buf` exposes `len()`; a test fake may only carry a `lines` table.
+local function buf_len(buf)
+  if type(buf) ~= "table" then
+    return nil
+  end
+  if type(buf.len) == "function" then
+    local ok, n = pcall(buf.len, buf)
+    if ok and type(n) == "number" then
+      return n
+    end
+  end
+  if type(buf.lines) == "table" then
+    return #buf.lines
+  end
+  return nil
+end
+
+-- The panel takes 90% of the terminal, and its content area is split 25/75
+-- between the request column and the PERT schema, the separator taking three
+-- cells. The ratio is fixed, so the separator never moves when a request has a
+-- long title or a deep graph. Everything the right column draws must fit in
+-- what is left, or the layout silently clips the branch and the tail of a PERT
+-- graph.
 local function widths_of(panel)
   local ui = panel.deps.ui
   local size = (type(ui) == "table" and ui.terminal_size) or maki.ui.terminal_size
@@ -53,18 +74,29 @@ local function widths_of(panel)
   end
   -- `maki.ui.terminal_size()` returns `{cols, rows}`; a plain number is
   -- accepted too so a test fake can stay one value.
+  local cols, rows
   if type(w) == "table" then
-    w = tonumber(w.cols) or tonumber(w[1])
+    cols = tonumber(w.cols) or tonumber(w[1])
+    rows = tonumber(w.rows) or tonumber(w[2])
+  else
+    cols = tonumber(w)
   end
-  if type(w) ~= "number" or w <= 0 then
+  if type(cols) ~= "number" or cols <= 0 then
     return nil, nil
   end
-  local panel_w = math.floor(w * 0.6)
-  local left_w = math.min(40, math.max(24, math.floor(panel_w * 0.4)))
+  local panel_w = math.floor(cols * 0.9)
+  local inner = math.max(10, panel_w - 2)
   -- The window width counts its two border cells, and the separator between
-  -- the columns is three cells (" │ "). Everything the right column draws must
-  -- fit in what is left, or the last character is swallowed by the border.
-  return left_w, math.max(20, panel_w - left_w - 5)
+  -- the columns is three cells (" │ "). The request column is a fixed 25% of
+  -- what remains, the schema takes the other 75%.
+  local usable = math.max(8, inner - 3)
+  local left_w = math.floor(usable * 0.25)
+  local right_width = usable - left_w
+  if right_width < 20 then
+    right_width = 20
+    left_w = math.max(8, usable - right_width)
+  end
+  return left_w, right_width, panel_w, rows
 end
 
 local function task_of(panel)
@@ -198,6 +230,7 @@ function M.refresh(panel)
       quiet = panel.quiet,
       frame = panel.frame,
       selected_intent = panel.intent_index,
+      selected_row = panel.cursor,
       left_width = left_width,
       right_width = right_width,
     })
@@ -255,21 +288,26 @@ function M.open(panel)
 
   panel.buf = ui.buf()
   M.refresh(panel)
+  -- The window takes 90% of the terminal in both directions. A percentage
+  -- width and the buffer's own width can disagree by a cell, which wraps every
+  -- line and breaks the border; an integer width derived from the same
+  -- computation as `widths_of` cannot.
+  local left_w, right_width, panel_w, term_rows = widths_of(panel)
+  local width = (left_w and right_width) and (left_w + 3 + right_width + 2) or "90%"
+  local content = buf_len(panel.buf) or 10
+  local max_h = term_rows and math.max(6, math.floor(term_rows * 0.9)) or nil
+  local height = max_h or math.min(math.max(content + 2, 6), 40)
   panel.win = ui.open_win(panel.buf, {
     title = "Metronome",
     anchor = "NE",
-    width = "60%",
-    height = "60%",
+    width = width,
+    height = height,
     stack = false,
-    cursor_line = true,
+    -- The selected PERT node is the only selector; a second cursor line would
+    -- be a second, invisible cursor over the task rows.
+    cursor_line = false,
     footer = {
-      { "j/k", "move" },
-      { "Enter", "focus" },
-      { "Space", "peek" },
-      { "a", "answer" },
-      { "r", "retry" },
-      { "d", "delete" },
-      { "s", "stop" },
+      { "j/k", "task" },
       { "v", "verbose" },
       { "q", "close" },
     },
@@ -293,7 +331,6 @@ function M.open(panel)
 
   M.bind(panel)
   M.bind_keys(panel)
-  M.start_animation(panel)
   return true
 end
 
@@ -328,11 +365,6 @@ end
 function M.set_quiet(panel, quiet)
   panel.quiet = quiet and true or false
   if panel.open then
-    if panel.quiet then
-      M.start_animation(panel)
-    else
-      M.stop_animation(panel)
-    end
     M.refresh(panel)
   end
   return panel.quiet
@@ -391,9 +423,10 @@ end
 
 -- Selection -----------------------------------------------------------------
 
--- `line` is a buffer line, which is what a click reports. A caller holding a
--- row index (the keyboard path and the tests) still selects that row when the
--- number does not name a task line.
+-- `line` is a buffer line, which is what a click reports. A click on a request
+-- line selects that request and its first task; a click anywhere else (blank
+-- space, the PERT header) selects nothing. Treating an unknown line as a row
+-- index is what let a click select an invisible task.
 function M.select(panel, line)
   if type(line) ~= "number" then
     return nil, "row must be a number"
@@ -405,7 +438,16 @@ function M.select(panel, line)
       break
     end
   end
-  index = index or line
+  if not index then
+    local groups = panel.groups or {}
+    if line >= 1 and line <= #groups then
+      panel.intent_index = line
+      panel.cursor = 1
+      M.refresh(panel)
+      return panel.rows[1]
+    end
+    return nil, "row is not a task"
+  end
   if index < 1 or index > #panel.rows then
     return nil, "row out of range"
   end
@@ -418,14 +460,32 @@ end
 
 function M.move(panel, delta)
   if #panel.rows == 0 then
-    return nil
+    -- The simplified layout has no task list: j/k walks the requests and the
+    -- right column redraws the selected request's schema.
+    local groups = panel.groups or {}
+    if #groups == 0 then
+      return nil
+    end
+    local target = (panel.intent_index or 1) + delta
+    if target < 1 then
+      target = 1
+    end
+    if target > #groups then
+      target = #groups
+    end
+    panel.intent_index = target
+    M.refresh(panel)
+    if panel.win and type(panel.win.set_cursor) == "function" then
+      panel.win:set_cursor(1)
+    end
+    return target
   end
   local next_index = panel.cursor + delta
   if next_index >= 1 and next_index <= #panel.rows then
     panel.cursor = next_index
-    if panel.win and type(panel.win.set_cursor) == "function" then
-      panel.win:set_cursor((panel.row_line and panel.row_line[panel.cursor]) or panel.cursor)
-    end
+    -- Re-render: the highlight follows the cursor, so moving it without a
+    -- refresh would leave the bold node behind.
+    M.refresh(panel)
     return panel.cursor
   end
   -- At the edge of the current intention, cross to the next/previous one.
@@ -433,16 +493,15 @@ function M.move(panel, delta)
   local target = (panel.intent_index or 1) + (delta > 0 and 1 or -1)
   if target < 1 or target > #groups then
     panel.cursor = delta > 0 and #panel.rows or 1
-    if panel.win and type(panel.win.set_cursor) == "function" then
-      panel.win:set_cursor((panel.row_line and panel.row_line[panel.cursor]) or panel.cursor)
-    end
+    M.refresh(panel)
     return panel.cursor
   end
   panel.intent_index = target
+  panel.cursor = 1
   M.refresh(panel)
-  panel.cursor = delta > 0 and 1 or math.max(1, #panel.rows)
-  if panel.win and type(panel.win.set_cursor) == "function" then
-    panel.win:set_cursor((panel.row_line and panel.row_line[panel.cursor]) or panel.cursor)
+  if delta < 0 then
+    panel.cursor = math.max(1, #panel.rows)
+    M.refresh(panel)
   end
   return panel.cursor
 end

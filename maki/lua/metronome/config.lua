@@ -164,6 +164,10 @@ function M.validate(config)
     if project.max_parallel ~= nil and (type(project.max_parallel) ~= "number" or project.max_parallel < 1) then
       problems[#problems + 1] = "project.max_parallel must be at least 1"
     end
+    if project.max_parallel_qualifiers ~= nil
+      and (type(project.max_parallel_qualifiers) ~= "number" or project.max_parallel_qualifiers < 1) then
+      problems[#problems + 1] = "project.max_parallel_qualifiers must be at least 1"
+    end
   end
 
   local roles = config.roles
@@ -179,12 +183,19 @@ function M.validate(config)
     end
   end
 
+  local review = config.review
+  if type(review) == "table" and review.engine ~= nil
+    and review.engine ~= "model" and review.engine ~= "no-mistakes" then
+    problems[#problems + 1] = string.format("review.engine: unknown engine %q", tostring(review.engine))
+  end
+
   if #problems > 0 then
     return nil, problems
   end
 
   -- Defaults, applied only once the config is known to be sound.
   config.project.max_parallel = config.project.max_parallel or 2
+  config.project.max_parallel_qualifiers = config.project.max_parallel_qualifiers or 4
   config.git = config.git or {}
   config.git.branch_prefix = config.git.branch_prefix or "metronome/"
   config.git.commit_style = config.git.commit_style or "conventional"
@@ -196,6 +207,8 @@ function M.validate(config)
   config.checks.timeout_secs = config.checks.timeout_secs or 600
 
   config.review = config.review or {}
+  config.review.engine = config.review.engine or "model"
+  config.review.no_mistakes_bin = config.review.no_mistakes_bin or "no-mistakes"
   config.review.max_rounds = config.review.max_rounds or 3
   config.review.require_checks_green = config.review.require_checks_green ~= false
   config.review.protected_paths = config.review.protected_paths
