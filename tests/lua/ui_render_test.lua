@@ -208,11 +208,16 @@ return function()
   eq(style_of(sel_lines, "T-…0100"), "bold", "the selected node is highlighted")
   eq(style_of(sel_lines, "T-…0102"), "run", "the other nodes keep their style")
 
-  -- panes highlights the node of the cursor row, and the request column stays
-  -- dim so there is exactly one selector.
-  local sel_pane = render.panes(diamond_tasks, { right_width = 39, selected_row = 2 })
-  eq(style_of(sel_pane, "T-…0103"), "bold", "panes highlights the selected task's node")
-  eq(style_of(sel_pane, "login"), "dim", "the request column is not a second selector")
+  -- panes only highlights a node when the user clicked one; the request line is
+  -- the default selector, so a plain render bolds no node.
+  local sel_pane = render.panes(diamond_tasks, {
+    right_width = 39, selected_row = 2, show_task_selection = true,
+  })
+  eq(style_of(sel_pane, "T-…0103"), "bold", "panes highlights an explicitly selected task's node")
+  eq(style_of(sel_pane, "login"), "bold", "the selected request is the selector")
+
+  local no_sel_pane = render.panes(diamond_tasks, { right_width = 39, selected_row = 2 })
+  eq(style_of(no_sel_pane, "T-…0103"), "run", "panes leaves nodes unhighlighted by default")
 
   -- panes: the simple two-column layout, full schema on the right.
   local pane_lines, pane_rows, _, pane_row_lines = render.panes(diamond_tasks, { right_width = 39 })
@@ -227,7 +232,58 @@ return function()
   local pane_joined = table.concat(pane_text, "\n")
   has(pane_joined, "PERT", "the right column is the PERT schema")
   has(pane_joined, "login", "the left column lists the request")
-  has(pane_joined, "T-…0100", "the merged prerequisite stays in the schema")
+  eq(pane_joined:find("T-…0100", 1, true), nil,
+    "a finished task is removed from the schema")
+
+  -- panes drops finished tasks but keeps failures and work in flight ---------
+  local mixed = {
+    { id = "T-1", title = "done", status = "merged", intent = "ship" },
+    { id = "T-2", title = "broken", status = "failed", intent = "ship" },
+    { id = "T-3", title = "moving", status = "running", intent = "ship" },
+    { id = "T-4", title = "waiting", status = "ready", intent = "ship" },
+    { id = "T-5", title = "gone", status = "deployed", intent = "old" },
+  }
+  local mixed_lines, mixed_rows, _, _, mixed_groups = render.panes(mixed)
+  eq(#mixed_groups, 1, "a request with only finished tasks is removed")
+  eq(mixed_groups[1].intent, "ship", "the request with live work stays")
+  eq(#mixed_groups[1].rows, 3, "finished tasks are dropped from the schema")
+  eq(#mixed_rows, 3, "the cursor model keeps errors and live work")
+  local mixed_text = {}
+  for _, line in ipairs(mixed_lines) do mixed_text[#mixed_text + 1] = render.text(line) end
+  local mixed_joined = table.concat(mixed_text, "\n")
+  eq(mixed_joined:find("T-1", 1, true), nil, "a merged task is not drawn")
+  has(mixed_joined, "fail", "the request column names the request state")
+  has(mixed_joined, "T-2", "a failed task stays")
+  has(mixed_joined, "T-3", "a running task stays")
+  has(mixed_joined, "T-4", "a waiting task stays")
+  eq(mixed_joined:find("old", 1, true), nil, "a fully finished request is not listed")
+
+  -- request_icon: the request carries the same state as its tasks -----------
+  eq(render.request_icon({ { status = "failed" } }), "✗", "a failed request carries a cross")
+  eq(render.request_icon({ { status = "merged" } }), "✓", "a finished request carries a check")
+  eq(render.request_icon({ { status = "ready" } }), "☐", "a request not started carries an empty box")
+  eq(render.request_icon({ { status = "running" } }, 0), render.spinner(0),
+    "a running request animates")
+  local _, _, running_word = render.request_icon({ { status = "running" } }, 0)
+  eq(running_word, "run", "the request word is short enough for the column")
+
+  -- PERT nodes animate the work in flight and mark a blocked node -----------
+  local live_rows = render.rows({
+    { id = "T-1", title = "moving", status = "running" },
+    { id = "T-2", title = "blocked", status = "awaiting_answers",
+      questions = { { id = "q", text = "?" } } },
+    { id = "T-3", title = "waiting", status = "ready" },
+    { id = "T-4", title = "broken", status = "failed" },
+  }, { frame = 0 })
+  local live_lines = render.pert(live_rows, { frame = 0 })
+  local live_text = {}
+  for _, spans in ipairs(live_lines) do live_text[#live_text + 1] = render.text(spans) end
+  local live_joined = table.concat(live_text, "\n")
+  has(live_joined, render.spinner(0), "a running node animates")
+  has(live_joined, "running", "a running node names its state")
+  has(live_joined, "?", "a blocked node carries a question mark")
+  has(live_joined, "☐", "a waiting node carries an empty box")
+  has(live_joined, "✗", "a failed node does not animate")
 
   local g_lines, g_rows, _, g_row_lines = render.lines(grouped)
   eq(g_rows[1].id, "T-20261115-0003", "display order puts the failure first")

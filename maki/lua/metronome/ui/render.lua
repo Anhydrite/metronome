@@ -241,6 +241,42 @@ function M.status_icon_style(status)
   return "ready"
 end
 
+-- The one-cell glyph a request carries in the left column. A running request
+-- animates with the same spinner as its tasks, so the index shows work in
+-- flight without spelling it out. The word and the style come from
+-- `request_status`, so the icon can never disagree with the counts.
+local REQUEST_ICON = {
+  questions = "?",
+  failed = "✗",
+  done = "✓",
+  partial = "◐",
+  ["not started"] = "☐",
+  waiting = "…",
+  empty = "·",
+}
+
+-- The request column is a quarter of the panel, so the state word is short:
+-- the icon carries the nuance and the word fits beside the request name.
+local REQUEST_WORD = {
+  questions = "ask",
+  failed = "fail",
+  running = "run",
+  done = "done",
+  partial = "part",
+  ["not started"] = "todo",
+  waiting = "wait",
+  empty = "empty",
+}
+
+function M.request_icon(rows, frame)
+  local word, style = M.request_status(rows)
+  local short = REQUEST_WORD[word] or word
+  if word == "running" then
+    return M.spinner(frame or 0), "run", short, style
+  end
+  return REQUEST_ICON[word] or "☐", style, short, style
+end
+
 -- Earliest/latest start and finish for every task of one intention, plus the
 -- slack. A task is on the critical path when its slack is zero: any delay to
 -- it delays the whole request. Durations are unit unless `row.estimate` is a
@@ -537,7 +573,9 @@ function M.tree(rows)
     seen[row.id] = true
     local extra = {}
     for _, dep in ipairs(row.depends_on_ids or {}) do
-      if dep ~= parent_of[row.id] then
+      -- A dependency the panel hides (a finished task) is not drawn as an
+      -- extra edge either: the schema only names nodes it actually shows.
+      if by_id[dep] and dep ~= parent_of[row.id] then
         local short = short_dep(dep)
         if short then
           extra[#extra + 1] = short
@@ -586,6 +624,18 @@ end
 
 local TERMINAL_STATUS = { merged = true, deployed = true, abandoned = true }
 
+-- Statuses that are actually moving. A failed or stalled task is active (it can
+-- be retried) but nothing is running, so it must not spin.
+local MOVING = {
+  qualifying = true,
+  running = true,
+  verifying = true,
+  reviewing = true,
+  changes_requested = true,
+  merging = true,
+  deploying = true,
+}
+
 -- Draw one request's dependency schema as the indented tree the README
 -- describes: one node per line, indented under its first prerequisite with
 -- `├─▶`/`└─▶`, carrying the status icon, the short id and the branch. The tree
@@ -608,10 +658,32 @@ function M.pert(rows, opts)
     local done = TERMINAL_STATUS[row.status] == true
     local spans = {}
     spans[#spans + 1] = { entry.prefix or "", "dim" }
-    local icon_style = done and "dim" or M.status_icon_style(row.status)
-    spans[#spans + 1] = { M.status_icon(row.status), icon_style }
+    -- A node that is moving carries the spinner, so the schema animates where
+    -- work is in flight. A blocked or waiting node gets a distinct glyph; a
+    -- finished one stays dim and static.
+    local icon, icon_style
+    if done then
+      icon, icon_style = M.status_icon(row.status), "dim"
+    elseif row.blocked then
+      icon, icon_style = "?", "run"
+    elseif row.waiting then
+      icon, icon_style = "☐", "ready"
+    elseif row.active and MOVING[row.status] then
+      icon, icon_style = row.spinner or M.spinner(opts.frame or 0), "run"
+    else
+      icon, icon_style = M.status_icon(row.status), M.status_icon_style(row.status)
+    end
+    spans[#spans + 1] = { icon, icon_style }
     local id_style = done and "dim" or (entry.critical and "run" or "dim")
     spans[#spans + 1] = { M.short_id(row.id), id_style }
+    -- The state comes before the title so it stays visible when the column is
+    -- narrow: the user reads whether the task is qualifying, implementing,
+    -- reviewing, failed or waiting before reading what it is about.
+    local state_text = row.detail or row.status
+    if type(state_text) == "string" and state_text ~= "" then
+      local state_style = done and "dim" or M.status_icon_style(row.status)
+      spans[#spans + 1] = { "  " .. M.fit(state_text, opts.state_max or 16), state_style }
+    end
     if type(row.title) == "string" and row.title ~= "" then
       spans[#spans + 1] = { "  " .. M.fit(row.title, opts.title_max or 22), "dim" }
     end
@@ -959,14 +1031,11 @@ end
 -- actions keep working on a task. `row_lines[i]` is the buffer line of row i.
 function M.panes(tasks, opts)
   opts = type(opts) == "table" and opts or {}
-  -- The schema must see the whole request, terminal tasks included; the left
-  -- column is the request index.
-  local all_opts = {}
-  for key, value in pairs(opts) do
-    all_opts[key] = value
-  end
-  all_opts.show_done = true
-  local all = M.rows(tasks, all_opts)
+  -- The panel shows what still needs a human. Finished tasks are dropped from
+  -- the request index and the schema, while failures, in-flight and waiting
+  -- tasks stay. A caller that wants the finished ones back passes
+  -- `show_done = true`; the live panel does not.
+  local all = M.rows(tasks, opts)
   local groups = M.groups(all)
   local counts = M.counts(all)
 
@@ -980,15 +1049,26 @@ function M.panes(tasks, opts)
 
   local left_width = tonumber(opts.left_width) or 40
 
-  -- Left column: one request per line. No status word, no counts: the request
-  -- itself is the index. The active request carries a marker, but the marker is
-  -- dim: the selector is the highlighted node in the PERT, not a second cursor.
+  -- Left column: one request per line, with its status icon. The request
+  -- itself is the index and the selector. The selected request is bold; the
+  -- PERT node is only bold when the user explicitly clicked a task.
   local left = {}
   for i, group in ipairs(groups) do
     local marker = i == selected and "▸ " or "  "
     local label = group.intent ~= "" and group.intent or "(no intention)"
+    local icon, icon_style, word, word_style = M.request_icon(group.rows, opts.frame)
+    local word_text = tostring(word or "")
+    local label_max = left_width - 4 - M.width_of(word_text) - 1
+    if label_max < 1 then
+      label_max = 1
+    end
     left[#left + 1] = {
-      spans = { { marker .. M.fit(label, left_width - 2), "dim" } },
+      spans = {
+        { marker, i == selected and "bold" or "dim" },
+        { icon .. " ", icon_style },
+        { word_text .. " ", word_style },
+        { M.fit(label, label_max), i == selected and "bold" or "dim" },
+      },
     }
   end
 
@@ -1001,7 +1081,6 @@ function M.panes(tasks, opts)
   else
     local group = groups[selected]
     -- The cursor model is the active tasks of this request, in schema order.
-    -- Build it first: the selected row names the node the PERT highlights.
     local active = M.rows(tasks, opts)
     local group_active = {}
     for _, row in ipairs(active) do
@@ -1009,12 +1088,18 @@ function M.panes(tasks, opts)
         group_active[#group_active + 1] = row
       end
     end
-    local selected_row = tonumber(opts.selected_row) or 1
-    if selected_row < 1 or selected_row > #group_active then
-      selected_row = 1
+    -- The request is the selector: no node is highlighted until the user
+    -- clicks one, which is the only way to target a task explicitly.
+    local selected_id = nil
+    if opts.show_task_selection then
+      local selected_row = tonumber(opts.selected_row) or 1
+      if selected_row < 1 or selected_row > #group_active then
+        selected_row = 1
+      end
+      selected_id = group_active[selected_row] and group_active[selected_row].id or nil
     end
-    local selected_id = group_active[selected_row] and group_active[selected_row].id or nil
     local pert_lines, _, node_line = M.pert(group.rows, {
+      frame = opts.frame,
       title_max = opts.title_max,
       branch_max = opts.branch_max,
       right_width = opts.right_width,
@@ -1024,8 +1109,8 @@ function M.panes(tasks, opts)
     for _, spans in ipairs(pert_lines) do
       right[#right + 1] = { spans = spans }
     end
-    -- Each task row maps to the schema line where its node sits, so j/k and the
-    -- actions still target the task the user sees highlighted.
+    -- Each task row maps to the schema line where its node sits, so a click on
+    -- a node can target that task and the actions know what it points at.
     for _, row in ipairs(group_active) do
       if node_line[row.id] then
         rows[#rows + 1] = row

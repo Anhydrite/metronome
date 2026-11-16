@@ -214,8 +214,8 @@ return function()
   eq(#opened[1].buf.lines > 0, true, "the buffer is filled before the window opens")
   eq(#panel.rows, 4, "open loads every task")
   eq(panel.cursor, 1, "the cursor starts on the first row")
-  eq(opened[1].cursor, panel.row_line[1], "the window cursor starts on the first task node")
-  eq(opened[1].cursor > 1, true, "the window cursor is not on the PERT header")
+  eq(opened[1].cursor, 1, "the window cursor starts on the first request line")
+  eq(opened[1].cursor, 1, "the window cursor is not on a PERT node")
 
   -- Layout: 90% of the terminal, split 25/75 --------------------------------
   -- The window takes 90% of the terminal in both directions, and the content
@@ -248,10 +248,10 @@ return function()
   local first_line = render.text(sized.buf.lines[1])
   local bar = first_line:find("│", 1, true)
   eq(type(bar), "number", "the first line carries the column separator")
-  -- Every character before the bar is ASCII once the marker glyph is folded
-  -- to one cell, so the byte count is the display column.
-  local prefix = first_line:sub(1, bar - 1):gsub("▸", "x")
-  eq(#prefix, 22, "the separator sits at a fixed 25% of the content area")
+  -- The prefix now carries a status glyph and a state word, so it is measured
+  -- in display cells rather than bytes: a one-cell glyph can be several bytes.
+  local prefix = first_line:sub(1, bar - 1)
+  eq(render.width_of(prefix), 22, "the separator sits at a fixed 25% of the content area")
 
   -- A task with no phase must not print a JSON null as a userdata.
   local peek_state = {
@@ -300,12 +300,14 @@ return function()
   -- Selection --------------------------------------------------------------
 
   eq(panel_mod.selected(panel).id, "T-20261114-d1e2", "selected is the first row")
-  eq(panel_mod.move(panel, 1), 2, "move down advances the cursor")
-  eq(panel_mod.selected(panel).id, "T-20261114-b7c1", "the cursor moved to the failure")
-  eq(opened[1].cursor, panel.row_line[2], "the window cursor follows the task line")
-  eq(panel_mod.move(panel, -1), 1, "move up rewinds the cursor")
-  eq(panel_mod.move(panel, -10), 1, "move up clamps at the first row")
-  eq(panel_mod.move(panel, 10), 4, "move down clamps at the last row")
+  -- The fixture is one request: j/k has nowhere to go and must not walk the
+  -- tasks inside the PERT. Request navigation is proven by the dedicated
+  -- multi-request block below.
+  eq(panel_mod.move(panel, 1), 1, "a single request has nowhere to move")
+  eq(panel_mod.selected(panel).id, "T-20261114-d1e2", "the selection stays on the only request")
+  eq(panel_mod.move(panel, -1), 1, "move up clamps at the only request")
+  eq(panel_mod.move(panel, -10), 1, "move up clamps at the first request")
+  eq(panel_mod.move(panel, 10), 1, "move down clamps at the last request")
 
   eq(panel_mod.select(panel, panel.row_line[3]).id, "T-20261114-a3f2", "select jumps to a row")
   eq(panel_mod.select(panel, 1).id, panel.rows[1].id,
@@ -313,6 +315,118 @@ return function()
   eq(panel_mod.select(panel, 0), nil, "select refuses row zero")
   eq(panel_mod.select(panel, 99), nil, "select refuses a row past the end")
   eq(panel_mod.select(panel, "x"), nil, "select refuses a non-number")
+
+  -- Arrows walk the requests, never the tasks inside the PERT -----------------
+  -- The left column is a request index; the right column is the selected
+  -- request's schema. j/k must change the selected request and redraw the
+  -- schema, not move an invisible task cursor inside the current request.
+  local request_tasks = {
+    ["T-20261115-1001"] = {
+      id = "T-20261115-1001", title = "auth", status = "running",
+      origin = "login", depends_on = {},
+    },
+    ["T-20261115-1002"] = {
+      id = "T-20261115-1002", title = "routes", status = "ready",
+      origin = "login", depends_on = { "T-20261115-1001" },
+    },
+    ["T-20261115-1003"] = {
+      id = "T-20261115-1003", title = "export", status = "failed",
+      origin = "export", depends_on = {},
+    },
+  }
+  local request_opened = {}
+  local request_ui = {
+    buf = ui.buf,
+    open_win = function(buf, opts)
+      local win = fake_win(buf, opts)
+      request_opened[#request_opened + 1] = win
+      return win
+    end,
+  }
+  local request_panel = new_panel({
+    state = { load = function() return { tasks = request_tasks } end },
+    ui = request_ui,
+    autocmd = function() return 0 end,
+    del_autocmd = function() end,
+  })
+  eq(panel_mod.open(request_panel), true, "the request panel opens")
+  eq(#request_panel.groups, 2, "the panel groups tasks by request")
+  eq(request_panel.groups[1].intent, "export", "the failure pulls its request first")
+  eq(request_panel.intent_index, 1, "the panel starts on the first request")
+  eq(panel_mod.selected(request_panel).id, "T-20261115-1003",
+    "the first request selects its first task")
+
+  -- The request line is the selector: it is bold and carries the window
+  -- cursor. No PERT node is bold until the user clicks one.
+  local function right_spans(line)
+    for i, span in ipairs(line) do
+      if span[1] == " │ " then
+        local out = {}
+        for j = i + 1, #line do
+          out[#out + 1] = line[j]
+        end
+        return out
+      end
+    end
+    return {}
+  end
+  local function has_bold(spans)
+    for _, span in ipairs(spans) do
+      if span[2] == "bold" then
+        return true
+      end
+    end
+    return false
+  end
+  local request_lines = request_panel.buf.lines
+  eq(request_opened[1].cursor, 1, "the window cursor starts on the first request line")
+  eq(request_lines[1][1][2], "bold", "the selected request line is bold")
+  eq(has_bold(right_spans(request_lines[request_panel.row_line[1]])), false,
+    "no PERT node is selected when the panel opens")
+
+  eq(panel_mod.move(request_panel, 1), 2, "move down selects the next request")
+  eq(request_panel.intent_index, 2, "the selected request moved")
+  eq(panel_mod.selected(request_panel).id, "T-20261115-1001",
+    "the new request selects its first task, not the previous task")
+  eq(request_panel.cursor, 1, "moving a request resets the task cursor")
+  request_lines = request_panel.buf.lines
+  eq(request_opened[1].cursor, 2, "the window cursor follows the selected request line")
+  eq(request_lines[2][1][2], "bold", "the new request line is bold")
+  eq(has_bold(right_spans(request_lines[2])), false,
+    "moving a request does not select a PERT node")
+  local second_request = render.text(request_lines[2])
+  eq(second_request:find("▸ ", 1, true) ~= nil, true,
+    "the marker follows the selected request")
+  eq(second_request:find("login", 1, true) ~= nil, true,
+    "the selected request is named")
+  eq(render.text(request_lines[2]):find("T-…1001", 1, true) ~= nil, true,
+    "the schema redraws for the selected request")
+
+  -- A click on a PERT node targets that task, but the request stays the
+  -- selector: the request line keeps the cursor and the clicked node turns bold.
+  local clicked = panel_mod.select(request_panel, request_panel.row_line[1])
+  eq(clicked.id, "T-20261115-1001", "a node click targets that task")
+  request_lines = request_panel.buf.lines
+  eq(has_bold(right_spans(request_lines[request_panel.row_line[1]])), true,
+    "the clicked node is bold")
+  eq(request_opened[1].cursor, 2, "a node click keeps the cursor on the request line")
+
+  -- A request with two tasks must not swallow the next arrow press: moving up
+  -- returns to the previous request instead of walking the login tasks.
+  eq(panel_mod.move(request_panel, -1), 1, "move up selects the previous request")
+  eq(request_panel.intent_index, 1, "the previous request is selected")
+  eq(panel_mod.selected(request_panel).id, "T-20261115-1003",
+    "the previous request selects its own first task")
+  request_lines = request_panel.buf.lines
+  eq(has_bold(right_spans(request_lines[request_panel.row_line[1]])), false,
+    "moving a request clears the clicked node")
+  eq(panel_mod.move(request_panel, -10), 1, "move up clamps at the first request")
+  eq(panel_mod.move(request_panel, 10), 2, "move down clamps at the last request")
+
+  eq(panel_mod.handle_key(request_panel, "<Down>"), "down", "the down arrow moves a request")
+  eq(panel_mod.handle_key(request_panel, "<Up>"), "up", "the up arrow moves a request")
+  eq(request_panel.intent_index, 1, "the arrows end on the first request")
+  panel_mod.close(request_panel)
 
   -- Keys -------------------------------------------------------------------
 
@@ -351,6 +465,24 @@ return function()
   tasks["T-20261114-c9d0"].status = "ready"
   panel_mod.refresh(panel)
 
+  -- a merged task leaves the PERT, but a failure and live work stay ----------
+  local function buffer_text()
+    local parts = {}
+    for _, line in ipairs(panel.buf.lines) do
+      parts[#parts + 1] = render.text(line)
+    end
+    return table.concat(parts, "\n")
+  end
+  tasks["T-20261114-c9d0"].status = "merged"
+  panel_mod.refresh(panel)
+  eq(buffer_text():find("bump deps", 1, true), nil, "a merged task leaves the PERT")
+  eq(buffer_text():find("fix login redirect", 1, true) ~= nil, true,
+    "a failed task stays in the PERT")
+  eq(buffer_text():find("export CSV", 1, true) ~= nil, true,
+    "an in-flight task stays in the PERT")
+  tasks["T-20261114-c9d0"].status = "ready"
+  panel_mod.refresh(panel)
+
   -- The highlighted line is the selected task ------------------------------
   -- The buffer starts with one summary line per bucket plus a blank line, so
   -- row i is not buffer line i. `d` must delete the task under the cursor.
@@ -364,9 +496,9 @@ return function()
   local first_row = panel_rows[1]
   local picked = panel_mod.select(panel, panel.row_line[1])
   eq(picked and picked.id, first_row.id, "selecting a buffer line selects its task")
-  eq(panel.win.cursor, panel.row_line[1], "the window cursor sits on the task line")
+  eq(panel.win.cursor, 1, "the window cursor sits on the request line")
   panel_mod.move(panel, 1)
-  eq(panel.win.cursor, panel.row_line[2], "moving down moves the cursor one task line")
+  eq(panel.win.cursor, 1, "moving a request keeps the cursor on its line")
 
   -- d deletes the selected task --------------------------------------------
   local selected_index
@@ -512,7 +644,16 @@ return function()
   eq(panel.quiet, false, "v turned quiet off")
   eq(panel_mod.handle_key(panel, "v"), "quiet", "v switches back to quiet")
   eq(panel.quiet, true, "v turned quiet on")
-  eq(#scheduled, 0, "the static panel schedules no spinner")
+  eq(#scheduled >= 1, true, "the open panel schedules the spinner")
+
+  -- The spinner is a view of work in flight, not a quiet-mode feature: the
+  -- PERT keeps animating in verbose mode too.
+  panel_mod.stop_animation(panel)
+  panel.animating = false
+  panel_mod.set_quiet(panel, false)
+  eq(panel_mod.start_animation(panel), true, "verbose mode still animates")
+  panel_mod.stop_animation(panel)
+  panel_mod.set_quiet(panel, true)
 
   -- Close and toggle -------------------------------------------------------
 

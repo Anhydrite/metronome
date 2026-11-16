@@ -16,7 +16,7 @@
 --   r      retry a failed task
 --   a      answer the pending question round
 --   +/-    rate a review finding (calibration)
---   j/k    move the cursor
+--   j/k    move between requests
 --   q      close
 
 local M = {}
@@ -194,6 +194,10 @@ function M.new(opts)
     buf = nil,
     rows = {},
     cursor = 1,
+    -- The request is the selector. A PERT node is only targeted when the user
+    -- clicks it; `task_selected` says whether the cursor names a task or the
+    -- selected request's first task.
+    task_selected = false,
     counts = { questions = 0, failures = 0, review = 0, progress = 0 },
     autocmds = {},
     -- Quiet mode is the Metronome default: the panel shows a spinner instead
@@ -216,6 +220,17 @@ function M.load(panel)
   return state
 end
 
+-- The buffer line the window cursor belongs on. With the two-column layout the
+-- selector is the request line, not a PERT node: the first column is one line
+-- per request, so the selected request's index is its line. The flat fallback
+-- keeps the task line.
+local function selected_line(panel)
+  if type(panel.groups) == "table" then
+    return panel.intent_index or 1
+  end
+  return (panel.row_line and panel.row_line[panel.cursor]) or panel.cursor
+end
+
 -- Rebuild the buffer from the projection. Returns the attention counts, which
 -- the bell and `a` both use.
 function M.refresh(panel)
@@ -231,6 +246,7 @@ function M.refresh(panel)
       frame = panel.frame,
       selected_intent = panel.intent_index,
       selected_row = panel.cursor,
+      show_task_selection = panel.task_selected == true,
       left_width = left_width,
       right_width = right_width,
     })
@@ -269,7 +285,7 @@ function M.refresh(panel)
     panel.buf:set_lines(lines)
   end
   if panel.win and type(panel.win.set_cursor) == "function" then
-    panel.win:set_cursor(panel.row_line[panel.cursor] or panel.cursor)
+    panel.win:set_cursor(selected_line(panel))
   end
   return counts
 end
@@ -307,18 +323,21 @@ function M.open(panel)
     -- be a second, invisible cursor over the task rows.
     cursor_line = false,
     footer = {
-      { "j/k", "task" },
+      { "j/k", "request" },
       { "v", "verbose" },
       { "q", "close" },
     },
   })
   panel.open = true
 
+  -- Start the spinner loop as soon as the panel is visible: the PERT and the
+  -- request index animate every task that is still moving.
+  M.start_animation(panel)
+
   -- `refresh` ran before the window existed, so the initial cursor row was
   -- never applied. Set it now that the window can take it.
   if type(panel.win.set_cursor) == "function" then
-    local line = (panel.row_line and panel.row_line[panel.cursor]) or panel.cursor
-    panel.win:set_cursor(line)
+    panel.win:set_cursor(selected_line(panel))
   end
 
   if type(panel.buf.on) == "function" then
@@ -346,6 +365,7 @@ function M.close(panel)
   panel.open = false
   panel.rows = {}
   panel.cursor = 1
+  panel.task_selected = false
   panel.counts = { questions = 0, failures = 0, review = 0, progress = 0 }
   panel.frame = 0
   return true
@@ -381,10 +401,11 @@ function M.tick(panel)
 end
 
 -- A single deferred loop, not a timer object: the callback re-arms itself only
--- while the panel is open and quiet, so closing stops the animation without
--- needing a cancel handle.
+-- while the panel is open, so closing stops the animation without needing a
+-- cancel handle. It runs in verbose mode too: the PERT spinner shows work in
+-- flight, and quiet mode only hides the agent's narration.
 function M.start_animation(panel)
-  if not panel.open or not panel.quiet or panel.animating then
+  if not panel.open or panel.animating then
     return false
   end
   local defer = defer_of(panel)
@@ -393,7 +414,7 @@ function M.start_animation(panel)
   end
   panel.animating = true
   defer(function()
-    if not panel.open or not panel.quiet then
+    if not panel.open then
       panel.animating = false
       return
     end
@@ -424,9 +445,10 @@ end
 -- Selection -----------------------------------------------------------------
 
 -- `line` is a buffer line, which is what a click reports. A click on a request
--- line selects that request and its first task; a click anywhere else (blank
--- space, the PERT header) selects nothing. Treating an unknown line as a row
--- index is what let a click select an invisible task.
+-- line selects that request; a click on a PERT node targets that task without
+-- changing the request. A click anywhere else (blank space, the PERT header)
+-- selects nothing. Treating an unknown line as a row index is what let a click
+-- select an invisible task.
 function M.select(panel, line)
   if type(line) ~= "number" then
     return nil, "row must be a number"
@@ -443,6 +465,7 @@ function M.select(panel, line)
     if line >= 1 and line <= #groups then
       panel.intent_index = line
       panel.cursor = 1
+      panel.task_selected = false
       M.refresh(panel)
       return panel.rows[1]
     end
@@ -452,17 +475,19 @@ function M.select(panel, line)
     return nil, "row out of range"
   end
   panel.cursor = index
-  if panel.win and type(panel.win.set_cursor) == "function" then
-    panel.win:set_cursor((panel.row_line and panel.row_line[index]) or index)
-  end
+  -- An explicit node click is the only way to target a task; the request stays
+  -- selected and the node turns bold to show what the actions will hit.
+  panel.task_selected = true
+  M.refresh(panel)
   return panel.rows[index]
 end
 
 function M.move(panel, delta)
-  if #panel.rows == 0 then
-    -- The simplified layout has no task list: j/k walks the requests and the
-    -- right column redraws the selected request's schema.
-    local groups = panel.groups or {}
+  -- The simplified layout is a request index: the left column lists the
+  -- requests, the right column draws the selected request's PERT. j/k walks
+  -- the requests, never the tasks inside the schema.
+  if type(panel.groups) == "table" then
+    local groups = panel.groups
     if #groups == 0 then
       return nil
     end
@@ -474,12 +499,15 @@ function M.move(panel, delta)
       target = #groups
     end
     panel.intent_index = target
+    -- A request change starts on its first task and clears any clicked node:
+    -- keeping the old index would target a task of the previous request.
+    panel.cursor = 1
+    panel.task_selected = false
     M.refresh(panel)
-    if panel.win and type(panel.win.set_cursor) == "function" then
-      panel.win:set_cursor(1)
-    end
     return target
   end
+  -- A renderer without the request index (the flat fallback) has no groups:
+  -- j/k walks the task rows as before.
   local next_index = panel.cursor + delta
   if next_index >= 1 and next_index <= #panel.rows then
     panel.cursor = next_index
@@ -488,21 +516,9 @@ function M.move(panel, delta)
     M.refresh(panel)
     return panel.cursor
   end
-  -- At the edge of the current intention, cross to the next/previous one.
-  local groups = panel.groups or {}
-  local target = (panel.intent_index or 1) + (delta > 0 and 1 or -1)
-  if target < 1 or target > #groups then
-    panel.cursor = delta > 0 and #panel.rows or 1
-    M.refresh(panel)
-    return panel.cursor
-  end
-  panel.intent_index = target
-  panel.cursor = 1
+  -- At the edge of the list, clamp instead of wrapping.
+  panel.cursor = delta > 0 and #panel.rows or 1
   M.refresh(panel)
-  if delta < 0 then
-    panel.cursor = math.max(1, #panel.rows)
-    M.refresh(panel)
-  end
   return panel.cursor
 end
 
