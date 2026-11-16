@@ -2158,6 +2158,21 @@ function M.new(deps)
     deploying = true,
   }
 
+  -- A dead task leaves two kinds of GitHub debris: the PR the pipeline
+  -- attached to the task, which `close_open_pr` closes, and a PR the gate
+  -- opened without ever attaching it, which is only visible by branch name.
+  -- Prune is the reconciler that closes the second kind and deletes both
+  -- branches. It runs after every abandon/stop, best effort: the task is
+  -- already dead, and a GitHub failure must not turn that decision into an
+  -- error.
+  local function prune_dead_task()
+    local called, result = pcall(runtime.prune, {})
+    if not called then
+      return { ok = false, error = tostring(result) }
+    end
+    return result
+  end
+
   -- Stop an in-flight task: cancel its spawn (which ends the role session it
   -- opened) and park it as `abandoned` with a reason the journal keeps. A
   -- stopped task is restartable with `retry`.
@@ -2184,7 +2199,7 @@ function M.new(deps)
     if not moved then
       return { ok = false, error = err }
     end
-    return { ok = true, task = moved, stopped = true }
+    return { ok = true, task = moved, stopped = true, prune = prune_dead_task() }
   end
 
   function runtime.abandon(input)
@@ -2194,7 +2209,7 @@ function M.new(deps)
     if not moved then
       return { ok = false, error = err }
     end
-    return { ok = true, task = moved }
+    return { ok = true, task = moved, prune = prune_dead_task() }
   end
 
   function runtime.delete(input)

@@ -906,6 +906,55 @@ return function()
   has(table.concat(pruned.deleted, ","), "metronome/orphan", "a branch with no task is deleted")
   eq(table.concat(pruned.deleted, ","):find("metronome/live", 1, true), nil,
     "a live task's branch is kept")
+
+  -- Stop and abandon prune the dead task's GitHub debris automatically ------
+  local auto_tasks = {
+    STOPME = { id = "STOPME", status = "running", branch = "metronome/stopme" },
+    ABANDONME = { id = "ABANDONME", status = "failed", branch = "metronome/abandonme" },
+  }
+  local auto_closed, auto_deleted = {}, {}
+  local auto_deps = {
+    config = prune_deps.config,
+    roles = prune_deps.roles,
+    state = {
+      load = function() return { tasks = auto_tasks } end,
+      transition = function(_, id, status) auto_tasks[id].status = status; return auto_tasks[id] end,
+      set_fields = function() return true end,
+    },
+    git = {
+      list_open_prs = function()
+        return {
+          { number = 21, head = "metronome/stopme" },
+          { number = 22, head = "metronome/abandonme" },
+        }
+      end,
+      list_branches = function() return { "metronome/stopme", "metronome/abandonme" } end,
+      pr_close = function(ref) auto_closed[#auto_closed + 1] = ref; return { closed = true } end,
+      delete_branch = function(_, branch) auto_deleted[#auto_deleted + 1] = branch; return { ok = true } end,
+    },
+    paths = prune_deps.paths,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {}, qualify = {}, questions = {}, analyze = {}, implement = {},
+    checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
+    pipeline = {}, calibrate = {}, fence = {}, mode = {},
+  }
+  local rt12 = runtime.new(auto_deps)
+  local stopped = rt12.stop({ id = "STOPME" })
+  eq(stopped.ok, true, "stop succeeds")
+  eq(stopped.stopped, true, "stop marks the task stopped")
+  eq(auto_tasks.STOPME.status, "abandoned", "stop parks the task as abandoned")
+  eq(stopped.prune and stopped.prune.ok, true, "stop prunes automatically")
+  has(table.concat(auto_closed, ","), "21", "stop closes the orphan PR")
+  has(table.concat(auto_deleted, ","), "metronome/stopme", "stop deletes the dead branch")
+
+  local abandoned = rt12.abandon({ id = "ABANDONME" })
+  eq(abandoned.ok, true, "abandon succeeds")
+  eq(auto_tasks.ABANDONME.status, "abandoned", "abandon parks the task as abandoned")
+  eq(abandoned.prune and abandoned.prune.ok, true, "abandon prunes automatically")
+  has(table.concat(auto_closed, ","), "22", "abandon closes the orphan PR")
+  has(table.concat(auto_deleted, ","), "metronome/abandonme", "abandon deletes the dead branch")
+
   -- config: a base branch that does not exist on origin is refused ----------
   local cfg_root = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "runtime-config")
   maki.fs.rm(cfg_root, { recursive = true })

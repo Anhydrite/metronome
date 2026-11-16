@@ -120,7 +120,7 @@ M.COMMANDS = {
   },
   {
     name = "abandon",
-    description = "Archive a task.",
+    description = "Archive a task, then prune orphan PRs and branches.",
     usage = "/metronome abandon <id>",
     build = function(rest)
       return need_id(rest, "abandon")
@@ -136,7 +136,7 @@ M.COMMANDS = {
   },
   {
     name = "stop",
-    description = "Stop an in-flight task: cancel its session and park it as abandoned.",
+    description = "Stop an in-flight task: cancel its session and park it as abandoned, then prune orphan PRs and branches.",
     usage = "/metronome stop <id>",
     build = function(rest)
       return need_id(rest, "stop")

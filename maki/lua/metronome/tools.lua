@@ -85,7 +85,7 @@ function M.definitions()
     },
     {
       name = "metronome_abandon",
-      description = "Archive a task.",
+      description = "Archive a task, then prune orphan pull requests and branches.",
       permission = "run",
       schema = {
         type = "object",
@@ -106,7 +106,7 @@ function M.definitions()
     },
     {
       name = "metronome_stop",
-      description = "Stop an in-flight task: cancel its session and park it as abandoned with a reason. The task can be restarted with metronome_retry.",
+      description = "Stop an in-flight task: cancel its session and park it as abandoned with a reason. The task can be restarted with metronome_retry. Orphan pull requests and branches are pruned automatically.",
       permission = "run",
       schema = {
         type = "object",
