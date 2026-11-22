@@ -1749,6 +1749,7 @@ auto_deploy = false
     pr = { number = 3, url = "u", state = "open" },
   }
   local transient_impl = 0
+  local transient_tick_opts = nil
   local transient_deps = {
     config = {
       load = function()
@@ -1783,6 +1784,7 @@ auto_deploy = false
     deploy = { run = function() return { ok = true } end },
     pipeline = {
       tick = function(opts)
+        transient_tick_opts = opts
         if transient_record.status == "ready" then
           opts.dispatch({ id = "T1" })
         end
@@ -1828,7 +1830,22 @@ auto_deploy = false
   eq(transient_record.pr and transient_record.pr.state, "open", "the failure leaves the PR open")
   has(tostring(transient_record.failure_reason), "network",
     "the persisted reason names the cause")
-
+  eq(transient_tick_opts and transient_tick_opts.max_attempts, 0,
+    "the drain tick never retries a failed task: schedule_retry is the only authority")
+  eq(type(transient_tick_opts and transient_tick_opts.recover), "table",
+    "the drain tick still receives the recovery policy")
+  local typed_result = type(rt_transient.last_background) == "table"
+    and type(rt_transient.last_background.results) == "table"
+    and rt_transient.last_background.results[1] or nil
+  eq(type(typed_result), "table", "the drain result keeps the per-task record")
+  eq(typed_result and typed_result.failure and typed_result.failure.cause, "network",
+    "the per-task result carries the typed failure")
+  eq(typed_result and typed_result.decision and typed_result.decision.action, "auto_retry",
+    "the per-task result carries the resume decision")
+  eq(typed_result and typed_result.retrying, true,
+    "the per-task result says the task is being retried")
+  eq(type(typed_result and typed_result.error), "string",
+    "the per-task result keeps the raw step error")
   -- Fire the deferred retry: it runs the task again, and the second failure
   -- exhausts the budget, which is the only thing that escalates.
   deferred[1].fn()
@@ -1899,6 +1916,75 @@ auto_deploy = false
   has(tostring(notified[1]), "auth", "the escalation names the auth cause")
   has(tostring(notified[1]), "credentials", "the escalation names the remedy")
   eq(auth_record.branch, "metronome/t1", "the auth failure keeps the branch")
+
+  -- A late automatic retry must not run a task a human already resumed -----
+  --
+  -- The backoff timer and a human retry can both decide to restart the same
+  -- task. Only the first may run it: `running -> running` is a legal no-op, so
+  -- without a status guard the same worktree would get two run_tasks (and two
+  -- sessions) at once.
+  local guard_record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
+  local guard_impl = 0
+  local guard_deferred = {}
+  local guard_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(guard_record),
+    implement = {
+      run = function()
+        guard_impl = guard_impl + 1
+        if guard_impl == 1 then
+          return { ok = false, error = "could not resolve host: github.com" }
+        end
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if guard_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    defer = function(fn, ms)
+      guard_deferred[#guard_deferred + 1] = { fn = fn, ms = ms }
+      return {}
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_guard = runtime.new(guard_deps)
+  rt_guard.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_guard.run_pending()
+  eq(guard_impl, 1, "the transient failure happened once")
+  eq(guard_record.status, "failed", "the task is parked for its automatic retry")
+  eq(#guard_deferred, 1, "the automatic retry is armed")
+  -- The user resumes before the backoff elapses; this run succeeds.
+  local guard_retry = rt_guard.retry({ id = "T1" }, { session = "S1" })
+  eq(guard_retry and guard_retry.ok, true, "the human retry is accepted")
+  rt_guard.run_pending()
+  eq(guard_impl, 2, "the human retry runs the task once")
+  eq(guard_record.status, "pr_open", "the human retry carried the task forward")
+  -- The armed automatic retry fires late: the task is no longer failed.
+  guard_deferred[1].fn()
+  rt_guard.run_pending()
+  eq(guard_impl, 2, "a late automatic retry is skipped instead of running the task twice")
 
   -- The drain never runs a task on its own turn -----------------------------
   --
@@ -2165,6 +2251,16 @@ auto_deploy = false
   eq(retry_record.status, "failed", "the retried task failed again")
   eq(retry_record.failure and retry_record.failure.attempts, 1,
     "a human retry resets the attempt budget")
+  eq(rt_retry.last_background and rt_retry.last_background.failure
+    and rt_retry.last_background.failure.cause, "network",
+    "the background record carries the typed failure, not only the raw error")
+  eq(rt_retry.last_background and rt_retry.last_background.decision
+    and rt_retry.last_background.decision.action, "auto_retry",
+    "the background record carries the resume decision")
+  eq(rt_retry.last_background and rt_retry.last_background.retrying, true,
+    "the background record says the task is being retried")
+  eq(type(rt_retry.last_background and rt_retry.last_background.error), "string",
+    "the background record keeps the raw step error")
 
   maki.session.notify = saved_notify
   maki.session.prompt = saved_prompt

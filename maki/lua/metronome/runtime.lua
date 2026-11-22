@@ -1669,6 +1669,13 @@ function M.new(deps)
       end
     end
 
+    -- `schedule_retry` is the single authority for automatic retries: it owns
+    -- the attempt streak and the `auto_retry` opt-out, neither of which the
+    -- tick's `retry_ready` can see. If the tick also picked a failed task, the
+    -- backoff timer and this drain could dispatch the same worktree twice, and
+    -- the tick would use its own default bound instead of the project's. A zero
+    -- bound makes `retry_ready` select nothing; the drain only starts `ready`
+    -- tasks here, and a failed task is resumed by its own scheduled job.
     for _ = 1, 32 do
       local tick = deps.pipeline.tick({
         state = deps.state,
@@ -1677,6 +1684,8 @@ function M.new(deps)
         stall = false,
         apply = true,
         dispatch = dispatch_one,
+        max_attempts = 0,
+        recover = recover_module(),
       })
       if not tick.ok then
         return { ok = false, error = tick.error, results = results }
@@ -1983,6 +1992,17 @@ function M.new(deps)
     retry_attempts[task_id] = attempt
     local cause = tostring(type(failure) == "table" and failure.cause or "transient")
     local function job()
+      -- One dispatch per failure: if a human retry, a `/reload` resume or an
+      -- earlier scheduled job already moved the task back to `running`, this
+      -- job has nothing to do. Without this guard, `running -> running` is a
+      -- legal no-op and the same worktree would get two concurrent run_tasks.
+      local loaded = deps.state.load(paths.root)
+      local current = loaded and loaded.tasks and loaded.tasks[task_id]
+      if current and current.status ~= "failed" then
+        log(paths, "automatic retry of " .. tostring(task_id)
+          .. " skipped: the task is no longer failed")
+        return nil
+      end
       -- The legal `failed -> running` edge is the resume: it also settles the
       -- attempt deadline so the next failure counts from this attempt.
       local moved, merr = deps.state.transition(paths.root, task_id, "running", { phase = phase })
@@ -2012,6 +2032,27 @@ function M.new(deps)
     return enqueue()
   end
 
+  -- The typed failure record returned by `handle_failure` is what the
+  -- background record (and `results`) must expose: consumers there need the
+  -- diagnosis and the resume action, not only the raw step error. The step's
+  -- own fields (`ok`, `error`, `phase`, ...) are kept so existing callers that
+  -- read them keep working.
+  local function with_failure(result, handled)
+    if type(handled) ~= "table" then
+      return result
+    end
+    local out = type(result) == "table" and result or { ok = false }
+    out.ok = false
+    out.failure = handled.failure or out.failure
+    out.decision = handled.decision or out.decision
+    out.retrying = handled.retrying
+    out.reason = handled.reason or out.reason
+    if out.error == nil then
+      out.error = handled.reason or handled.error
+    end
+    return out
+  end
+
   -- One dispatch of one task with the failure policy attached. Every entry
   -- point — the scheduler, a human retry, a resume after reload, an automatic
   -- retry — goes through here, so a failure is always typed, always persisted
@@ -2022,8 +2063,9 @@ function M.new(deps)
       -- A crash is a failure like any other: nothing raised here reaches the
       -- drain, and the task keeps the artefacts a retry resumes from.
       local failed = { ok = false, error = tostring(result) }
+      failed = with_failure(failed,
+        handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed))
       runtime.last_background = failed
-      handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed)
       return failed
     end
     if type(result) == "table" and result.conflict then
@@ -2033,22 +2075,25 @@ function M.new(deps)
       ok, result = again_ok, again
       if not ok then
         local failed = { ok = false, error = tostring(result) }
+        failed = with_failure(failed,
+          handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed))
         runtime.last_background = failed
-        handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed)
         return failed
       end
     end
     if type(result) ~= "table" then
       result = { ok = false, error = tostring(result) }
     end
-    runtime.last_background = result
     if result.ok then
       -- The streak is over: the next failure, if any, starts from attempt one.
       retry_attempts[task_id] = nil
+      runtime.last_background = result
       return result
     end
     local err = result.error or result.reason or result
-    handle_failure(opts, paths, cfg, runner, session, task_id, err, result)
+    result = with_failure(result,
+      handle_failure(opts, paths, cfg, runner, session, task_id, err, result))
+    runtime.last_background = result
     return result
   end
 
