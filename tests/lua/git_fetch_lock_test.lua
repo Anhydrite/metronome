@@ -2,24 +2,26 @@
 --
 -- Concurrent git.fetch calls on the same clone raced on refs and died with
 -- "cannot lock ref 'refs/remotes/origin/...'", failing tasks that had nothing
--- wrong with them. This file pins the three halves of the fix:
+-- wrong with them. This file pins the halves of the fix:
 --
---   (a) four concurrent fetches on one clone all succeed, and only one
---       `git fetch` child is started for them (the others reuse its result);
---   (b) the advisory lock file is gone after a failing fetch, and a later
---       fetch still works -- a fetch that fails must not wedge the clone;
---   (c) ref contention stderr classifies as git_lock/transient/retryable,
---       while unrelated failures stay the generic git_error.
+--   (a) a fetch is single-flight per (repository, remote): one call starts one
+--       `git fetch` child, the in-flight fetch is registered under a key that
+--       names its remote, and the registry is empty again afterwards;
+--   (b) four fetches started from four real processes on one clone never
+--       overlap inside git and all succeed -- the pre-fix race, observed
+--       without depending on an async primitive the test host may not have;
+--   (c) the advisory lock is released when the fetch raises, and an abandoned
+--       lock is taken over instead of wedging the clone;
+--   (d) ref contention stderr classifies as git_lock/transient/retryable for
+--       fetch, while unrelated failures and push rejections keep their cause.
 --
--- Everything runs real git against a throwaway bare remote. The remote carries
--- many refs, the shape that made the production race visible. The ref-lock
--- collision itself is timing-dependent, so the pre-fix failure is pinned by a
--- deterministic signal instead: how many `git fetch` children the four
--- callers start. Before the fix each caller starts its own (four); after it,
--- one fetch runs and the other three reuse its result.
+-- Everything runs real git against a throwaway bare remote, seeded with many
+-- refs: that is the shape the pipeline hits (an epic branch per task) and the
+-- one that made the production collision visible.
 
 return function()
   local git = load_module("git")
+  local root = maki.uv.cwd()
   local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "git-fetch-lock")
   maki.fs.rm(base, { recursive = true })
   maki.fs.mkdir(base, { parents = true })
@@ -53,8 +55,7 @@ return function()
   eq(code, 0, "initial push: " .. out:sub(1, 80))
 
   -- Many refs on the remote: a fetch then writes many remote-tracking files,
-  -- the shape the pipeline hits (an epic branch per task) and the one that made
-  -- the production collision visible.
+  -- the shape the pipeline hits and the one that made the race visible.
   code, out = sh({
     "sh", "-c",
     'head=$(git rev-parse HEAD) || exit 1; i=0; '
@@ -64,73 +65,165 @@ return function()
   }, remote)
   eq(code, 0, "remote seeded with many branches: " .. out:sub(1, 80))
 
-  -- (a) Four concurrent fetches on one clone --------------------------------
+  -- (a) Single-flight, keyed by the remote ---------------------------------
 
-  -- Count the `git fetch` children the module really starts. The serialized
-  -- path goes through M.run for that command, so overriding it is an honest
-  -- seam: four callers, one fetch.
+  local lock, lock_err = git.fetch_lock_path(repo)
+  eq(type(lock), "string", "the lock path is derived from the common git dir: " .. tostring(lock_err))
+  eq(git.fetch_key(lock, "origin") ~= git.fetch_key(lock, "no-mistakes"), true,
+    "the in-process key names the remote: origin and no-mistakes differ")
+  eq(git.fetch_key(lock, "origin"), git.fetch_key(lock, "origin"),
+    "the in-process key is stable for the same remote")
+
+  -- The fetch goes through M.run, so counting `git fetch` children there is an
+  -- honest seam, and the registry can be inspected while the child would run.
   local real_run = git.run
-  local fetch_children = 0
+  local children, registered, other_registered = 0, nil, nil
   git.run = function(args, opts)
     if type(args) == "table" then
       for _, arg in ipairs(args) do
         if arg == "fetch" then
-          fetch_children = fetch_children + 1
+          children = children + 1
+          registered = git.fetch_in_flight[git.fetch_key(lock, "origin")]
+          other_registered = git.fetch_in_flight[git.fetch_key(lock, "no-mistakes")]
           break
         end
       end
     end
     return real_run(args, opts)
   end
+  local fetched, ferr = git.fetch(repo, "origin")
+  git.run = real_run
 
-  -- A child that fails raises, so gather reports git.fetch's error text rather
-  -- than a bare nil first return.
-  local function fetch_once()
-    local value, err = git.fetch(repo, "origin")
-    if value == true then
-      return true
-    end
-    error("fetch failed: " .. tostring(err), 0)
+  eq(fetched, true, "the fetch succeeds: " .. tostring(ferr))
+  eq(children, 1, "one fetch call starts exactly one git fetch child")
+  eq(type(registered), "table", "the in-flight fetch is registered under (lock, remote)")
+  eq(other_registered, nil,
+    "a caller for another remote does not see the origin fetch as its own")
+  eq(git.fetch_in_flight[git.fetch_key(lock, "origin")], nil,
+    "the registry is empty once the fetch returns")
+  eq(maki.fs.metadata(lock), nil, "the lock is released after a successful fetch")
+
+  -- (b) Four concurrent fetches from four real processes --------------------
+  --
+  -- The host has no async primitive the test can rely on, so the concurrency
+  -- comes from the clone itself: its remote runs a wrapper around
+  -- git-upload-pack that sleeps and records whether another fetch was already
+  -- inside it. Two holds of that marker are the ref race, observed from the
+  -- filesystem. Pre-fix (no serialization) the four fetches overlap; after the
+  -- fix the repository lock serializes them, and all four still succeed.
+
+  local events = maki.fs.joinpath(base, "events.log")
+  local marker = maki.fs.joinpath(base, "in-fetch.d")
+  local slow = maki.fs.joinpath(base, "slow-upload-pack.sh")
+  local function q(s)
+    return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
   end
+  maki.fs.write(slow, table.concat({
+    "#!/bin/sh",
+    "# One fetch at a time per clone is the contract under test: a second",
+    "# caller inside this block is a ref race in the making.",
+    "if ! mkdir " .. q(marker) .. " 2>/dev/null; then",
+    "  printf 'overlap\\n' >> " .. q(events),
+    "fi",
+    "sleep 1",
+    "rmdir " .. q(marker) .. " 2>/dev/null",
+    "printf 'run\\n' >> " .. q(events),
+    'exec "$(git --exec-path)/git-upload-pack" "$@"',
+    "",
+  }, "\n"))
+  code, out = sh({ "chmod", "+x", slow })
+  eq(code, 0, "slow upload-pack is executable: " .. out:sub(1, 80))
+  code, out = sh({ "git", "config", "remote.origin.uploadpack", slow }, repo)
+  eq(code, 0, "the clone's origin uses the slow upload-pack: " .. out:sub(1, 80))
 
-  local results
-  if maki.async and type(maki.async.gather) == "function" then
-    results = maki.async.gather({ fetch_once, fetch_once, fetch_once, fetch_once })
-  else
-    -- No concurrency primitive: the four calls still have to succeed, they
-    -- just cannot overlap. Only the success count is meaningful here.
-    results = {}
-    for i = 1, 4 do
-      local value, err = git.fetch(repo, "origin")
-      results[i] = { ok = true, value = value, err = err }
-    end
+  local jobs = {}
+  for i = 1, 4 do
+    local child_out = maki.fs.joinpath(base, "child-" .. i .. ".txt")
+    local driver = maki.fs.joinpath(base, "driver-" .. i .. ".lua")
+    maki.fs.write(driver, table.concat({
+      "-- Fetch once and leave the outcome for the parent to read.",
+      'local child_git = load_module("git")',
+      string.format("local value, err = child_git.fetch(%q, %q)", repo, "origin"),
+      string.format('maki.fs.write(%q, tostring(value) .. "\\t" .. tostring(err))', child_out),
+      "",
+    }, "\n"))
+    local job = maki.fn.jobstart({
+      "env", "METRONOME_E2E_DRIVER=" .. driver, "maki", "--trust", "index", "README.md",
+    }, { cwd = root, scope = "plugin" })
+    eq(type(job), "number", "fetch child " .. i .. " started")
+    jobs[#jobs + 1] = job
+  end
+  for _, job in ipairs(jobs) do
+    maki.fn.jobwait(job, 120000)
   end
 
   local succeeded, first_err = 0, nil
-  for _, entry in ipairs(results) do
-    if entry.ok and entry.value == true then
+  for i = 1, 4 do
+    local text = maki.fs.read(maki.fs.joinpath(base, "child-" .. i .. ".txt")) or ""
+    local value, err = text:match("^(.-)\t(.*)$")
+    if value == "true" then
       succeeded = succeeded + 1
-    elseif entry.err then
-      first_err = first_err or tostring(entry.err)
+    elseif err and err ~= "nil" then
+      first_err = first_err or err
     end
   end
   eq(succeeded, 4,
     "four concurrent fetches on one clone all succeed"
       .. (first_err and (": " .. first_err) or ""))
 
-  if maki.async and type(maki.async.gather) == "function" then
-    eq(fetch_children, 1,
-      "the concurrent fetches share a single git fetch child (started "
-        .. tostring(fetch_children) .. ")")
+  local log = maki.fs.read(events) or ""
+  local runs, overlaps = 0, 0
+  for line in log:gmatch("[^\n]+") do
+    if line == "run" then
+      runs = runs + 1
+    elseif line == "overlap" then
+      overlaps = overlaps + 1
+    end
   end
+  eq(runs, 4, "each of the four callers ran its own fetch (ran " .. tostring(runs) .. ")")
+  eq(overlaps, 0,
+    "the four fetches never overlapped inside git (saw " .. tostring(overlaps)
+      .. " overlap(s): that is the ref race)")
 
+  -- The slow upload-pack is a test detail; the rest of the file talks to the
+  -- plain local remote again.
+  sh({ "git", "config", "--unset", "remote.origin.uploadpack" }, repo)
+
+  -- (c) The lock survives neither an error nor an abandoned owner -----------
+
+  -- An error raised *inside* the fetch must still give the lock back. The
+  -- raise happens below M.fetch's own pcall in run_fetch, which is the path a
+  -- cancelled or broken child takes.
+  local raising = 0
+  git.run = function(args, opts)
+    if type(args) == "table" then
+      for _, arg in ipairs(args) do
+        if arg == "fetch" then
+          raising = raising + 1
+          error("injected: fetch died", 0)
+        end
+      end
+    end
+    return real_run(args, opts)
+  end
+  local raised, raised_err, raised_diag = git.fetch(repo, "origin")
   git.run = real_run
+  eq(raising, 1, "the injected run seam was reached once")
+  eq(raised, nil, "a fetch that raises does not succeed")
+  eq(type(raised_err), "string", "a fetch that raises explains itself")
+  eq(raised_diag and raised_diag.what, "fetch", "the raise is reported as a fetch failure")
+  eq(maki.fs.metadata(lock), nil, "the lock is removed when the fetch raises")
 
-  -- (b) The lock is released on the error path ------------------------------
+  local after_raise, after_raise_err = git.fetch(repo, "origin")
+  eq(after_raise, true, "a fetch after the raise succeeds: " .. tostring(after_raise_err))
 
-  local lock = maki.fs.joinpath(repo, ".git", "metronome-fetch.lock")
+  -- A local remote that does not exist makes git fail after the lock is taken;
+  -- the lock still has to come back off.
+  local bad, bad_err = git.fetch(repo, "nope")
+  eq(bad, nil, "a fetch from a missing remote fails: " .. tostring(bad_err))
+  eq(maki.fs.metadata(lock), nil, "the lock is removed after a failed fetch")
 
-  -- A held lock must not hang the caller: the wait is bounded, and the error
+  -- A fresh lock belongs to a live fetch: the wait is bounded, and the error
   -- names the cause so the caller can retry instead of failing the task.
   maki.fs.write(lock, "held by the test\n")
   local blocked, blocked_err, blocked_diag = git.fetch(repo, "origin", { lock_timeout_ms = 150 })
@@ -139,21 +232,29 @@ return function()
   has(blocked_err or "", "git_lock", "the timeout error names git_lock")
   eq(blocked_diag and blocked_diag.cause, "git_lock", "the timeout diag carries cause git_lock")
   eq(blocked_diag and blocked_diag.transient, true, "the timeout diag is transient")
+  eq(blocked_diag and blocked_diag.retryable, true, "the timeout diag is retryable")
   maki.fs.rm(lock, { force = true })
 
-  -- A failing git command inside the fetch must still drop the lock. A missing
-  -- remote is the cheapest real failure: the lock is taken, git fails, the
-  -- lock has to come back off.
-  local bad, bad_err = git.fetch(repo, "nope")
-  eq(bad, nil, "a fetch from a missing remote fails: " .. tostring(bad_err))
-  local leftover = maki.fs.metadata(lock)
-  eq(leftover, nil, "the fetch lock is removed after a failed fetch")
+  -- A lock whose owner is gone -- a cancelled task, a crashed maki -- must be
+  -- taken over, not polled until the pipeline gives up. A child that has
+  -- already exited plays the crashed owner: its pid is real and dead.
+  local dead_code, dead_out = sh({ "sh", "-c", "echo $$" })
+  local dead_pid = tonumber((dead_out or ""):match("%d+"))
+  eq(dead_code, 0, "a throwaway process ran: " .. (dead_out or ""):sub(1, 40))
+  eq(type(dead_pid), "number", "its pid is readable")
+  maki.fs.write(lock, string.format("pid=%d time=%d\n", dead_pid, os.time() * 1000 - 30000))
+  local recovered, recovered_err = git.fetch(repo, "origin", { lock_timeout_ms = 10000 })
+  eq(recovered, true, "a lock left by a dead owner is taken over: " .. tostring(recovered_err))
+  eq(maki.fs.metadata(lock), nil, "the recovered lock is released after the fetch")
 
-  local again, again_err = git.fetch(repo, "origin")
-  eq(again, true, "a fetch after the failure succeeds: " .. tostring(again_err))
-  eq(maki.fs.metadata(lock), nil, "the fetch lock is removed after a successful fetch")
+  -- A lock nobody released and nobody owns any more is taken over on age too:
+  -- that is the crash with no pid recorded at all.
+  maki.fs.write(lock, string.format("pid=0 time=%d\n", os.time() * 1000 - 600000))
+  local reclaimed, reclaimed_err = git.fetch(repo, "origin", { lock_timeout_ms = 5000 })
+  eq(reclaimed, true, "an abandoned lock is taken over: " .. tostring(reclaimed_err))
+  eq(maki.fs.metadata(lock), nil, "the taken-over lock is released after the fetch")
 
-  -- (c) Ref contention classifies as git_lock -------------------------------
+  -- (d) Ref contention classifies as git_lock -------------------------------
 
   local lock_strings = {
     "error: cannot lock ref 'refs/remotes/origin/metronome/epic/x': is at a but expected b",
@@ -182,4 +283,16 @@ return function()
   eq(other.cause, "git_error", "an unrelated fetch failure stays git_error")
   eq(other.transient, nil, "an unrelated failure is not transient")
   eq(other.retryable, nil, "an unrelated failure is not retryable")
+
+  -- A push that mentions a ref update is a rejection, not transient ref
+  -- contention: the caller has to rebase, so the hint must not say "retry".
+  local push = git.classify("push", {
+    code = 1,
+    stderr = "error: failed to update ref 'refs/heads/x'\n"
+      .. " ! [rejected]        x -> x (non-fast-forward)\n"
+      .. "error: failed to push some refs to 'origin'",
+    command = "git push origin x",
+  })
+  eq(push.cause, "push_rejected", "a push refusal keeps its specific cause")
+  eq(push.transient, nil, "a push refusal is not transient")
 end

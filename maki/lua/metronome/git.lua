@@ -122,19 +122,8 @@ function M.classify(what, result)
     return haystack:find(needle, 1, true) ~= nil
   end
 
-  -- Ref-lock contention is not a broken clone: two git processes touched the
-  -- same ref at once. It is transient and retryable, so it gets its own cause
-  -- (and a remedy that names it) instead of the generic "inspect the output".
-  -- "cannot lock ref 'refs/...'" and "cannot lock ref" are the same message.
   local cause, message, hint, transient, retryable
-  if has("cannot lock ref") or has("unable to update local ref")
-    or has("failed to update ref") then
-    cause = "git_lock"
-    message = "another git operation holds a ref of this repository"
-    hint = "wait for the in-flight fetch to finish and retry; the ref contention is transient"
-    transient = true
-    retryable = true
-  elseif what == "worktree add" then
+  if what == "worktree add" then
     if has("a branch named") then
       cause = "branch_exists"
       message = "the task branch already exists"
@@ -153,6 +142,19 @@ function M.classify(what, result)
       cause = "remote_missing"
       message = "the remote is not reachable"
       hint = "check the remote name/URL with `git remote -v`"
+    elseif what == "fetch" and (has("cannot lock ref")
+      or has("unable to update local ref") or has("failed to update ref")) then
+      -- Ref-lock contention is not a broken clone: another git process touched
+      -- the same ref at once. It is transient and retryable, so it gets its own
+      -- cause (and a remedy that names it) instead of the generic "inspect the
+      -- output". Only fetch says so: on a push, "failed to update ref" is part
+      -- of a rejection the caller must handle differently, so it keeps the more
+      -- specific cause below.
+      cause = "git_lock"
+      message = "another git operation holds a ref of this repository"
+      hint = "wait for the in-flight fetch to finish and retry; the ref contention is transient"
+      transient = true
+      retryable = true
     elseif what == "push" and (has("non-fast-forward") or has("[rejected]")
       or has("failed to push some refs") or has("fetch first")) then
       cause = "push_rejected"
@@ -321,16 +323,64 @@ end
 -- for a race. Since tasks run as separate processes, the guard has to live on
 -- disk. One advisory lock file per repository, taken for the whole fetch,
 -- queues the callers; an in-process registry keeps a single process from even
--- reaching that point, and a caller that finds a fetch already in flight waits
--- for it and reuses its result instead of starting a second one.
+-- reaching that point, and a caller that finds the same fetch already in
+-- flight waits for it and reuses its result instead of starting a second one.
+--
+-- The in-process registry is keyed by (lock, remote): the runtime fetches
+-- `origin` while a task rebases and `no-mistakes` while the gate runs, and a
+-- caller that reused the other remote's result would resolve stale or missing
+-- mirror refs. The lock file stays per repository, because git's refs are.
 
 local FETCH_LOCK_NAME = "metronome-fetch.lock"
-local FETCH_LOCK_WAIT_MS = 30000
+local FETCH_TIMEOUT_MS = 60000
+-- The wait has to outlast the fetch a caller is queued behind: with a bound
+-- shorter than the command timeout, a slow but healthy fetch made every waiter
+-- give up with git_lock just before the lock came back.
+local FETCH_LOCK_WAIT_MS = FETCH_TIMEOUT_MS + 15000
+-- A lock nobody released -- a cancelled task, a crashed maki -- must not wedge
+-- the clone forever. Past this age it is stale and gets taken over. The bound
+-- stays below FETCH_LOCK_WAIT_MS so a queued caller reclaims an abandoned lock
+-- before its own wait runs out, and above FETCH_TIMEOUT_MS so a slow but
+-- healthy fetch is never taken over.
+local FETCH_LOCK_STALE_MS = FETCH_TIMEOUT_MS + 10000
+-- A dead owner is spotted much sooner than the age bound, but not so soon that
+-- a lock written a moment ago is taken over by mistake.
+local FETCH_LOCK_DEAD_PID_GRACE_MS = 5000
 local FETCH_LOCK_POLL_MS = 20
 local FETCH_LOCK_MAX_POLL_MS = 250
+-- Ref contention is transient even with the disk lock held (a push, a rebase
+-- or the gate may be touching the same refs), so the fetch itself retries a
+-- couple of times before reporting git_lock.
+local FETCH_RETRY_DELAYS_MS = { 100, 400 }
 
--- lock path -> the fetch currently in flight in this process.
+-- registry key -> the fetch currently in flight in this process.
 local fetch_in_flight = {}
+-- Exposed so a test can prove the registry is empty after a fetch and that the
+-- key distinguishes remotes; callers keep to M.fetch.
+M.fetch_in_flight = fetch_in_flight
+
+local function now_ms()
+  return os.time() * 1000
+end
+
+local function own_pid()
+  local uv = maki.uv
+  if type(uv) == "table" and type(uv.os_getpid) == "function" then
+    local called, pid = pcall(uv.os_getpid)
+    if called and tonumber(pid) then
+      return tonumber(pid)
+    end
+  end
+  return nil
+end
+
+local function process_alive(pid)
+  if not pid then
+    return true
+  end
+  local result = run({ "sh", "-c", 'kill -0 "$1" 2>/dev/null', "sh", tostring(pid) })
+  return result == nil or result.ok
+end
 
 -- Suspend cooperatively for `ms`. maki.async.sleep lets the other tasks (and
 -- the UI) run; the `sleep` child is only for a host that has no async sleep,
@@ -380,23 +430,85 @@ function M.fetch_lock_path(repo)
   return maki.fs.joinpath(dir, FETCH_LOCK_NAME)
 end
 
+-- The registry key pairs the repository lock with the remote, so a fetch of
+-- `no-mistakes` never reuses the result of an `origin` fetch.
+function M.fetch_key(lock, remote)
+  return tostring(lock) .. "\0" .. tostring(remote or "origin")
+end
+
+local function lock_owner(path)
+  local text = maki.fs.read(path)
+  if type(text) ~= "string" then
+    return nil
+  end
+  local pid = tonumber(text:match("pid=(%d+)"))
+  if pid == 0 then
+    -- 0 is what the writer uses when the host exposes no pid: "unknown", not
+    -- "process group". A liveness check on it would always answer yes.
+    pid = nil
+  end
+  return {
+    raw = text,
+    ts = tonumber(text:match("time=(%d+)")),
+    pid = pid,
+  }
+end
+
+-- A lock is stale when its owner is demonstrably gone: either it is old enough
+-- that no fetch could still hold it (every fetch is bounded by
+-- FETCH_TIMEOUT_MS) or its recorded process no longer exists. The file is
+-- re-read before it is removed, so a lock taken over meanwhile is left alone.
+-- A lock with no readable owner (an older release's empty file, a truncated
+-- write) is treated as held: only the timestamp this module writes can prove
+-- that its owner is gone.
+local function take_over_stale_lock(path)
+  local owner = lock_owner(path)
+  if not owner or not owner.ts then
+    return false
+  end
+  local age = now_ms() - owner.ts
+  local abandoned = age >= FETCH_LOCK_STALE_MS
+  if not abandoned and owner.pid and age >= FETCH_LOCK_DEAD_PID_GRACE_MS then
+    abandoned = not process_alive(owner.pid)
+  end
+  if not abandoned then
+    return false
+  end
+  local again = lock_owner(path)
+  if again and again.raw ~= owner.raw then
+    return false
+  end
+  maki.fs.rm(path, { force = true })
+  return true
+end
+
 -- Create the lock file if and only if nobody else holds it. `set -C` gives the
 -- shell noclobber, which is O_EXCL: the create is atomic, so two processes can
--- never both win. maki.fs has no exclusive create, hence the one-line child.
+-- never both win. The owner (pid + timestamp) is written in the same create so
+-- a later caller can tell an abandoned lock from a live one. maki.fs has no
+-- exclusive create, hence the one-line child.
 local function try_lock(path)
-  local result = run({ "sh", "-c", 'set -C; : > "$1"', "sh", path })
-  return result ~= nil and result.ok
+  local pid = own_pid()
+  local owner = string.format("pid=%s time=%d", pid and tostring(pid) or "0", now_ms())
+  local result = run({
+    "sh", "-c", 'set -C; printf %s "$2" > "$1"', "sh", path, owner,
+  })
+  if result ~= nil and result.ok then
+    return true
+  end
+  return take_over_stale_lock(path)
 end
 
 local function release_lock(path)
   maki.fs.rm(path, { force = true })
 end
 
-local function lock_diag(lock, timeout_ms)
+local function lock_diag(lock, timeout_ms, remote)
   return {
     cause = "git_lock",
     what = "fetch",
     command = "git fetch",
+    remote = remote,
     message = "another fetch is already running for this repository",
     hint = "wait for the in-flight fetch to finish, then retry; ref contention is transient",
     detail = string.format("timed out after %dms waiting for %s", timeout_ms, lock),
@@ -405,10 +517,15 @@ local function lock_diag(lock, timeout_ms)
   }
 end
 
-local function do_fetch(repo, remote)
+local function fetch_command(repo, remote)
   -- Through M.run so a test can count the fetch children; the lock helpers
   -- above stay on the private run and never appear in that count.
-  local result, err = M.run({ "git", "-C", repo, "fetch", remote or "origin", "--prune" })
+  return M.run({ "git", "-C", repo, "fetch", remote or "origin", "--prune" },
+    { timeout_ms = FETCH_TIMEOUT_MS })
+end
+
+local function do_fetch(repo, remote)
+  local result, err = fetch_command(repo, remote)
   if not result then
     return nil, err
   end
@@ -418,14 +535,29 @@ local function do_fetch(repo, remote)
   return true
 end
 
+-- Ref contention is not a broken clone, so a fetch that loses a ref race is
+-- retried in place (with the lock still held) instead of failing the task --
+-- callers of M.fetch do not retry on their own.
+local function do_fetch_with_retry(repo, remote)
+  local value, err, diag = do_fetch(repo, remote)
+  local attempt = 0
+  while value == nil and type(diag) == "table" and diag.cause == "git_lock"
+    and attempt < #FETCH_RETRY_DELAYS_MS do
+    attempt = attempt + 1
+    pause(FETCH_RETRY_DELAYS_MS[attempt])
+    value, err, diag = do_fetch(repo, remote)
+  end
+  return value, err, diag
+end
+
 -- Take the lock, run the fetch, and always give the lock back -- including when
 -- the command fails, so a failed fetch never wedges the clone.
 local function run_fetch(repo, remote, lock, timeout_ms)
   if not wait_bounded(function() return try_lock(lock) end, timeout_ms) then
-    local diag = lock_diag(lock, timeout_ms)
+    local diag = lock_diag(lock, timeout_ms, remote)
     return nil, M.describe(diag), diag
   end
-  local ok, value, err, diag = pcall(do_fetch, repo, remote)
+  local ok, value, err, diag = pcall(do_fetch_with_retry, repo, remote)
   release_lock(lock)
   if not ok then
     error(value, 0)
@@ -436,35 +568,48 @@ end
 -- Fetch the base so a new task starts from what the remote has now, not from
 -- whatever this checkout happened to hold.
 --
--- Concurrent callers for the same repository are serialized: the first one
--- fetches and the others wait for it and reuse its result. `opts.lock_timeout_ms`
--- bounds that wait (a test uses a short bound; the pipeline keeps the default).
+-- Concurrent callers for the same repository and remote are serialized: the
+-- first one fetches and the others wait for it and reuse its result. A caller
+-- for another remote queues on the disk lock and runs its own fetch, because
+-- its refs are not the ones the in-flight fetch updates.
+-- `opts.lock_timeout_ms` bounds the wait (a test uses a short bound; the
+-- pipeline keeps the default, which outlasts a whole fetch).
 function M.fetch(repo, remote, opts)
   opts = opts or {}
+  remote = remote or "origin"
   local timeout_ms = tonumber(opts.lock_timeout_ms) or FETCH_LOCK_WAIT_MS
   local lock, lock_err = M.fetch_lock_path(repo)
   if not lock then
     return nil, lock_err
   end
 
-  local owner = fetch_in_flight[lock]
+  local key = M.fetch_key(lock, remote)
+  local owner = fetch_in_flight[key]
   if owner then
     wait_bounded(function() return owner.done end, timeout_ms)
     if not owner.done then
-      local diag = lock_diag(lock, timeout_ms)
+      local diag = lock_diag(lock, timeout_ms, remote)
       return nil, M.describe(diag), diag
     end
     return owner.value, owner.err, owner.diag
   end
 
-  local record = { done = false }
-  fetch_in_flight[lock] = record
+  local record = { done = false, remote = remote }
+  fetch_in_flight[key] = record
   local ok, value, err, diag = pcall(run_fetch, repo, remote, lock, timeout_ms)
   if not ok then
-    value, err, diag = nil, "fetch failed [git_error]: " .. tostring(value)
+    -- A raise inside the fetch is reported with the same shape as a git
+    -- failure, and the lock has already been released by run_fetch.
+    local raised = {
+      cause = "git_error", what = "fetch", command = "git fetch",
+      message = "the fetch was interrupted", hint = "inspect the command output and retry",
+      detail = tostring(value),
+      transient = true, retryable = true,
+    }
+    value, err, diag = nil, M.describe(raised), raised
   end
   record.value, record.err, record.diag, record.done = value, err, diag, true
-  fetch_in_flight[lock] = nil
+  fetch_in_flight[key] = nil
   return value, err, diag
 end
 
