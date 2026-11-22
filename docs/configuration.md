@@ -121,6 +121,7 @@ A failure refuses the binding: `init` writes no state, `config` leaves `config.t
 | `auto_merge` | boolean | `false` | Merge without asking. Off by default: the pipeline opens the PR and waits. |
 | `method` | `"squash"`, `"merge"` or `"rebase"` | `"squash"` | Flag passed to `gh pr merge`. |
 | `auto_rebase` | boolean | `true` | Rebase the branch on the fresh base before merging. |
+| `max_conflict_retries` | integer, 0–10 | `2` | How many conflict resolutions are attempted before escalating to the human. |
 
 ## `[deploy]`
 
