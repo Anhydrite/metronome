@@ -61,6 +61,8 @@ protected_paths = ["review-rules.md", "AGENTS.md", ".metronome/", "deploy.md"]
 auto_merge = false
 method = "squash"
 auto_rebase = true
+# How many conflict resolutions are attempted before escalating to the human.
+max_conflict_retries = 2
 
 [deploy]
 auto_deploy = false

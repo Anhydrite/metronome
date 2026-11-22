@@ -277,6 +277,116 @@ exit 1
   eq(reopened_task and reopened_task.pr and reopened_task.pr.number, 7, "pr_open stores the existing PR")
   eq(reopened_task and reopened_task.status, "pr_open", "pr_open moves the task on")
 
+  -- A repair re-enters pr_open while the previous PR is still open. Reusing it
+  -- must send no `pr close` and no `pr create` at all: that close/create pair
+  -- is the PR loop of T-20261122-0033.
+  local created4, cerr4 = state.create(root, { id = "T-20261114-c004", title = "repair", status = "reviewing" })
+  eq(cerr4, nil, "repair task created: " .. tostring(cerr4))
+  local attached_open, aoerr = git.pr_attach(state, root, "T-20261114-c004", {
+    number = 51,
+    url = "https://github.com/example/repo/pull/51",
+    state = "open",
+  })
+  eq(aoerr, nil, "the open PR is attached: " .. tostring(aoerr))
+
+  maki.fs.write(log, "")
+  local reused, rerr4 = git.pr_open(state, root, "T-20261114-c004", {
+    title = "feat: add export",
+    body = "because finance",
+    base = "main",
+    head = "metronome/T-20261114-c004",
+    worktree = base,
+    gh = ok_gh,
+    attach_only = true,
+  })
+  eq(rerr4, nil, "pr_open reusing an open PR has no error: " .. tostring(rerr4))
+  eq(reused and reused.number, 51, "pr_open returns the PR already carried by the task")
+  eq(reused and reused.state, "open", "the reused PR keeps its state")
+  eq(read_log(), "", "reusing an open PR runs no gh command")
+
+  local reused_again, rerr5 = git.pr_open(state, root, "T-20261114-c004", {
+    title = "feat: add export",
+    base = "main",
+    head = "metronome/T-20261114-c004",
+    worktree = base,
+    gh = ok_gh,
+    attach_only = true,
+  })
+  eq(rerr5, nil, "a second repair reuses the same PR: " .. tostring(rerr5))
+  eq(reused_again and reused_again.number, 51, "a second repair returns the same PR")
+  eq(read_log(), "", "a second repair still runs no gh command")
+
+  -- Reusing works through the moving path too (attach_only unset): the task is
+  -- moved on, but the PR is not closed and recreated.
+  local moved_reuse, mreerr = git.pr_open(state, root, "T-20261114-c004", {
+    title = "feat: add export",
+    base = "main",
+    head = "metronome/T-20261114-c004",
+    worktree = base,
+    gh = ok_gh,
+  })
+  eq(mreerr, nil, "reusing and moving has no error: " .. tostring(mreerr))
+  eq(moved_reuse and moved_reuse.number, 51, "the moving path returns the reused PR")
+  eq(state.load(root).tasks["T-20261114-c004"].status, "pr_open", "the reused task moves on")
+  eq(read_log(), "", "the moving path runs no gh command either")
+
+  -- A whole repair cycle opens exactly one PR: reused on every later pass.
+  local created6, cerr6 = state.create(root, { id = "T-20261114-c006", title = "cycle", status = "reviewing" })
+  eq(cerr6, nil, "cycle task created: " .. tostring(cerr6))
+  maki.fs.write(log, "")
+  local cycle_first, cferr = git.pr_open(state, root, "T-20261114-c006", {
+    title = "feat: add export",
+    base = "main",
+    head = "metronome/T-20261114-c006",
+    worktree = base,
+    gh = ok_gh,
+    attach_only = true,
+  })
+  eq(cferr, nil, "the first pass opens the PR: " .. tostring(cferr))
+  eq(cycle_first and cycle_first.number, 42, "the first pass returns the new PR")
+  for _ = 1, 3 do
+    local again, aerr2 = git.pr_open(state, root, "T-20261114-c006", {
+      title = "feat: add export",
+      base = "main",
+      head = "metronome/T-20261114-c006",
+      worktree = base,
+      gh = ok_gh,
+      attach_only = true,
+    })
+    eq(aerr2, nil, "a repair pass reuses the PR: " .. tostring(aerr2))
+    eq(again and again.number, 42, "a repair pass returns the first PR")
+  end
+  local cycle_log = read_log()
+  local creates = 0
+  for line in cycle_log:gmatch("[^\n]+") do
+    if line:match("^pr create") then
+      creates = creates + 1
+    end
+  end
+  eq(creates, 1, "one pr create for the whole repair cycle")
+  eq(cycle_log:find("pr close", 1, true), nil, "no pr close during a repair")
+
+  -- A closed PR is not an open one: a new PR is opened.
+  local created7, cerr7 = state.create(root, { id = "T-20261114-c007", title = "closed pr", status = "reviewing" })
+  eq(cerr7, nil, "closed-PR task created: " .. tostring(cerr7))
+  git.pr_attach(state, root, "T-20261114-c007", {
+    number = 9,
+    url = "https://github.com/example/repo/pull/9",
+    state = "closed",
+  })
+  maki.fs.write(log, "")
+  local reopened_closed, rcerr = git.pr_open(state, root, "T-20261114-c007", {
+    title = "feat: add export",
+    base = "main",
+    head = "metronome/T-20261114-c007",
+    worktree = base,
+    gh = ok_gh,
+    attach_only = true,
+  })
+  eq(rcerr, nil, "a closed PR does not block a new one: " .. tostring(rcerr))
+  eq(reopened_closed and reopened_closed.number, 42, "a new PR is opened after a closed one")
+  has(read_log(), "pr create", "a closed PR leads to a pr create")
+
   -- pr_exists but nothing to look up: still an error, never a nil success.
   local nofind, nferr = git.pr_create({
     title = "feat: add export",

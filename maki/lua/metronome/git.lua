@@ -10,6 +10,8 @@
 
 local M = {}
 
+local fs = maki.fs
+
 -- The stable, locale-independent sentinel a caller branches on when a commit
 -- found nothing left to record. It is a value this module owns, never a
 -- substring of git's output: git answers in the user's language ("rien à
@@ -619,10 +621,58 @@ function M.reset_hard(worktree, sha)
   return M.head_sha(worktree)
 end
 
+-- The conflict markers git leaves in an unmerged file: a hunk starts at
+-- `<<<<<<<` and closes at `>>>>>>>`. Reading the file is the only way to show
+-- the caller the exact lines the repair must decide between; `git diff` on an
+-- unmerged path prints a combined diff, not the marked-up file.
+local function conflict_hunks(worktree, files)
+  local hunks = {}
+  for _, path in ipairs(files or {}) do
+    local read_ok, text = pcall(fs.read, fs.joinpath(worktree, path))
+    if read_ok and type(text) == "string" then
+      local lines = {}
+      local current = nil
+      local start = nil
+      local number = 0
+      for line in (text .. "\n"):gmatch("(.-)\n") do
+        number = number + 1
+        if line:match("^<<<<<<<") then
+          current = { line }
+          start = number
+        elseif current then
+          current[#current + 1] = line
+          if line:match("^>>>>>>>") then
+            hunks[#hunks + 1] = {
+              file = path,
+              start = start,
+              text = table.concat(current, "\n"),
+            }
+            current = nil
+          end
+        end
+      end
+      -- A block left unterminated by a truncated file is not a usable hunk:
+      -- only closed marker blocks are reported, nothing is made up.
+    end
+  end
+  return hunks
+end
+
+-- The commit a failed rebase could not replay: git names it in
+-- "error: could not apply <sha>... <subject>". It is read, never invented: a
+-- rebase that failed before replaying (a bad upstream, a dirty tree) leaves it
+-- nil.
+local function replay_commit(result)
+  local output = (result.stderr or "") .. "\n" .. (result.stdout or "")
+  return output:match("could not apply (%x+)")
+end
+
 -- Rebase the task branch onto the freshest base. A conflict is not a crash:
--- the unmerged files are named, the rebase is aborted so the worktree is left
--- clean, and the caller gets a message it can act on. The branch head is
--- untouched by a failed rebase, so a retry starts from the same commit.
+-- the unmerged files, the conflict hunks and the commit that could not be
+-- replayed are named, the rebase is aborted so the worktree is left clean, and
+-- the caller gets a message it can act on. The branch head is untouched by a
+-- failed rebase, so a retry starts from the same commit. Every detail comes
+-- from git's own output; what git did not say stays nil.
 function M.rebase(worktree, upstream)
   if type(worktree) ~= "string" or worktree == "" then
     return nil, "rebase needs a worktree"
@@ -644,11 +694,24 @@ function M.rebase(worktree, upstream)
         end
       end
     end
+    -- The hunks must be read before the abort: `git rebase --abort` restores
+    -- the branch and removes the marked-up files.
+    local hunks = conflict_hunks(worktree, conflicts)
+    local commit = replay_commit(result)
     run({ "git", "-C", worktree, "rebase", "--abort" })
+    local command = "git rebase " .. upstream
     local files = #conflicts > 0 and table.concat(conflicts, ", ") or "unknown"
-    return nil, string.format("rebase failed (conflicts: %s): %s",
-      files, first_line(result.stderr) or "no output"),
-      { conflict = #conflicts > 0 and conflicts or nil }
+    local detail = first_line(result.stderr) or first_line(result.stdout) or "no output"
+    return nil, string.format(
+      "rebase failed on %s (conflicts: %s): %s; resolve the conflict and re-run `%s`",
+      upstream, files, detail, command),
+      {
+        conflict = #conflicts > 0 and conflicts or nil,
+        hunks = #hunks > 0 and hunks or nil,
+        commit = commit,
+        upstream = upstream,
+        command = command,
+      }
   end
   return M.head_sha(worktree)
 end
@@ -1086,20 +1149,28 @@ end
 --
 -- The PR is stored before the move so a refused transition still leaves the
 -- work visible: the caller can retry the move without opening a second PR.
+--
+-- A repair re-enters this step while the previous PR is still open, so an open
+-- PR carried by the task is reused as-is: closing it and opening a second one
+-- only produced a close/create pair per repair round (the PR loop of
+-- T-20261122-0033). Closing a PR stays what `pr_close` is for -- an explicit
+-- abandonment -- and is never done here. A new PR is opened only when the task
+-- carries no open one.
 function M.pr_open(state, root, task_id, opts)
   opts = opts or {}
-  -- A retry must not accumulate pull requests. Close the previous open one
-  -- first; a merged or already-closed PR is left alone.
   local loaded = type(state.load) == "function" and state.load(root) or nil
   local existing = loaded and loaded.tasks and loaded.tasks[task_id]
     and loaded.tasks[task_id].pr or nil
   if existing and existing.number
-    and existing.state ~= "merged" and existing.state ~= "closed" then
-    pcall(M.pr_close, existing.number, {
-      gh = opts.gh,
-      worktree = opts.worktree,
-      timeout_ms = opts.timeout_ms,
-    })
+    and (existing.state == "open" or existing.state == nil) then
+    if opts.attach_only then
+      return existing
+    end
+    local moved, terr = state.transition(root, task_id, "pr_open", { phase = opts.phase or "review" })
+    if not moved then
+      return nil, terr
+    end
+    return existing
   end
   local pr, err = M.pr_create(opts)
   if not pr then

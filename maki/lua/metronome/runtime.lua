@@ -69,10 +69,6 @@ end
 
 -- Statuses in which another pilot already owns the task: a review round, a fix
 -- round, a check run, a pull request waiting on a human, a merge or a deploy.
--- A dispatch that reaches `run_task` in one of these would put a second pilot
--- on the same worktree, racing the one that moved the task there. `ready`,
--- `running`, `failed` and `abandoned` are not in the set: a fresh dispatch, a
--- retry and a resume all legitimately start from them.
 local OWNED_STATUSES = {
   awaiting_answers = true,
   verifying = true,
@@ -87,7 +83,6 @@ local OWNED_STATUSES = {
 
 -- Statuses that prove a review round's fix turn is no longer ours: the task was
 -- resumed by another driver, shipped, or parked while the round was running.
--- Fixing it then would re-implement a task that has moved on.
 local REVIEW_ROUND_LOST = {
   running = true,
   pr_open = true,
@@ -428,6 +423,7 @@ local function render_config(answers)
   lines[#lines + 1] = "auto_merge = " .. b(answers.auto_merge)
   lines[#lines + 1] = "method = " .. toml_string(merge.method or "squash")
   lines[#lines + 1] = "auto_rebase = " .. b(merge.auto_rebase ~= false)
+  lines[#lines + 1] = "max_conflict_retries = " .. s(merge.max_conflict_retries or 2)
   lines[#lines + 1] = ""
   lines[#lines + 1] = "[deploy]"
   lines[#lines + 1] = "auto_deploy = " .. b(answers.auto_deploy)
@@ -770,8 +766,18 @@ function M.new(deps)
   -- How many times a task may be redone on a fresh base. A base that keeps
   -- moving is a real situation (several PRs merging), so the bound is a count,
   -- not a lifetime flag: a task that repaired one conflict can still repair
-  -- the next one.
-  local MAX_CONFLICT_REPAIRS = 3
+  -- the next one. The bound is the project's (`merge.max_conflict_retries`,
+  -- default 2), never a constant here: a project that wants a tighter or a
+  -- looser repair budget must be able to say so.
+  local DEFAULT_CONFLICT_RETRIES = 2
+
+  local function conflict_retry_bound(cfg)
+    local configured = cfg and cfg.merge and tonumber(cfg.merge.max_conflict_retries)
+    if configured ~= nil then
+      return configured
+    end
+    return DEFAULT_CONFLICT_RETRIES
+  end
 
   local function conflict_repairs(task)
     local n = tonumber(task and task.conflict_retries)
@@ -779,6 +785,118 @@ function M.new(deps)
       return n
     end
     return (task and task.conflict_retried) and 1 or 0
+  end
+
+  -- The facts a conflict carries, in one shape. The journal note the runtime
+  -- writes, the prompt the implementer reads and the escalation the human
+  -- reads are all built from this table, so they cannot disagree about the
+  -- files, the hunk or the base.
+  local function conflict_file_list(result)
+    local files = result and result.conflict_file_list
+    if type(files) == "table" and #files > 0 then
+      return files
+    end
+    local raw = result and (result.conflict_files or result.conflict) or nil
+    if type(raw) == "table" then
+      return raw
+    end
+    local out = {}
+    if type(raw) == "string" then
+      for piece in raw:gmatch("[^,]+") do
+        local name = trim(piece)
+        if name ~= "" then
+          out[#out + 1] = name
+        end
+      end
+    end
+    return out
+  end
+
+  -- Two shapes reach this function: the `merge.run` result (`conflict_hunks`,
+  -- `conflict_commit`, `rebase_command`) and the `merge.rebase` diagnostic
+  -- (`hunks`, `commit`, `command`). Both describe the same conflict, so the
+  -- aliases are normalised here rather than at every call site: a rebase that
+  -- conflicts during implement must carry the same hunks and faulty commit as
+  -- one that conflicts during merge, or the note and the implementer prompt
+  -- would silently lose them.
+  local function conflict_details(result, base)
+    result = type(result) == "table" and result or {}
+    local upstream = is_non_empty(result.upstream) and result.upstream
+      or ("origin/" .. tostring(is_non_empty(base) and base or "main"))
+    local hunks = type(result.conflict_hunks) == "table" and result.conflict_hunks
+      or (type(result.hunks) == "table" and result.hunks or nil)
+    local commit = is_non_empty(result.conflict_commit) and result.conflict_commit
+      or (is_non_empty(result.commit) and result.commit or nil)
+    local command = is_non_empty(result.rebase_command) and result.rebase_command
+      or (is_non_empty(result.command) and result.command or nil)
+    return {
+      files = conflict_file_list(result),
+      hunks = hunks,
+      base = is_non_empty(result.base) and result.base or (is_non_empty(base) and base or nil),
+      base_sha = is_non_empty(result.base_sha) and result.base_sha or nil,
+      upstream = upstream,
+      commit = commit,
+      command = command or ("git rebase " .. upstream),
+    }
+  end
+
+  -- The facts a note states, without claiming the task is dead: the conflict is
+  -- being repaired, and the implementer will read the same lines.
+  local function conflict_note(details)
+    local files = #details.files > 0 and table.concat(details.files, ", ") or "unknown"
+    local parts = {
+      string.format("rebase conflict with %s will be redone on the fresh base",
+        details.upstream or "origin/main"),
+      "files: " .. files,
+      "command: `" .. details.command .. "`",
+    }
+    if details.base_sha then
+      parts[#parts + 1] = "base sha: " .. details.base_sha
+    end
+    if details.commit then
+      parts[#parts + 1] = "commit: " .. details.commit
+    end
+    return table.concat(parts, "; ")
+  end
+
+  -- Beyond the bound the reader must get the means to act: the files, the base
+  -- (with its SHA), the exact command and the commit git could not replay.
+  local function conflict_escalation(details)
+    local files = #details.files > 0 and table.concat(details.files, ", ") or "unknown"
+    local parts = {
+      string.format("rebase conflict on %s cannot be repaired automatically",
+        details.upstream or "origin/main"),
+      "files: " .. files,
+      "command: `" .. details.command .. "`",
+    }
+    if details.base_sha then
+      parts[#parts + 1] = "base sha: " .. details.base_sha
+    end
+    if details.commit then
+      parts[#parts + 1] = "commit: " .. details.commit
+    end
+    return table.concat(parts, "; ")
+  end
+
+  -- Journal the conflict as a `note` event: files, hunks, base and the faulty
+  -- commit, quoted as evidence. Never raises: a journal that cannot take the
+  -- note must not stop the repair.
+  local function journal_conflict(state, root_path, task_id, details, summary)
+    if type(state) ~= "table" or type(state.append) ~= "function" then
+      return
+    end
+    local lines = { summary or conflict_note(details) }
+    for _, hunk in ipairs(details.hunks or {}) do
+      if type(hunk) == "table" then
+        lines[#lines + 1] = string.format("--- %s:%s\n%s",
+          tostring(hunk.file or "unknown"), tostring(hunk.start or "?"), tostring(hunk.text or ""))
+      end
+    end
+    pcall(state.append, root_path, {
+      kind = "note",
+      task_id = task_id,
+      text = table.concat(lines, "\n"),
+    })
   end
 
   -- An epic task owns the single PR from the epic branch to the project base.
@@ -1058,8 +1176,11 @@ function M.new(deps)
     -- move more than once while the task is redone, and `task` is the table
     -- loaded at the start of the run, so its counter never moves on its own.
     local repairs = conflict_repairs(task)
+    local repair_bound = conflict_retry_bound(cfg)
 
-    local function implement_and_verify(feedback)
+    -- `conflict` is the facts of the conflict the previous turn left, if any:
+    -- the implementer receives the files and hunks it must resolve, as data.
+    local function implement_and_verify(feedback, conflict)
       local impl = deps.implement.run({
         task = task,
         repo = paths.repo,
@@ -1077,6 +1198,7 @@ function M.new(deps)
         max_attempts = 1,
         deadline_secs = opts.deadline_secs,
         feedback = feedback,
+        conflict = conflict,
       })
       if not impl.ok then
         return nil, impl
@@ -1102,9 +1224,11 @@ function M.new(deps)
           if type(rebase_diag) == "table" and rebase_diag.conflict then
             -- The base moved under the branch and the same lines changed.
             -- That is repairable without a human: move the branch back to the
-            -- fresh base and redo the work there, once. A second conflict is
+            -- fresh base and redo the work there, with the conflict facts in
+            -- the prompt. The bound is the project's; beyond it the conflict is
             -- a real failure and goes to the user.
-            if repairs < MAX_CONFLICT_REPAIRS
+            local details = conflict_details(rebase_diag, base)
+            if repairs < repair_bound
               and type(deps.git.reset_hard) == "function" then
               -- `reset_hard` takes a sha, never a ref: resolve the fresh base
               -- first, or the reset is refused and the repair silently does
@@ -1113,31 +1237,35 @@ function M.new(deps)
                 and deps.git.rev_parse(worktree, "origin/" .. base) or nil
               local reset = base_sha and deps.git.reset_hard(worktree, base_sha) or nil
               if reset then
+                if base_sha then
+                  details.base_sha = details.base_sha or base_sha
+                end
                 log(paths, "task " .. task_id .. " conflicted with the fresh base on "
                   .. tostring(rebase_diag.conflict) .. "; redoing it on the fresh base")
                 repairs = repairs + 1
+                -- The task is already running: the repair continues the turn,
+                -- it is not a failure. Persist the counter and the phase so a
+                -- reload keeps both.
                 pcall(state.set_fields, paths.root, task_id, {
                   conflict_retried = true,
                   conflict_retries = repairs,
+                  phase = "implement",
                 })
-                pcall(state.transition, paths.root, task_id, "failed", {
-                  reason = "rebase conflict on the fresh base, redoing it: "
-                    .. tostring(rebase_err),
-                })
-                pcall(state.transition, paths.root, task_id, "running", { phase = "implement" })
+                journal_conflict(state, paths.root, task_id, details,
+                  "rebase conflict (repairable): " .. conflict_note(details))
                 -- The reset rewrote the branch: lease the push so the PR shows
                 -- the commit the next turn will build on.
                 if type(deps.git.push) == "function" then
                   deps.git.push(worktree, impl.ctx.branch, { remote = "origin", force = true })
                 end
-                return implement_and_verify(feedback)
+                return implement_and_verify(feedback, details)
               end
             end
             return nil, {
               ok = false,
               conflict = true,
               phase = "implement",
-              error = "rebase onto fresh base conflicted: " .. tostring(rebase_err),
+              error = conflict_escalation(details),
             }
           end
           -- The rebase never started: it is the fetch that failed. A remote or
@@ -1226,271 +1354,314 @@ function M.new(deps)
       initial_feedback = task.review.findings
     end
 
-    local impl, impl_err = implement_and_verify(initial_feedback)
-    if not impl then
-      return impl_err
-    end
-
-    local worktree = impl.ctx.worktree
-    local checks = task.checks or cfg.checks.default
-    local diff_base = impl.diff_base or ("origin/" .. base)
-
-    state.transition(paths.root, task_id, "verifying", { phase = "verify" })
-    state.transition(paths.root, task_id, "reviewing", { phase = "review" })
-
-    -- Two review engines. `model` opens the PR first and runs the bounded
-    -- reviewer loop. `no-mistakes` lets the local gate clean, push and open
-    -- the PR itself, then merges it: no review/implement loop at all.
-    local engine = (cfg.review and cfg.review.engine) or "model"
+    -- A merge conflict is repaired here, not by relaunching the merge: a
+    -- relaunch replays the same commit on the same base and hits the same
+    -- conflict, which is exactly the loop this replaces. The repair is a real
+    -- implementation cycle: the task goes back to `running`/`implement` with
+    -- the conflict facts, the implementer resolves and pushes, and the
+    -- pipeline (implement -> verify -> review -> merge) runs again. It is
+    -- bounded by `merge.max_conflict_retries` and counted in the persisted
+    -- `conflict_retries`, so a reload cannot restart the budget.
     local pr
-    local reviewed
-    local approved_sha = impl.sha
+    local approved_sha
+    local merged
+    local conflict = nil
 
-    if engine == "no-mistakes" then
-      local nm = deps.no_mistakes
-      if type(nm) ~= "table" or type(nm.run) ~= "function" then
-        return { ok = false, error = "review.engine is no-mistakes but the module is not loaded" }
+    while true do
+      local impl, impl_err = implement_and_verify(initial_feedback, conflict)
+      if not impl then
+        return impl_err
       end
-      local timeout = (cfg.limits and cfg.limits.timeout_minutes and cfg.limits.timeout_minutes * 60000)
-        or 1800000
-      -- A cancelled gate run leaves its fix commits in the private
-      -- `no-mistakes` mirror while the live branch is reset to the pre-run
-      -- head. The next run refuses to reconcile that gap ("at-risk commits
-      -- absent from live head"), so bring the live branch up to the mirror
-      -- head first: the gate's work is never dropped. Only a fast-forward is
-      -- allowed, so a local commit the mirror does not have is never lost.
-      if type(deps.git.fetch) == "function" and type(deps.git.rev_parse) == "function"
-        and type(deps.git.reset_hard) == "function" then
-        pcall(deps.git.fetch, paths.repo, "no-mistakes")
-        local mirror = deps.git.rev_parse(worktree, "no-mistakes/" .. impl.ctx.branch)
-        local live = type(deps.git.head_sha) == "function" and deps.git.head_sha(worktree) or nil
-        if mirror and live and mirror ~= live and type(deps.git.is_ancestor) == "function" then
-          local ancestor = deps.git.is_ancestor(worktree, live, mirror)
-          if ancestor then
-            pcall(deps.git.reset_hard, worktree, mirror)
+      -- The findings belonged to the first attempt; a repair pass carries the
+      -- conflict facts instead.
+      initial_feedback = nil
+
+      local worktree = impl.ctx.worktree
+      local checks = task.checks or cfg.checks.default
+      local diff_base = impl.diff_base or ("origin/" .. base)
+
+      state.transition(paths.root, task_id, "verifying", { phase = "verify" })
+      state.transition(paths.root, task_id, "reviewing", { phase = "review" })
+
+      -- Two review engines. `model` opens the PR first and runs the bounded
+      -- reviewer loop. `no-mistakes` lets the local gate clean, push and open
+      -- the PR itself, then merges it: no review/implement loop at all.
+      local engine = (cfg.review and cfg.review.engine) or "model"
+      local reviewed
+      approved_sha = impl.sha
+
+      if engine == "no-mistakes" then
+        local nm = deps.no_mistakes
+        if type(nm) ~= "table" or type(nm.run) ~= "function" then
+          return { ok = false, error = "review.engine is no-mistakes but the module is not loaded" }
+        end
+        local timeout = (cfg.limits and cfg.limits.timeout_minutes and cfg.limits.timeout_minutes * 60000)
+          or 1800000
+        -- A cancelled gate run leaves its fix commits in the private
+        -- `no-mistakes` mirror while the live branch is reset to the pre-run
+        -- head. The next run refuses to reconcile that gap ("at-risk commits
+        -- absent from live head"), so bring the live branch up to the mirror
+        -- head first: the gate's work is never dropped. Only a fast-forward is
+        -- allowed, so a local commit the mirror does not have is never lost.
+        if type(deps.git.fetch) == "function" and type(deps.git.rev_parse) == "function"
+          and type(deps.git.reset_hard) == "function" then
+          pcall(deps.git.fetch, paths.repo, "no-mistakes")
+          local mirror = deps.git.rev_parse(worktree, "no-mistakes/" .. impl.ctx.branch)
+          local live = type(deps.git.head_sha) == "function" and deps.git.head_sha(worktree) or nil
+          if mirror and live and mirror ~= live and type(deps.git.is_ancestor) == "function" then
+            local ancestor = deps.git.is_ancestor(worktree, live, mirror)
+            if ancestor then
+              pcall(deps.git.reset_hard, worktree, mirror)
+            end
           end
         end
-      end
 
-      local gate, gerr = nm.run({
-        worktree = worktree,
-        intent = task.intent or task.title,
-        base = base,
-        bin = cfg.review and cfg.review.no_mistakes_bin,
-        timeout_ms = timeout,
-        -- Match the CLI's hold to the task timeout, so a gate that is still
-        -- fixing is not mistaken for a failed gate.
-        wait = string.format("%dm", math.max(10, math.floor(timeout / 60000))),
-      })
-      if not gate then
-        return { ok = false, error = gerr or "no-mistakes could not run" }
-      end
-      if not gate.ok then
-        -- The gate reports; the task fails. It never bounces back to the
-        -- implementer, which is the loop this engine exists to remove.
-        return { ok = false, error = gate.error, no_mistakes = gate }
-      end
-      reviewed = { ok = true, approved = true, no_mistakes = gate }
-      approved_sha = (deps.git.head_sha and deps.git.head_sha(worktree)) or impl.sha
-      -- no-mistakes pushed the branch and opened the PR itself; read it back
-      -- and attach it to the task before the merge step.
-      pr = deps.git.pr_view(impl.ctx.branch, {
-        repo = paths.repo,
-        worktree = worktree,
-        gh = "gh",
-        timeout_ms = 60000,
-      })
-      if not pr then
-        return { ok = false, error = "no-mistakes passed but its pull request cannot be found", no_mistakes = gate }
-      end
-      deps.git.pr_attach(state, paths.root, task_id, pr)
-    else
-      -- Open the pull request before the review: the reviewer reads the exact
-      -- SHA on a real PR, and a human can follow it while the review runs. The
-      -- task stays in `reviewing` until the review approves it.
-      pr = deps.git.pr_open(state, paths.root, task_id, {
-        repo = paths.repo,
-        worktree = worktree,
-        base = base,
-        head = impl.ctx.branch,
-        title = task.title,
-        body = "Metronome task " .. task_id,
-        gh = "gh",
-        attach_only = true,
-      })
-      if not pr then
-        return { ok = false, error = "cannot open the pull request" }
-      end
-
-      -- A review that asks for changes is not a failure: it is the next round's
-      -- work. The loop re-implements with the findings, re-runs the checks and
-      -- the convergence diff, then reviews again, up to `review.max_rounds`.
-      -- Only an exhausted bound escalates, and only a real error (a dead
-      -- reviewer, an invalid answer) ends the task before that.
-      local function fix(result)
-        local findings = type(result) == "table" and result.findings or nil
-        -- The round was opened on a task in `reviewing`; by the time its verdict
-        -- lands another pilot may have moved the task on (a second dispatch, a
-        -- stop, a merge). Re-read the journal before re-implementing: a fix turn
-        -- on a task that is no longer ours would be a second pilot, and the
-        -- journal would refuse `running -> changes_requested` for both.
-        local current_state = state.load(paths.root)
-        local current = current_state and current_state.tasks
-          and current_state.tasks[task_id] or nil
-        local status = type(current) == "table" and tostring(current.status or "")
-          or "unknown"
-        if REVIEW_ROUND_LOST[status] then
-          local text = "review fix turn discarded: task no longer reviewing (status="
-            .. status .. ")"
-          log(paths, "task " .. tostring(task_id) .. ": " .. text)
-          if type(state.append) == "function" then
-            pcall(state.append, paths.root, {
-              kind = "note",
-              task_id = task_id,
-              text = text,
-            })
-          end
-          return { ok = true, stale = true, discarded = true, status = status }
+        local gate, gerr = nm.run({
+          worktree = worktree,
+          intent = task.intent or task.title,
+          base = base,
+          bin = cfg.review and cfg.review.no_mistakes_bin,
+          timeout_ms = timeout,
+          -- Match the CLI's hold to the task timeout, so a gate that is still
+          -- fixing is not mistaken for a failed gate.
+          wait = string.format("%dm", math.max(10, math.floor(timeout / 60000))),
+        })
+        if not gate then
+          return { ok = false, error = gerr or "no-mistakes could not run" }
         end
-        local moved, merr = state.transition(paths.root, task_id, "running", { phase = "implement" })
-        if not moved then
-          if is_illegal_transition(merr) then
-            -- The move was refused because the task left the round between the
-            -- read above and this write. Same rule: drop the turn, journal it,
-            -- never fail the task for a sequencing defect.
-            local text = "review fix turn discarded: " .. tostring(merr)
+        if not gate.ok then
+          -- The gate reports; the task fails. It never bounces back to the
+          -- implementer, which is the loop this engine exists to remove.
+          return { ok = false, error = gate.error, no_mistakes = gate }
+        end
+        reviewed = { ok = true, approved = true, no_mistakes = gate }
+        approved_sha = (deps.git.head_sha and deps.git.head_sha(worktree)) or impl.sha
+        -- no-mistakes pushed the branch and opened the PR itself; read it back
+        -- and attach it to the task before the merge step.
+        pr = deps.git.pr_view(impl.ctx.branch, {
+          repo = paths.repo,
+          worktree = worktree,
+          gh = "gh",
+          timeout_ms = 60000,
+        })
+        if not pr then
+          return { ok = false, error = "no-mistakes passed but its pull request cannot be found", no_mistakes = gate }
+        end
+        deps.git.pr_attach(state, paths.root, task_id, pr)
+      else
+        -- Open the pull request before the review: the reviewer reads the exact
+        -- SHA on a real PR, and a human can follow it while the review runs. The
+        -- task stays in `reviewing` until the review approves it.
+        --
+        -- A repair re-enters this path with the PR already open: it is reused,
+        -- never recreated. `git.pr_open` attaches to an existing PR (contract),
+        -- so the runtime does not even call it a second time — a second PR would
+        -- split the review from the merge.
+        if not pr then
+          pr = deps.git.pr_open(state, paths.root, task_id, {
+            repo = paths.repo,
+            worktree = worktree,
+            base = base,
+            head = impl.ctx.branch,
+            title = task.title,
+            body = "Metronome task " .. task_id,
+            gh = "gh",
+            attach_only = true,
+          })
+          if not pr then
+            return { ok = false, error = "cannot open the pull request" }
+          end
+        end
+
+        -- A review that asks for changes is not a failure: it is the next round's
+        -- work. The loop re-implements with the findings, re-runs the checks and
+        -- the convergence diff, then reviews again, up to `review.max_rounds`.
+        -- Only an exhausted bound escalates, and only a real error (a dead
+        -- reviewer, an invalid answer) ends the task before that.
+        local function fix(result)
+          local findings = type(result) == "table" and result.findings or nil
+          -- The round was opened on a task in `reviewing`; by the time its
+          -- verdict lands another pilot may have moved the task on. Re-read the
+          -- journal before re-implementing: a fix turn on a task that is no
+          -- longer ours would be a second pilot.
+          local current_state = state.load(paths.root)
+          local current = current_state and current_state.tasks
+            and current_state.tasks[task_id] or nil
+          local status = type(current) == "table" and tostring(current.status or "")
+            or "unknown"
+          if REVIEW_ROUND_LOST[status] then
+            local text = "review fix turn discarded: task no longer reviewing (status="
+              .. status .. ")"
             log(paths, "task " .. tostring(task_id) .. ": " .. text)
             if type(state.append) == "function" then
-              pcall(state.append, paths.root, {
-                kind = "note",
-                task_id = task_id,
-                text = text,
-              })
+              pcall(state.append, paths.root, { kind = "note", task_id = task_id, text = text })
             end
             return { ok = true, stale = true, discarded = true, status = status }
           end
-          return { ok = false, error = merr or "cannot resume after review" }
+          local moved, merr = state.transition(paths.root, task_id, "running", { phase = "implement" })
+          if not moved then
+            if is_illegal_transition(merr) then
+              local text = "review fix turn discarded: " .. tostring(merr)
+              log(paths, "task " .. tostring(task_id) .. ": " .. text)
+              if type(state.append) == "function" then
+                pcall(state.append, paths.root, { kind = "note", task_id = task_id, text = text })
+              end
+              return { ok = true, stale = true, discarded = true, status = status }
+            end
+            return { ok = false, error = merr or "cannot resume after review" }
+          end
+          log(paths, string.format("task %s: review round %s requested changes, re-implementing",
+            task_id, tostring(result and result.round or "?")))
+          local again, err = implement_and_verify(findings)
+          if not again then
+            return { ok = false, error = (err and err.error) or "fix failed" }
+          end
+          state.transition(paths.root, task_id, "verifying", { phase = "verify" })
+          state.transition(paths.root, task_id, "reviewing", { phase = "review" })
+          return true
         end
-        log(paths, string.format("task %s: review round %s requested changes, re-implementing",
-          task_id, tostring(result and result.round or "?")))
-        local again, err = implement_and_verify(findings)
-        if not again then
-          return { ok = false, error = (err and err.error) or "fix failed" }
-        end
-        state.transition(paths.root, task_id, "verifying", { phase = "verify" })
-        state.transition(paths.root, task_id, "reviewing", { phase = "review" })
-        return true
-      end
 
-      local review_opts = {
-        task = task_id,
-        worktree = worktree,
-        base = diff_base,
-        git = deps.git,
-        state = state,
-        root = paths.root,
-        runner = runner,
-        tasks_dir = paths.tasks,
-        repo = paths.repo,
-        state_root = paths.runs,
-        ctx = opts.ctx,
-        session_opts = session.reviewer,
-        fence = deps.fence,
-        max_rounds = (cfg.review and cfg.review.max_rounds) or 3,
-        fix = fix,
-      }
-      if type(deps.review.loop) == "function" then
-        reviewed = deps.review.loop(review_opts)
-      else
-        reviewed = deps.review.review(review_opts)
-      end
-      if type(reviewed) == "table" and (reviewed.discarded or reviewed.stale) then
-        -- The verdict belonged to a round this task already left. The review
-        -- module journaled it as a stale note and dropped it; the run must not
-        -- turn that into a task failure.
-        local text = "task " .. tostring(task_id)
-          .. ": stale review verdict discarded, nothing is shipped"
-        log(paths, text)
-        return {
-          ok = true,
-          skipped = true,
-          stale = true,
-          task_id = task_id,
-          pr = pr,
-          reason = text,
+        local review_opts = {
+          task = task_id,
+          worktree = worktree,
+          base = diff_base,
+          git = deps.git,
+          state = state,
+          root = paths.root,
+          runner = runner,
+          tasks_dir = paths.tasks,
+          repo = paths.repo,
+          state_root = paths.runs,
+          ctx = opts.ctx,
+          session_opts = session.reviewer,
+          fence = deps.fence,
+          max_rounds = (cfg.review and cfg.review.max_rounds) or 3,
+          fix = fix,
         }
-      end
-
-      if not reviewed.ok or not reviewed.approved then
-        local reason = (reviewed and reviewed.error) or "review not approved"
-        if type(reviewed) == "table" and reviewed.escalated then
-          reason = string.format("review escalated after %s round(s)", tostring(reviewed.round or "?"))
+        if type(deps.review.loop) == "function" then
+          reviewed = deps.review.loop(review_opts)
+        else
+          reviewed = deps.review.review(review_opts)
         end
-        return { ok = false, error = reason, review = reviewed, pr = pr }
+        if type(reviewed) == "table" and (reviewed.discarded or reviewed.stale) then
+          -- The verdict belonged to a round this task already left. The review
+          -- module journaled it as a stale note and dropped it; the run must
+          -- not turn that into a task failure.
+          local text = "task " .. tostring(task_id)
+            .. ": stale review verdict discarded, nothing is shipped"
+          log(paths, text)
+          return {
+            ok = true,
+            skipped = true,
+            stale = true,
+            task_id = task_id,
+            pr = pr,
+            reason = text,
+          }
+        end
+        if not reviewed.ok or not reviewed.approved then
+          local reason = (reviewed and reviewed.error) or "review not approved"
+          if type(reviewed) == "table" and reviewed.escalated then
+            reason = string.format("review escalated after %s round(s)", tostring(reviewed.round or "?"))
+          end
+          return { ok = false, error = reason, review = reviewed, pr = pr }
+        end
+
+        -- The SHA the reviewer approved is the one that ships, not the first
+        -- round's: a fix round moved the branch.
+        approved_sha = (reviewed and reviewed.sha) or impl.sha
       end
 
-      -- The SHA the reviewer approved is the one that ships, not the first
-      -- round's: a fix round moved the branch.
-      approved_sha = (reviewed and reviewed.sha) or impl.sha
-    end
+      -- The review passed on the exact SHA: move the task to `pr_open` now.
+      state.transition(paths.root, task_id, "pr_open", { phase = "review" })
 
-    -- The review passed on the exact SHA: move the task to `pr_open` now.
-    state.transition(paths.root, task_id, "pr_open", { phase = "review" })
+      -- `auto_merge` is the project's switch. Off means the task stops at
+      -- `pr_open` with a PR a human can review and merge; on means the merger
+      -- takes it the rest of the way (and redeploys when `auto_deploy` is set).
+      if engine ~= "no-mistakes" and not (cfg.merge and cfg.merge.auto_merge) then
+        return { ok = true, task_id = task_id, sha = approved_sha, pr = pr, pr_open = true }
+      end
 
-    -- `auto_merge` is the project's switch. Off means the task stops at
-    -- `pr_open` with a PR a human can review and merge; on means the merger
-    -- takes it the rest of the way (and redeploys when `auto_deploy` is set).
-    if engine ~= "no-mistakes" and not (cfg.merge and cfg.merge.auto_merge) then
-      return { ok = true, task_id = task_id, sha = approved_sha, pr = pr, pr_open = true }
-    end
+      local merge_err
+      merged, merge_err = with_merge_gate(function()
+        return deps.merge.run({
+          task = task_id,
+          worktree = worktree,
+          repo = paths.repo,
+          git = deps.git,
+          state = state,
+          root = paths.root,
+          remote = "origin",
+          base = base,
+          checks = deps.checks,
+          gh = "gh",
+          method = cfg.merge.method,
+          verify = cfg.checks.re_run_after_merge ~= false,
+          commands = checks,
+          -- A subtask merges into the epic branch, which is not a deployable
+          -- base: recording it as deploy-pending would ship work that never
+          -- reached the project base.
+          deploy_pending = not epic_subtask,
+        })
+      end)
+      if not merged then
+        return { ok = false, error = tostring(merge_err or "merge failed") }
+      end
+      if merged.ok then
+        break
+      end
 
-    local merged, merge_err = with_merge_gate(function()
-      return deps.merge.run({
-        task = task_id,
-        worktree = worktree,
-        repo = paths.repo,
-        git = deps.git,
-        state = state,
-        root = paths.root,
-        remote = "origin",
-        base = base,
-        checks = deps.checks,
-        gh = "gh",
-        method = cfg.merge.method,
-        verify = cfg.checks.re_run_after_merge ~= false,
-        commands = checks,
-        -- A subtask merges into the epic branch, which is not a deployable
-        -- base: recording it as deploy-pending would ship work that never
-        -- reached the project base.
-        deploy_pending = not epic_subtask,
-      })
-    end)
-    if not merged then
-      return { ok = false, error = tostring(merge_err or "merge failed") }
-    end
-    if not merged.ok then
-      -- A conflict with the base is repairable without a human: move the
-      -- branch back to the fresh base and let the implementer redo the work
-      -- there. One repair only; a second conflict is a real failure.
-      if merged.conflict and conflict_repairs(task) < MAX_CONFLICT_REPAIRS then
-        local base_sha = deps.git.rev_parse
+      -- A conflict with the base is repairable without a human: the task goes
+      -- back to the implementer on the fresh base with the conflict facts, and
+      -- the next turn resolves and pushes. This loop is the repair — the
+      -- caller no longer relaunches the merge, which would replay the same
+      -- commit on the same base. The bound counts real repairs, comes from the
+      -- project's config, and is persisted with the counter.
+      local details = merged.conflict and conflict_details(merged, base) or nil
+      local repaired = false
+      if details and repairs < repair_bound then
+        local base_sha = type(deps.git.rev_parse) == "function"
           and deps.git.rev_parse(worktree, "origin/" .. base) or nil
-        local reset = base_sha and deps.git.reset_hard
+        local reset = base_sha and type(deps.git.reset_hard) == "function"
           and deps.git.reset_hard(worktree, base_sha) or nil
         if reset then
+          if base_sha then
+            details.base_sha = details.base_sha or base_sha
+          end
           log(paths, "task " .. task_id .. " hit a merge conflict on "
             .. tostring(merged.conflict_files) .. "; redoing it on the fresh base")
-          pcall(deps.state.set_fields, paths.root, task_id, {
+          repairs = repairs + 1
+          -- `merging` has no edge back to `running`: the repair is a
+          -- continuation of the turn, not a failure, so status, phase and
+          -- counter are written together. A reload then resumes in implement
+          -- with the conflict already journalled. The note itself is written
+          -- once, by `merge.run` (the repairable branch it returns from), so
+          -- the runtime does not duplicate it: one conflict, one note.
+          pcall(state.set_fields, paths.root, task_id, {
+            status = "running",
+            phase = "implement",
             conflict_retried = true,
-            conflict_retries = conflict_repairs(task) + 1,
+            conflict_retries = repairs,
           })
-          pcall(deps.state.transition, paths.root, task_id, "failed",
-            { reason = "merge conflict: " .. tostring(merged.conflict_files) })
-          pcall(deps.state.transition, paths.root, task_id, "running", { phase = "implement" })
-          return { ok = false, conflict = true, error = merged.error, task_id = task_id }
+          -- The branch is back on the fresh base: the PR is the same PR, so the
+          -- push leases it and no second PR is opened.
+          if type(deps.git.push) == "function" then
+            pcall(deps.git.push, worktree, impl.ctx.branch, { remote = "origin", force = true })
+          end
+          conflict = details
+          repaired = true
         end
       end
-      return merged
+      if not repaired then
+        if details then
+          -- Beyond the bound the human gets the means to act — the files, the
+          -- base and the exact command — not git's raw "rebase failed".
+          local message = conflict_escalation(details)
+          journal_conflict(state, paths.root, task_id, details, message)
+          return { ok = false, error = message, phase = "merge", task_id = task_id }
+        end
+        return merged
+      end
     end
 
     -- A subtask of an epic stops at `merged`: its work is on the epic branch,
@@ -1858,7 +2029,7 @@ function M.new(deps)
     -- That is what makes the drain unblockable — a slow, stuck or crashing task
     -- leaves the loop free to start the next one.
     local function dispatch_one(task)
-      local spawned, handle = pcall(spawn, function()
+      local handle = spawn(function()
         -- `run_and_handle` already guards the failure policy; this guard also
         -- covers anything it returns or raises outside it, so `results` and
         -- `task_handles` are always settled and the re-drain always fires.
@@ -1873,17 +2044,6 @@ function M.new(deps)
         task_handles[task.id] = nil
         redrain()
       end)
-      if not spawned then
-        -- The spawn itself failed, so the task never ran: settle its result and
-        -- re-drain. One task that cannot even be started must not stop the
-        -- other ready ones from being dispatched by this loop.
-        log(paths, "task " .. tostring(task.id)
-          .. " could not be dispatched: " .. tostring(handle))
-        results[#results + 1] = { ok = false, error = tostring(handle) }
-        task_handles[task.id] = nil
-        redrain()
-        return nil
-      end
       if handle ~= nil then
         task_handles[task.id] = handle
       end
@@ -1896,18 +2056,8 @@ function M.new(deps)
     -- the tick would use its own default bound instead of the project's. A zero
     -- bound makes `retry_ready` select nothing; the drain only starts `ready`
     -- tasks here, and a failed task is resumed by its own scheduled job.
-    local tick_crashed = false
-    local tick_crashes = 0
     for _ = 1, 32 do
-      if type(deps.pipeline.tick) ~= "function" then
-        return { ok = false, error = "the pipeline module is missing tick", results = results }
-      end
-      -- The tick runs on the drain's own turn: an error raised anywhere inside
-      -- it (a dispatch, a lock, a module defect) would abandon the loop and
-      -- leave the other ready tasks waiting for a drain that already returned.
-      -- Catch it, record it, and keep ticking: the queue behind a crash is
-      -- still work that must be dispatched.
-      local ticked, tick = pcall(deps.pipeline.tick, {
+      local tick = deps.pipeline.tick({
         state = deps.state,
         root = paths.root,
         max_parallel = max_parallel,
@@ -1917,25 +2067,10 @@ function M.new(deps)
         max_attempts = 0,
         recover = recover_module(),
       })
-      if not ticked then
-        tick_crashes = tick_crashes + 1
-        log(paths, "scheduler tick error: " .. tostring(tick))
-        results[#results + 1] = { ok = false, error = tostring(tick) }
-        -- In the async path the drain has no caller left watching it: re-arm so
-        -- the scheduler wakes up and resumes the rest of the queue. Once per
-        -- pass: re-arming on every crash of the same tick would spin forever.
-        if not tick_crashed then
-          tick_crashed = true
-          redrain()
-        end
-        -- A tick that fails three times in a row dispatches nothing: stop
-        -- hammering it and let the re-armed scheduler try again later.
-        if tick_crashes >= 3 then
-          break
-        end
-      elseif not tick.ok then
+      if not tick.ok then
         return { ok = false, error = tick.error, results = results }
-      elseif #tick.started == 0 then
+      end
+      if #tick.started == 0 then
         break
       end
     end
@@ -1944,12 +2079,7 @@ function M.new(deps)
     -- check and the final deploy belong to the synchronous path (the scripted
     -- e2e driver), where every task has already finished by now.
     if deps.async then
-      return {
-        ok = true,
-        results = results,
-        background = true,
-        crashed = tick_crashed,
-      }
+      return { ok = true, results = results, background = true }
     end
 
     local loaded = deps.state.load(paths.root)
@@ -2159,10 +2289,8 @@ function M.new(deps)
     -- A transition the journal refused inside the runtime is a defect in the
     -- runtime's sequencing, not a fault of the task: another pilot already moved
     -- the task on. Failing the task for it would condemn work that is very
-    -- likely in progress elsewhere, and the failure_reason would blame the task
-    -- for the scheduler. Journal it as a note, leave the status and the failure
-    -- fields alone, and hand the caller a non-failing result so it does not
-    -- retry or escalate a task that did nothing wrong.
+    -- likely in progress elsewhere. Journal it as a note, leave the status and
+    -- the failure fields alone, and hand the caller a non-failing result.
     if is_illegal_transition(message) then
       local text = "illegal transition reconciled: " .. message
       log(paths, "task " .. tostring(task_id) .. ": " .. text)
@@ -2349,8 +2477,7 @@ function M.new(deps)
     local out = type(result) == "table" and result or { ok = false }
     if handled.reconciled then
       -- The runtime reconciled its own defect: the dispatch is not a task
-      -- failure, so the step's error must not survive on the result. Callers
-      -- key on `ok`, `error` and `failure`; all three say "fine" here.
+      -- failure, so the step's error must not survive on the result.
       out.ok = true
       out.reconciled = true
       out.error = nil
@@ -2384,19 +2511,10 @@ function M.new(deps)
       runtime.last_background = failed
       return failed
     end
-    if type(result) == "table" and result.conflict then
-      -- The branch is back on the fresh base: redo the work once.
-      log(paths, "task " .. tostring(task_id) .. " conflicted with the fresh base; redoing it")
-      local again_ok, again = pcall(run_task, opts, task_id, paths, cfg, runner, session)
-      ok, result = again_ok, again
-      if not ok then
-        local failed = { ok = false, error = tostring(result) }
-        failed = with_failure(failed,
-          apply_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed))
-        runtime.last_background = failed
-        return failed
-      end
-    end
+    -- A conflict is no longer relaunched here: replaying `run_task` would call
+    -- the merge again on the same base and hit the same conflict, which is the
+    -- loop this replaces. The repair is `run_task`'s own bounded cycle (back to
+    -- implement with the conflict facts), so whatever it returns is final.
     if type(result) ~= "table" then
       result = { ok = false, error = tostring(result) }
     end
@@ -2446,13 +2564,6 @@ function M.new(deps)
           scheduler_dirty = false
           runtime.last_background = after_questions(
             job.opts, job.paths, job.cfg, job.runner, job.session)
-          -- The drain's own loop failed and re-armed itself. Give the next burst
-          -- of work a fresh pass instead of spinning on the same failing tick:
-          -- the crashed pass already kept ticking and dispatched what it could.
-          local bg = runtime.last_background
-          if type(bg) == "table" and bg.crashed and scheduler_dirty then
-            break
-          end
         end
       end
     end)
