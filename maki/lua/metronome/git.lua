@@ -110,9 +110,9 @@ local function detail_of(what, stderr)
 end
 
 -- Turn a failed command into a cause a caller can branch on. The causes are
--- the four situations a task pipeline actually hits -- a stale worktree, a
--- stale branch, a refused push, an unreachable remote -- plus auth and a
--- catch-all, so a failure is never just "git failed".
+-- the situations a task pipeline actually hits -- a stale worktree, a stale
+-- branch, a refused push, an unreachable remote, a transient ref collision --
+-- plus auth and a catch-all, so a failure is never just "git failed".
 function M.classify(what, result)
   result = result or {}
   local stderr = result.stderr or ""
@@ -122,8 +122,19 @@ function M.classify(what, result)
     return haystack:find(needle, 1, true) ~= nil
   end
 
-  local cause, message, hint
-  if what == "worktree add" then
+  -- Ref-lock contention is not a broken clone: two git processes touched the
+  -- same ref at once. It is transient and retryable, so it gets its own cause
+  -- (and a remedy that names it) instead of the generic "inspect the output".
+  -- "cannot lock ref 'refs/...'" and "cannot lock ref" are the same message.
+  local cause, message, hint, transient, retryable
+  if has("cannot lock ref") or has("unable to update local ref")
+    or has("failed to update ref") then
+    cause = "git_lock"
+    message = "another git operation holds a ref of this repository"
+    hint = "wait for the in-flight fetch to finish and retry; the ref contention is transient"
+    transient = true
+    retryable = true
+  elseif what == "worktree add" then
     if has("a branch named") then
       cause = "branch_exists"
       message = "the task branch already exists"
@@ -207,6 +218,10 @@ function M.classify(what, result)
     command = result.command,
     message = message,
     hint = hint,
+    -- Only causes that are safe to retry as-is say so; a nil field is absent
+    -- from the table and from any encoding of it.
+    transient = transient,
+    retryable = retryable,
     detail = detail_of(what, stderr) or first_line(stdout) or "no output",
   }
 end
@@ -298,10 +313,102 @@ function M.current_branch(path)
   return (result.stdout:gsub("%s+$", ""))
 end
 
--- Fetch the base so a new task starts from what the remote has now, not from
--- whatever this checkout happened to hold.
-function M.fetch(repo, remote)
-  local result, err = run({ "git", "-C", repo, "fetch", remote or "origin", "--prune" })
+-- Fetch, serialized per repository ------------------------------------------
+--
+-- Two fetches on the same clone update the same refs, and git serialises no
+-- further than its own per-ref `.lock` files: the loser dies with "cannot lock
+-- ref 'refs/remotes/...'" and the task that needed the base is marked failed
+-- for a race. Since tasks run as separate processes, the guard has to live on
+-- disk. One advisory lock file per repository, taken for the whole fetch,
+-- queues the callers; an in-process registry keeps a single process from even
+-- reaching that point, and a caller that finds a fetch already in flight waits
+-- for it and reuses its result instead of starting a second one.
+
+local FETCH_LOCK_NAME = "metronome-fetch.lock"
+local FETCH_LOCK_WAIT_MS = 30000
+local FETCH_LOCK_POLL_MS = 20
+local FETCH_LOCK_MAX_POLL_MS = 250
+
+-- lock path -> the fetch currently in flight in this process.
+local fetch_in_flight = {}
+
+-- Suspend cooperatively for `ms`. maki.async.sleep lets the other tasks (and
+-- the UI) run; the `sleep` child is only for a host that has no async sleep,
+-- and it yields exactly the same way through jobwait.
+local function pause(ms)
+  if maki.async and type(maki.async.sleep) == "function" then
+    maki.async.sleep(ms)
+    return
+  end
+  run({ "sh", "-c", string.format("sleep %.3f", ms / 1000) })
+end
+
+-- Poll `should_stop` with a short backoff until it answers true or the bound
+-- runs out. The bound is a count of scheduled milliseconds, so the wait is
+-- finite whatever the wall clock does, and the backoff keeps a long wait from
+-- spinning. Returns true when the condition was met.
+local function wait_bounded(should_stop, timeout_ms)
+  local waited, step = 0, FETCH_LOCK_POLL_MS
+  while true do
+    if should_stop() then
+      return true
+    end
+    if waited >= timeout_ms then
+      return false
+    end
+    pause(step)
+    waited = waited + step
+    step = math.min(math.floor(step * 1.5), FETCH_LOCK_MAX_POLL_MS)
+  end
+end
+
+-- The common git dir is the one shared by every worktree of the clone, so a
+-- fetch started from a task worktree queues behind the one started from the
+-- main checkout. `rev-parse` answers a path relative to the repo when the repo
+-- sits inside it; a repo that cannot answer falls back to `.git`.
+function M.fetch_lock_path(repo)
+  local result, err = run({ "git", "-C", repo, "rev-parse", "--git-common-dir" })
+  if not result then
+    return nil, err
+  end
+  local dir = result.ok and (result.stdout:gsub("%s+$", "")) or ""
+  if dir == "" then
+    dir = maki.fs.joinpath(repo, ".git")
+  elseif not dir:match("^/") then
+    dir = maki.fs.joinpath(repo, dir)
+  end
+  return maki.fs.joinpath(dir, FETCH_LOCK_NAME)
+end
+
+-- Create the lock file if and only if nobody else holds it. `set -C` gives the
+-- shell noclobber, which is O_EXCL: the create is atomic, so two processes can
+-- never both win. maki.fs has no exclusive create, hence the one-line child.
+local function try_lock(path)
+  local result = run({ "sh", "-c", 'set -C; : > "$1"', "sh", path })
+  return result ~= nil and result.ok
+end
+
+local function release_lock(path)
+  maki.fs.rm(path, { force = true })
+end
+
+local function lock_diag(lock, timeout_ms)
+  return {
+    cause = "git_lock",
+    what = "fetch",
+    command = "git fetch",
+    message = "another fetch is already running for this repository",
+    hint = "wait for the in-flight fetch to finish, then retry; ref contention is transient",
+    detail = string.format("timed out after %dms waiting for %s", timeout_ms, lock),
+    transient = true,
+    retryable = true,
+  }
+end
+
+local function do_fetch(repo, remote)
+  -- Through M.run so a test can count the fetch children; the lock helpers
+  -- above stay on the private run and never appear in that count.
+  local result, err = M.run({ "git", "-C", repo, "fetch", remote or "origin", "--prune" })
   if not result then
     return nil, err
   end
@@ -309,6 +416,56 @@ function M.fetch(repo, remote)
     return fail("fetch", result)
   end
   return true
+end
+
+-- Take the lock, run the fetch, and always give the lock back -- including when
+-- the command fails, so a failed fetch never wedges the clone.
+local function run_fetch(repo, remote, lock, timeout_ms)
+  if not wait_bounded(function() return try_lock(lock) end, timeout_ms) then
+    local diag = lock_diag(lock, timeout_ms)
+    return nil, M.describe(diag), diag
+  end
+  local ok, value, err, diag = pcall(do_fetch, repo, remote)
+  release_lock(lock)
+  if not ok then
+    error(value, 0)
+  end
+  return value, err, diag
+end
+
+-- Fetch the base so a new task starts from what the remote has now, not from
+-- whatever this checkout happened to hold.
+--
+-- Concurrent callers for the same repository are serialized: the first one
+-- fetches and the others wait for it and reuse its result. `opts.lock_timeout_ms`
+-- bounds that wait (a test uses a short bound; the pipeline keeps the default).
+function M.fetch(repo, remote, opts)
+  opts = opts or {}
+  local timeout_ms = tonumber(opts.lock_timeout_ms) or FETCH_LOCK_WAIT_MS
+  local lock, lock_err = M.fetch_lock_path(repo)
+  if not lock then
+    return nil, lock_err
+  end
+
+  local owner = fetch_in_flight[lock]
+  if owner then
+    wait_bounded(function() return owner.done end, timeout_ms)
+    if not owner.done then
+      local diag = lock_diag(lock, timeout_ms)
+      return nil, M.describe(diag), diag
+    end
+    return owner.value, owner.err, owner.diag
+  end
+
+  local record = { done = false }
+  fetch_in_flight[lock] = record
+  local ok, value, err, diag = pcall(run_fetch, repo, remote, lock, timeout_ms)
+  if not ok then
+    value, err, diag = nil, "fetch failed [git_error]: " .. tostring(value)
+  end
+  record.value, record.err, record.diag, record.done = value, err, diag, true
+  fetch_in_flight[lock] = nil
+  return value, err, diag
 end
 
 -- Create an isolated worktree on a new branch, cut from the freshest base.
