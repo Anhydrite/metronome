@@ -960,6 +960,11 @@ function M.new(deps)
   local describe_failure
   local typed_failure
   local fetch_diagnosis
+  -- Git ref-lock replay helpers: `run_task` uses them, so they are declared
+  -- before it and defined with the other diagnosis helpers below.
+  local git_lock_sleep
+  local retry_git_lock
+  local git_lock_diagnosis
   local later
   local retry_attempts
 
@@ -1014,8 +1019,20 @@ function M.new(deps)
         max_attempts = 1,
         deadline_secs = opts.deadline_secs,
         feedback = feedback,
+        -- The same short bounded replay as the runtime's own git calls, so a
+        -- ref lock in prepare/commit/push is retried inside the turn too.
+        sleep = git_lock_sleep(opts),
+        git_lock_attempts = opts.git_lock_attempts,
+        git_lock_delay_ms = opts.git_lock_delay_ms,
       })
       if not impl.ok then
+        -- A ref lock is contention, not a broken task: name it so the failure
+        -- policy can report git_lock and its remedy instead of a generic
+        -- string. The turn already replayed its own git calls to exhaustion.
+        local lock = git_lock_diagnosis(impl.diagnosis)
+        if lock then
+          impl.diagnosis = lock
+        end
         return nil, impl
       end
       local worktree = impl.ctx.worktree
@@ -1028,13 +1045,15 @@ function M.new(deps)
       -- implementation on the new base.
       local diff_base = "origin/" .. base
       if deps.merge and type(deps.merge.rebase) == "function" then
-        local rebased, rebase_err, rebase_diag = deps.merge.rebase({
-          repo = paths.repo,
-          worktree = worktree,
-          remote = "origin",
-          base = base,
-          git = deps.git,
-        })
+        local rebased, rebase_err, rebase_diag = retry_git_lock(opts, function()
+          return deps.merge.rebase({
+            repo = paths.repo,
+            worktree = worktree,
+            remote = "origin",
+            base = base,
+            git = deps.git,
+          })
+        end)
         if not rebased then
           if type(rebase_diag) == "table" and rebase_diag.conflict then
             -- The base moved under the branch and the same lines changed.
@@ -1084,7 +1103,7 @@ function M.new(deps)
             ok = false,
             phase = "verify",
             error = "cannot refresh the base before the checks: " .. tostring(rebase_err),
-            diagnosis = fetch_diagnosis(rebase_err),
+            diagnosis = git_lock_diagnosis(rebase_diag) or fetch_diagnosis(rebase_err),
           }
         end
         -- The rebase just fetched the remote and reports the exact ref it
@@ -1098,16 +1117,18 @@ function M.new(deps)
         -- reviewer reads would point at two different commits. The push leases
         -- the branch, so a concurrent push is still refused rather than lost.
         if type(deps.git.push) == "function" then
-          local pushed, push_err = deps.git.push(worktree, impl.ctx.branch, {
-            remote = "origin",
-            force = true,
-          })
+          local pushed, push_err, push_diag = retry_git_lock(opts, function()
+            return deps.git.push(worktree, impl.ctx.branch, {
+              remote = "origin",
+              force = true,
+            })
+          end)
           if not pushed then
             return nil, {
               ok = false,
               phase = "verify",
               error = "push after rebase failed: " .. tostring(push_err),
-              diagnosis = fetch_diagnosis(push_err),
+              diagnosis = git_lock_diagnosis(push_diag) or fetch_diagnosis(push_err),
             }
           end
         end
@@ -1645,6 +1666,80 @@ function M.new(deps)
       cause = "network",
       message = "cannot fetch the base from origin: " .. tostring(err or "no output"),
       remedy = "check the network, the remote and the credentials (gh auth status), then retry.",
+      transient = true,
+      retryable = true,
+      remediable = true,
+    }
+  end
+
+  -- Git ref-lock contention. Fetch is single-flight inside this process, but two
+  -- maki processes on the same clone can still lose the same `<ref>.lock` race.
+  -- A `git_lock` is a transient loss, not a broken task: replay the failed git
+  -- operation (never the model session) with a short bounded backoff before the
+  -- task is marked failed. The sleep seam keeps tests from waiting.
+  local GIT_LOCK_ATTEMPTS = 3
+  local GIT_LOCK_DELAY_MS = 200
+
+  function git_lock_sleep(opts)
+    if type(opts) == "table" and type(opts.sleep) == "function" then
+      return opts.sleep
+    end
+    if type(deps.sleep) == "function" then
+      return deps.sleep
+    end
+    local async = maki.async
+    if type(async) == "table" and type(async.sleep) == "function" then
+      return async.sleep
+    end
+    return function() end
+  end
+
+  local function git_lock_backoff_ms(opts)
+    local base = tonumber(type(opts) == "table" and opts.git_lock_delay_ms)
+      or GIT_LOCK_DELAY_MS
+    if base < 0 then
+      base = 0
+    end
+    local jitter = base > 0 and (math.random() * base) or 0
+    return math.floor(base + jitter)
+  end
+
+  -- Replay `fn` while it fails with `git_lock`. `fn` returns `(value, err,
+  -- diag)`; anything else is reported at once, so a permanent cause is never
+  -- repeated.
+  function retry_git_lock(opts, fn)
+    local attempts = math.floor(
+      tonumber(type(opts) == "table" and opts.git_lock_attempts) or GIT_LOCK_ATTEMPTS)
+    if attempts < 1 then
+      attempts = 1
+    end
+    local sleep = git_lock_sleep(opts)
+    local value, err, diag
+    for attempt = 1, attempts do
+      value, err, diag = fn()
+      if value then
+        return value, err, diag
+      end
+      if type(diag) ~= "table" or diag.cause ~= "git_lock" then
+        return value, err, diag
+      end
+      if attempt < attempts then
+        sleep(git_lock_backoff_ms(opts))
+      end
+    end
+    return value, err, diag
+  end
+
+  -- A git diagnostic uses `hint` where the failure policy reads `remedy`.
+  function git_lock_diagnosis(diag)
+    if type(diag) ~= "table" or diag.cause ~= "git_lock" then
+      return nil
+    end
+    return {
+      cause = "git_lock",
+      message = diag.message or "another git process holds the ref lock",
+      remedy = diag.remedy or diag.hint
+        or "retry in a moment: the ref lock is transient",
       transient = true,
       retryable = true,
       remediable = true,

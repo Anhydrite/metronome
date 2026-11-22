@@ -2214,6 +2214,170 @@ auto_deploy = false
     "a fetch failure is transient, so it stays retryable")
   has(tostring(fetch_record.failure_reason), "network", "the reason names the cause")
 
+  -- A git_lock is replayed, bounded, before the task is failed ------------
+  --
+  -- Two maki processes on the same clone can race for a ref lock even though
+  -- fetch is single-flight in process. The runtime replays the failed git step
+  -- with a short bounded backoff (three attempts, ~200 ms jittered) instead of
+  -- condemning the task on the first lock. The sleep seam keeps the test fast,
+  -- and the step that is replayed is the git operation, not the model session.
+  local function check_git_lock_replay()
+  local lock_diag = {
+    cause = "git_lock",
+    message = "cannot lock ref 'refs/remotes/origin/main'",
+    hint = "another git process holds a ref lock; retry in a moment",
+  }
+
+  local replay_seen = { rebase = 0, checks = 0 }
+  local replay_sleeps = {}
+  local replay_record = {
+    id = "T1", status = "ready", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+    checkpoints = { "c1", "c2" }, run_dir = "/tmp/runs/T1",
+  }
+  local replay_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(replay_record),
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = {
+      verify = function()
+        replay_seen.checks = replay_seen.checks + 1
+        return { ok = true }
+      end,
+      write_report = function() end,
+    },
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = {
+      rebase = function()
+        replay_seen.rebase = replay_seen.rebase + 1
+        if replay_seen.rebase < 3 then
+          return nil, "rebase failed [git_lock]: cannot lock ref", lock_diag
+        end
+        return { ok = true, base = "origin/main@fresh", sha = "rebsha" }
+      end,
+      run = function() return { ok = true } end,
+    },
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if replay_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    sleep = function(ms) replay_sleeps[#replay_sleeps + 1] = ms end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_replay = runtime.new(replay_deps)
+  rt_replay.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_replay.run_pending()
+  eq(replay_seen.rebase, 3, "a git_lock on the rebase is replayed up to the third attempt")
+  eq(#replay_sleeps, 2, "the replay backs off between attempts")
+  eq(type(replay_sleeps[1]) == "number" and replay_sleeps[1] >= 200
+    and replay_sleeps[1] < 400, true, "the replay backoff is short and jittered around 200 ms")
+  eq(replay_seen.checks, 1, "the task goes on to its checks after the replay")
+  eq(replay_record.status ~= "failed", true, "a first git_lock does not fail the task")
+  eq(replay_record.failure, nil, "a replayed git_lock leaves no failure on the task")
+
+  -- An exhausted git_lock fails the task, names the cause and keeps every
+  -- artefact a retry resumes from.
+  local exhausted_seen = { rebase = 0 }
+  local exhausted_sleeps = {}
+  local exhausted_record = {
+    id = "T1", status = "ready", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+    checkpoints = { "c1", "c2" }, run_dir = "/tmp/runs/T1",
+  }
+  local exhausted_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+          recover = { max_attempts = 1, backoff_base_secs = 0 },
+        }
+      end,
+    },
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(exhausted_record),
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = {
+      rebase = function()
+        exhausted_seen.rebase = exhausted_seen.rebase + 1
+        return nil, "rebase failed [git_lock]: cannot lock ref", lock_diag
+      end,
+      run = function() return { ok = true } end,
+    },
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if exhausted_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    sleep = function(ms) exhausted_sleeps[#exhausted_sleeps + 1] = ms end,
+    defer = function() return {} end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_exhausted = runtime.new(exhausted_deps)
+  rt_exhausted.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_exhausted.run_pending()
+  eq(exhausted_seen.rebase, 3, "an exhausted git_lock stops after three attempts")
+  eq(#exhausted_sleeps, 2, "an exhausted replay backs off twice")
+  eq(exhausted_record.status, "failed", "an exhausted git_lock fails the task")
+  eq(type(exhausted_record.failure), "table", "the failure is a typed record")
+  eq(exhausted_record.failure and exhausted_record.failure.cause, "git_lock",
+    "the failure names git_lock")
+  eq(exhausted_record.failure and exhausted_record.failure.transient, true,
+    "git_lock is transient")
+  has(tostring(exhausted_record.failure_reason), "git_lock", "the reason names git_lock")
+  has(tostring(exhausted_record.failure_reason), "retry", "the reason names the remedy")
+  eq(exhausted_record.branch, "metronome/t1", "the failure keeps the branch")
+  eq(exhausted_record.worktree, "/tmp/wt-t1", "the failure keeps the worktree")
+  eq(exhausted_record.run_dir, "/tmp/runs/T1", "the failure keeps the transcript directory")
+  eq(#(exhausted_record.checkpoints or {}), 2, "the failure keeps the checkpoints")
+
+  
+  end
+  check_git_lock_replay()
+
   -- metronome_retry restarts a failed task and resets the attempt budget ----
   local retry_record = {
     id = "T1", status = "failed", title = "t", checks = { "true" },

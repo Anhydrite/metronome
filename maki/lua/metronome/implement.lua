@@ -214,11 +214,73 @@ local function check_module(name, module, functions)
   return true
 end
 
+-- Git lock replay -----------------------------------------------------------
+--
+-- Fetch is single-flight inside this process (git.lua), but two maki processes
+-- on the same clone can still race for the same ref lock and one loses with
+-- "cannot lock ref". That is contention, not a broken task: the caller replays
+-- the failed git operation with a short, bounded backoff before anything is
+-- marked failed. Only the git call is replayed -- never the model session.
+local GIT_LOCK_ATTEMPTS = 3
+local GIT_LOCK_DELAY_MS = 200
+
+-- The sleep is injected so a test proves the budget without waiting on it.
+local function sleep_for(opts)
+  if type(opts) == "table" and type(opts.sleep) == "function" then
+    return opts.sleep
+  end
+  local async = maki.async
+  if type(async) == "table" and type(async.sleep) == "function" then
+    return async.sleep
+  end
+  return function() end
+end
+
+-- ~200 ms with jitter, so two tasks that collided do not replay in lockstep
+-- and collide again.
+local function git_lock_backoff_ms(opts)
+  local base = tonumber(type(opts) == "table" and opts.git_lock_delay_ms) or GIT_LOCK_DELAY_MS
+  if base < 0 then
+    base = 0
+  end
+  local jitter = base > 0 and (math.random() * base) or 0
+  return math.floor(base + jitter)
+end
+
+-- Run `fn`, replaying only while git classifies the failure as `git_lock`.
+-- `fn` returns `(value, err, diag)`; the replay stops on the first value or on
+-- any other cause, so a permanent failure is reported once.
+local function retry_git_lock(opts, fn)
+  local attempts = math.floor(tonumber(type(opts) == "table" and opts.git_lock_attempts)
+    or GIT_LOCK_ATTEMPTS)
+  if attempts < 1 then
+    attempts = 1
+  end
+  local sleep = sleep_for(opts)
+  local value, err, diag
+  for attempt = 1, attempts do
+    value, err, diag = fn()
+    if value then
+      return value, err, diag
+    end
+    if type(diag) ~= "table" or diag.cause ~= "git_lock" then
+      return value, err, diag
+    end
+    if attempt < attempts then
+      sleep(git_lock_backoff_ms(opts))
+    end
+  end
+  return value, err, diag
+end
+
 -- Create or re-attach the task worktree and move the task to running.
 --
 -- Reuse is the normal path: a second turn finds the worktree already listed.
 -- When only the branch survived a removed worktree, the `branch_exists`
 -- diagnostic is the signal to check that branch out instead of creating it.
+--
+-- Every git step hands back its diagnostic as a third value, so a caller can
+-- tell a ref lock (`git_lock`) from a missing remote or a credential problem.
 function M.prepare(opts)
   opts = type(opts) == "table" and opts or {}
 
@@ -255,9 +317,11 @@ function M.prepare(opts)
   end
   local remote = opts.remote or "origin"
 
-  local fetched, ferr = opts.git.fetch(opts.repo, remote)
+  local fetched, ferr, fdiag = retry_git_lock(opts, function()
+    return opts.git.fetch(opts.repo, remote)
+  end)
   if not fetched then
-    return nil, ferr
+    return nil, ferr, fdiag
   end
 
   local worktree = M.worktree_path(opts.root, task_id, opts)
@@ -267,9 +331,11 @@ function M.prepare(opts)
   local branch = is_non_empty(task.branch) and task.branch
     or M.branch_for(task_id, { branch_prefix = opts.branch_prefix, title = task.title })
 
-  local listed, lerr = opts.git.worktree_list(opts.repo)
+  local listed, lerr, ldiag = retry_git_lock(opts, function()
+    return opts.git.worktree_list(opts.repo)
+  end)
   if not listed then
-    return nil, lerr
+    return nil, lerr, ldiag
   end
   local reuse = false
   for _, path in ipairs(listed) do
@@ -287,12 +353,16 @@ function M.prepare(opts)
   end
 
   if not reuse then
-    local made, merr, diag = opts.git.worktree_add(opts.repo, worktree, branch, base, { remote = remote })
+    local made, merr, diag = retry_git_lock(opts, function()
+      return opts.git.worktree_add(opts.repo, worktree, branch, base, { remote = remote })
+    end)
     if not made and type(diag) == "table" and diag.cause == "branch_exists" then
-      made, merr, diag = opts.git.worktree_add(opts.repo, worktree, branch, base, { existing = true })
+      made, merr, diag = retry_git_lock(opts, function()
+        return opts.git.worktree_add(opts.repo, worktree, branch, base, { existing = true })
+      end)
     end
     if not made then
-      return nil, merr
+      return nil, merr, diag
     end
   end
 
@@ -437,9 +507,11 @@ function M.assert_task_branch(branch, base)
 end
 
 local function run_impl(opts)
-  local ctx, perr = M.prepare(opts)
+  local ctx, perr, pdiag = M.prepare(opts)
   if not ctx then
-    return { ok = false, error = perr }
+    -- Keep the git diagnostic: a ref lock (`git_lock`) is not the same failure
+    -- as a missing remote or a bad credential, and the caller names it.
+    return { ok = false, error = perr, diagnosis = pdiag, phase = "implement" }
   end
 
   local branch_ok, branch_err = M.assert_task_branch(ctx.branch, opts.base_ref or "main")
@@ -500,7 +572,9 @@ local function run_impl(opts)
   local no_changes = false
 
   if opts.commit ~= false then
-    local csha, ccerr = opts.git.commit(ctx.worktree, M.commit_message(opts.task, opts))
+    local csha, ccerr, cdiag = retry_git_lock(opts, function()
+      return opts.git.commit(ctx.worktree, M.commit_message(opts.task, opts))
+    end)
     if not csha then
       -- A commit that found nothing to record is benign: the tree is clean,
       -- either because the turn really committed (HEAD moved past the
@@ -515,7 +589,15 @@ local function run_impl(opts)
         sha = head
         no_changes = (head == checkpoint)
       else
-        return { ok = false, error = ccerr, ctx = ctx, checkpoint = checkpoint, run = run }
+        return {
+          ok = false,
+          error = ccerr,
+          diagnosis = cdiag,
+          phase = "implement",
+          ctx = ctx,
+          checkpoint = checkpoint,
+          run = run,
+        }
       end
     else
       sha = csha
@@ -529,14 +611,18 @@ local function run_impl(opts)
     -- A plain push would be refused as non-fast-forward on a branch the
     -- pipeline owns, so the push leases it: it only replaces the remote branch
     -- when the remote still holds what we last fetched.
-    local pushed, push_err = opts.git.push(ctx.worktree, ctx.branch, {
-      remote = opts.remote or "origin",
-      force = true,
-    })
+    local pushed, push_err, push_diag = retry_git_lock(opts, function()
+      return opts.git.push(ctx.worktree, ctx.branch, {
+        remote = opts.remote or "origin",
+        force = true,
+      })
+    end)
     if not pushed then
       return {
         ok = false,
         error = push_err,
+        diagnosis = push_diag,
+        phase = "implement",
         ctx = ctx,
         checkpoint = checkpoint,
         run = run,
