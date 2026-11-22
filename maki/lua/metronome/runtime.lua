@@ -1517,19 +1517,39 @@ function M.new(deps)
     end
 
     -- A task the gate moved to ready passed it: its quarantine must go away.
-    -- `maki.NIL` is JSON null and state.lua's replay drops a null field patch,
-    -- so this is a targeted clear instead of rewriting the whole record (which
-    -- would silently discard any event another writer appended in between).
-    -- Skipped when the task is not quarantined, so a clean pass appends nothing.
+    -- state.lua's replay only implements set/patch field events, with no way to
+    -- delete a key, so a `{ quarantine = nil }` patch is an empty event and a
+    -- null patch would persist `quarantine: null` (schema-invalid). Rewrite the
+    -- record through a `task_created` event instead: replay replaces the whole
+    -- record, so the key is genuinely gone. The read is fresh and guarded, and
+    -- only an already-quarantined task is rewritten, so a clean pass appends
+    -- nothing.
     local function clear_quarantine(task_id)
-      local previous = current_task(task_id)
-      if type(previous) ~= "table" then
+      if type(deps.state.load) ~= "function" or type(deps.state.append) ~= "function" then
         return
       end
-      if previous.quarantine == nil or previous.quarantine == maki.NIL then
+      local ok, loaded = pcall(deps.state.load, paths.root)
+      if not ok or type(loaded) ~= "table" or type(loaded.tasks) ~= "table" then
         return
       end
-      pcall(deps.state.set_fields, paths.root, task_id, { quarantine = maki.NIL })
+      local current = loaded.tasks[task_id]
+      if type(current) ~= "table" then
+        return
+      end
+      if current.quarantine == nil or current.quarantine == maki.NIL then
+        return
+      end
+      local rewritten = {}
+      for key, value in pairs(current) do
+        if key ~= "quarantine" then
+          rewritten[key] = value
+        end
+      end
+      pcall(deps.state.append, paths.root, {
+        kind = "task_created",
+        task_id = task_id,
+        task = rewritten,
+      })
     end
 
     if type(gate) == "table" and type(gate.blocked) == "table" then
@@ -1615,6 +1635,12 @@ function M.new(deps)
     -- of a scope when it ends: the sessions died mid-review. A spawn outlives
     -- the drain, and a finished task re-triggers the drain to refill the slots.
     local function dispatch_one(task)
+      -- Never hand a quarantined id to the runner, whatever the scheduler's
+      -- view says: the gate is expected to keep blocked tasks in `qualifying`,
+      -- but the invariant should not depend on that contract alone.
+      if type(task) ~= "table" or quarantine_set[task.id] then
+        return
+      end
       local fn = function()
         local result = run_task(opts, task.id, paths, cfg, runner, session)
         if type(result) == "table" and result.conflict then
@@ -1685,7 +1711,14 @@ function M.new(deps)
       }
     end
 
-    local loaded = deps.state.load(paths.root)
+    -- Guarded like the snapshot read above: with no early return, a gate
+    -- failure rooted in a state-load error now reaches this point, and an
+    -- unguarded load here would raise after dispatch instead of reporting
+    -- `ok = true` like the async path.
+    local loaded_ok, loaded = pcall(deps.state.load, paths.root)
+    if not loaded_ok or type(loaded) ~= "table" then
+      loaded = nil
+    end
     local last = nil
     local pending = {}
     for _, task in pairs(loaded and loaded.tasks or {}) do

@@ -195,15 +195,7 @@ function M.replay(text)
             end
           elseif event.kind == "field" then
             for k, v in pairs(event.fields or {}) do
-              -- A JSON null in a patch clears the key. A Lua nil cannot say
-              -- that (it is an absent key, so no patch at all), and keeping
-              -- the null would persist `x: null`, which the task schema
-              -- rejects wherever it expects an object or an array.
-              if v == maki.NIL then
-                task[k] = nil
-              else
-                task[k] = v
-              end
+              task[k] = v
             end
           elseif event.kind == "note" then
             task.notes = task.notes or {}

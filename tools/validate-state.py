@@ -54,14 +54,7 @@ def replay(events: list[dict]) -> dict[str, dict]:
                 if "phase" in event:
                     task["phase"] = event["phase"]
             elif kind == "field":
-                for key, value in (event.get("fields") or {}).items():
-                    # A JSON null in a patch clears the key (state.lua replay
-                    # drops it too): keeping it would persist `x: null`, which
-                    # the task schema rejects where it expects object/array.
-                    if value is None:
-                        task.pop(key, None)
-                    else:
-                        task[key] = value
+                task.update(event.get("fields") or {})
             elif kind == "note":
                 task.setdefault("notes", []).append(event.get("text"))
             if "at" in event:

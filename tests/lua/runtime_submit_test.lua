@@ -1719,25 +1719,25 @@ auto_deploy = false
         if q_tasks[id] then q_tasks[id].status = status end
         return { id = id, status = status }
       end,
-      -- Mirror state.lua's replay: a maki.NIL value in a patch clears the key,
-      -- a plain value sets it. `{ quarantine = nil }` would be an empty patch.
+      -- Mirror state.lua's replay: a field patch sets each key it carries.
       set_fields = function(_, id, fields)
         local task = q_tasks[id]
         if task then
           for key, value in pairs(fields or {}) do
-            if value == maki.NIL then
-              task[key] = nil
-            else
-              task[key] = value
-            end
+            task[key] = value
           end
         end
         return task
       end,
-      -- The old clear rewrote the whole record with a fresh task_created; a
-      -- targeted field patch must never need that.
-      append = function()
+      -- state.lua replay has no field-delete event, so clearing a quarantine
+      -- goes through a task_created rewrite: mirror that replacement here.
+      append = function(_, event)
         q_appends = q_appends + 1
+        if type(event) == "table" and event.kind == "task_created"
+          and event.task_id and type(event.task) == "table" then
+          q_tasks[event.task_id] = event.task
+          q_tasks[event.task_id].id = event.task_id
+        end
         return { tasks = q_tasks }
       end,
     },
@@ -1886,8 +1886,8 @@ auto_deploy = false
   rt_q.run_pending()
   eq(q_tasks["T-2"].quarantine, nil,
     "a task that passes the gate is no longer shown as quarantined")
-  eq(q_appends, 0,
-    "clearing a quarantine patches the field instead of rewriting the record")
+  eq(q_appends, 1,
+    "clearing a quarantine rewrites the record once, since replay has no field delete")
 
   -- Synchronous drain: a quarantined sibling must not count as a task that
   -- failed to finish, and the merged sibling must still deploy.
@@ -1917,11 +1917,7 @@ auto_deploy = false
         local task = s_tasks[id]
         if task then
           for key, value in pairs(fields or {}) do
-            if value == maki.NIL then
-              task[key] = nil
-            else
-              task[key] = value
-            end
+            task[key] = value
           end
         end
         return task
@@ -2089,7 +2085,7 @@ auto_deploy = false
   eq(r_ticks > 0, true, "the drain still ticks the scheduler after a gate error")
 
   -- A repaired task: the next pass clears the field through the journal, and
-  -- replay drops the null patch so the key is gone, not null.
+  -- replay drops the key because the record is rewritten without it.
   r_gate_mode = "repaired"
   r_ticks = 0
   rt_r.answer({ answers = {} }, ctx)
