@@ -2,9 +2,14 @@
 --
 -- Qualification produces one sheet at a time; this module is what looks at
 -- the set. It finds the contradictions, duplicates and gaps a human would
--- catch by reading every sheet side by side: two tasks with the same title,
--- two tasks that would edit the same file without an ordering, a dependency
--- that names nothing, a cycle, a task with no files or no checks.
+-- catch by reading every sheet side by side: two tasks with the same title, a
+-- dependency that names nothing, a cycle, a task with no files or no checks.
+-- Two tasks touching the same file is not a contradiction: each task works in
+-- its own worktree, and any conflict is resolved when the branches merge.
+--
+-- Inter-task rules only compare tasks that share a base_ref: two tasks cut
+-- from different base branches are never concurrent, so overlap, duplicates
+-- and cycles across them are meaningless.
 --
 -- Two halves, deliberately separate:
 --   * the structural half is pure Lua over the task tables — no state, no
@@ -289,6 +294,7 @@ function M.analyze(tasks, opts)
   local keys = {}
   local dep_map = {}
   local id_set = {}
+  local groups = {}
 
   for i, raw in ipairs(list) do
     local task = type(raw) == "table" and raw or {}
@@ -300,12 +306,34 @@ function M.analyze(tasks, opts)
     checksets[i] = string_list(task.checks)
     keys[i] = table.concat(filesets[i], ",")
     dep_map[id] = string_list(task.depends_on)
+    -- The group a task belongs to: its base_ref, else the batch base_ref,
+    -- else the default group. Inter-task rules never cross groups: two tasks
+    -- cut from different base branches are never concurrent.
+    local group_key = ""
+    if is_non_empty(task.base_ref) then
+      group_key = trim(task.base_ref)
+    elseif type(opts.base_ref) == "string" and opts.base_ref ~= "" then
+      group_key = opts.base_ref
+    end
+    groups[i] = group_key
+  end
+
+  local group_indexes = {}
+  for i = 1, #ids do
+    local key = groups[i]
+    group_indexes[key] = group_indexes[key] or {}
+    local group = group_indexes[key]
+    group[#group + 1] = i
+  end
+
+  local function same_group(i, j)
+    return groups[i] == groups[j]
   end
 
   -- duplicate_title: two sheets a human would read as the same task.
   for i = 1, #ids do
     for j = i + 1, #ids do
-      if titles[i] ~= "" and titles[i] == titles[j] then
+      if same_group(i, j) and titles[i] ~= "" and titles[i] == titles[j] then
         findings[#findings + 1] = {
           severity = "blocking",
           rule = "duplicate_title",
@@ -318,15 +346,18 @@ function M.analyze(tasks, opts)
     end
   end
 
-  -- duplicate_files: two sheets that would change exactly the same files.
+  -- duplicate_files: two sheets declaring exactly the same files. Like
+  -- file_overlap, this is not a conflict — each task works in its own
+  -- worktree and the branches merge independently — so it only advises.
   for i = 1, #ids do
     for j = i + 1, #ids do
-      if keys[i] ~= "" and keys[i] == keys[j] then
+      if same_group(i, j) and keys[i] ~= "" and keys[i] == keys[j] then
         findings[#findings + 1] = {
-          severity = "blocking",
+          severity = "minor",
           rule = "duplicate_files",
           message = string.format(
-            "tasks %s and %s declare the same files: %s", ids[i], ids[j], keys[i]
+            "tasks %s and %s declare the same files: %s; both merge independently, so make sure their changes compose",
+            ids[i], ids[j], keys[i]
           ),
           tasks = { ids[i], ids[j] },
         }
@@ -334,22 +365,23 @@ function M.analyze(tasks, opts)
     end
   end
 
-  -- file_overlap: two sheets that touch a shared file with no ordering
-  -- between them. An explicit dependency either way is the ordering, so the
-  -- scheduler can run them in sequence and the overlap is not a finding.
+  -- file_overlap: two sheets touching a shared file. Overlap is the point of
+  -- worktrees, not a conflict: the two branches merge independently and any
+  -- textual conflict is resolved at merge time. The finding is kept as minor
+  -- advice so a human can still spot an accidental split.
   local reaches = make_reacher(dep_map)
   for i = 1, #ids do
     for j = i + 1, #ids do
-      if keys[i] ~= "" and keys[j] ~= "" and keys[i] ~= keys[j] then
+      if same_group(i, j) and keys[i] ~= "" and keys[j] ~= "" and keys[i] ~= keys[j] then
         local shared = intersection(filesets[i], filesets[j])
         if #shared > 0
           and not reaches(ids[i], ids[j])
           and not reaches(ids[j], ids[i]) then
           findings[#findings + 1] = {
-            severity = "blocking",
+            severity = "minor",
             rule = "file_overlap",
             message = string.format(
-              "tasks %s and %s both touch %s and neither depends on the other",
+              "tasks %s and %s both touch %s; they merge independently and any conflict resolves at merge",
               ids[i], ids[j], table.concat(shared, ", ")
             ),
             tasks = { ids[i], ids[j] },
@@ -384,7 +416,8 @@ function M.analyze(tasks, opts)
             severity = "blocking",
             rule = "missing_dependency",
             message = string.format(
-              "task %s depends on unknown task %s", ids[i], dep
+              "task %s depends on %s, which is neither a task id, a task title nor an index of the batch",
+              ids[i], dep
             ),
             tasks = { ids[i] },
           }
@@ -412,15 +445,23 @@ function M.analyze(tasks, opts)
     end
   end
 
-  -- dependency_cycle: a loop among two or more tasks.
-  for _, cycle in ipairs(find_cycles(ids, dep_map, id_set)) do
-    local path = table.concat(cycle, " -> ") .. " -> " .. cycle[1]
-    findings[#findings + 1] = {
-      severity = "blocking",
-      rule = "dependency_cycle",
-      message = "dependency cycle: " .. path,
-      tasks = cycle,
-    }
+  -- dependency_cycle: a loop among two or more tasks of the same base
+  -- branch. A cycle across groups would be an artifact: those tasks are
+  -- never scheduled together.
+  for _, indexes in pairs(group_indexes) do
+    local group_ids = {}
+    for k, i in ipairs(indexes) do
+      group_ids[k] = ids[i]
+    end
+    for _, cycle in ipairs(find_cycles(group_ids, dep_map, id_set)) do
+      local path = table.concat(cycle, " -> ") .. " -> " .. cycle[1]
+      findings[#findings + 1] = {
+        severity = "blocking",
+        rule = "dependency_cycle",
+        message = "dependency cycle: " .. path,
+        tasks = cycle,
+      }
+    end
   end
 
   -- gate_cycle / undeclared_gate_dependency: a check that runs a file another
@@ -431,7 +472,9 @@ function M.analyze(tasks, opts)
   -- cannot show this, so the analyst must.
   local owners = {}
   local file_sets = {}
+  local id_group = {}
   for i = 1, #ids do
+    id_group[ids[i]] = groups[i]
     file_sets[ids[i]] = {}
     for _, file in ipairs(filesets[i]) do
       file_sets[ids[i]][file] = true
@@ -447,8 +490,11 @@ function M.analyze(tasks, opts)
         local file_owners = owners[token]
         if file_owners and not file_sets[me][token] then
           for owner in pairs(file_owners) do
-            local key = me .. "\0" .. owner .. "\0" .. token
-            if not gate_reported[key] then
+            -- Tasks of another base branch never run concurrently with this
+            -- one, so owning the same gate file is not a coupling.
+            if id_group[owner] == id_group[me] then
+              local key = me .. "\0" .. owner .. "\0" .. token
+              if not gate_reported[key] then
               gate_reported[key] = true
               if reaches(owner, me) then
                 findings[#findings + 1] = {
@@ -470,6 +516,7 @@ function M.analyze(tasks, opts)
                   ),
                   tasks = { me, owner },
                 }
+              end
               end
             end
           end
@@ -581,7 +628,7 @@ function M.analyze(tasks, opts)
       mine[f] = true
     end
     for j = 1, #ids do
-      if i ~= j and not depends_on(ids[i], ids[j]) then
+      if i ~= j and same_group(i, j) and not depends_on(ids[i], ids[j]) then
         for _, file in ipairs(filesets[j]) do
           if not mine[file] then
             local base = file:match("([^/]+)$") or file

@@ -123,11 +123,11 @@ return function()
     "a declared dependency is not flagged")
 
   local dup_files_finding = find_rule(dup_files, "duplicate_files")
-  eq(dup_files_finding and dup_files_finding.severity, "blocking", "duplicate_files is blocking")
+  eq(dup_files_finding and dup_files_finding.severity, "minor", "duplicate_files is minor")
   eq(dup_files_finding and dup_files_finding.tasks[1], "T-20261114-b003", "duplicate_files names the first task")
   eq(dup_files_finding and dup_files_finding.tasks[2], "T-20261114-b004", "duplicate_files names the second task")
   has(dup_files_finding and dup_files_finding.message or "", "src/a.lua", "duplicate_files names the files")
-  eq(dup_files.ok, false, "duplicate_files blocks")
+  eq(dup_files.ok, true, "duplicate_files does not block")
 
   -- analyze: file_overlap -------------------------------------------------
 
@@ -136,11 +136,49 @@ return function()
     task("T-20261114-c002", "Second", { "src/shared.lua", "src/two.lua" }),
   })
   local overlap_finding = find_rule(overlap, "file_overlap")
-  eq(overlap_finding and overlap_finding.severity, "blocking", "file_overlap is blocking")
-  eq(overlap_finding and overlap_finding.tasks[1], "T-20261114-c001", "file_overlap names the first task")
-  eq(overlap_finding and overlap_finding.tasks[2], "T-20261114-c002", "file_overlap names the second task")
-  has(overlap_finding and overlap_finding.message or "", "src/shared.lua", "file_overlap names the shared file")
-  eq(overlap.ok, false, "file_overlap blocks")
+  eq(overlap.ok, true, "file_overlap does not block")
+  eq(overlap_finding == nil or overlap_finding.severity, "minor", "file_overlap is minor when emitted")
+  if overlap_finding then
+    eq(overlap_finding.tasks[1], "T-20261114-c001", "file_overlap names the first task")
+    eq(overlap_finding.tasks[2], "T-20261114-c002", "file_overlap names the second task")
+    has(overlap_finding.message, "src/shared.lua", "file_overlap names the shared file")
+  end
+  for _, finding in ipairs(overlap.findings) do
+    eq(finding.severity ~= "blocking", true, "two tasks sharing a file produce no blocking finding")
+  end
+
+  -- analyze: inter-task rules are scoped by base_ref -----------------------
+
+  -- Two tasks cut from different base branches are never concurrent: same
+  -- title, same files and checks that name each other's files must not be
+  -- compared at all.
+  local other_epics = analyze.analyze({
+    { id = "T-20261122-a001", title = "Shared title", files = { "src/shared.lua" },
+      checks = { "node src/other.js" }, depends_on = {}, base_ref = "metronome/epic/a" },
+    { id = "T-20261122-b001", title = "  shared   TITLE.  ", files = { "src/shared.lua" },
+      checks = { "node src/shared.js" }, depends_on = {}, base_ref = "metronome/epic/b" },
+  })
+  eq(other_epics.ok, true, "tasks of different epics are ok")
+  eq(#other_epics.findings, 0, "tasks of different base_refs are never compared")
+
+  -- A shared base_ref via opts groups the whole batch: a real duplicate is
+  -- still caught inside one epic.
+  local same_epic = analyze.analyze({
+    { id = "T-20261122-a002", title = "Shared title", files = { "src/shared.lua" },
+      checks = { "make test" }, depends_on = {} },
+    { id = "T-20261122-a003", title = "shared title", files = { "src/other.lua" },
+      checks = { "make test" }, depends_on = {} },
+  }, { base_ref = "metronome/epic/a" })
+  eq(find_rule(same_epic, "duplicate_title") ~= nil, true, "duplicate_title still fires inside one base_ref group")
+
+  -- A task base_ref wins over the batch base_ref.
+  local task_base_wins = analyze.analyze({
+    { id = "T-20261122-a004", title = "Shared title", files = { "src/shared.lua" },
+      checks = { "make test" }, depends_on = {}, base_ref = "metronome/epic/a" },
+    { id = "T-20261122-a005", title = "shared title", files = { "src/other.lua" },
+      checks = { "make test" }, depends_on = {} },
+  }, { base_ref = "metronome/epic/b" })
+  eq(find_rule(task_base_wins, "duplicate_title"), nil, "a task base_ref overrides the batch base_ref")
 
   local ordered = analyze.analyze({
     task("T-20261114-c003", "Second", { "src/shared.lua", "src/two.lua" }, nil, { "T-20261114-c004" }),
@@ -165,6 +203,7 @@ return function()
   eq(missing_finding and missing_finding.severity, "blocking", "missing_dependency is blocking")
   eq(missing_finding and missing_finding.tasks[1], "T-20261114-e001", "missing_dependency names the task")
   has(missing_finding and missing_finding.message or "", "T-20261114-ffff", "missing_dependency names the unknown id")
+  has(missing_finding and missing_finding.message or "", "neither a task id, a task title nor an index", "missing_dependency explains the reference kinds")
   eq(missing.ok, false, "missing_dependency blocks")
 
   local known = analyze.analyze({
