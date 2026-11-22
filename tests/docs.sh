@@ -11,6 +11,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 README="$ROOT/README.md"
 ARCH="$ROOT/docs/architecture.md"
 CONFIG="$ROOT/docs/configuration.md"
+PROMPT="$ROOT/system-prompt.md"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -45,6 +46,13 @@ fi
 if grep -qi "chef-dorchestre" "$README"; then
   fail "README.md still names the retired chef-dorchestre agent"
 fi
+# The mandatory init preflight is part of the contract: its five verification
+# themes, its refusal semantics and its reach to /metronome config must be
+# documented, or the change silently disappears.
+for needle in "preflight" "git identity" "declared checks" "origin" \
+  "jsonschema" "/metronome config"; do
+  need "$README" "$needle" "readme preflight"
+done
 ok readme
 
 # docs/architecture.md -------------------------------------------------------
@@ -79,6 +87,23 @@ done
 while IFS= read -r section; do
   need "$CONFIG" "[$section]" "configuration"
 done < <(grep -oE '^\[[a-z]+\]' "$ROOT/templates/config.toml" | tr -d '[]' | sort -u)
+
+# The Preflight subsection must name the five verifications and the refusal
+# contract, and state that /metronome config runs the same preflight.
+for needle in "## Preflight" "preflight" "git identity" "declared checks" \
+  "origin" "jsonschema" "/metronome config"; do
+  need "$CONFIG" "$needle" "configuration preflight"
+done
 ok configuration
+
+# system-prompt.md -------------------------------------------------------------
+
+[[ -f "$PROMPT" ]] || fail "system-prompt.md is missing"
+[[ -s "$PROMPT" ]] || fail "system-prompt.md is empty"
+for needle in "preflight" "refused when the preflight fails" \
+  "relay the reported check, command and remedy verbatim"; do
+  need "$PROMPT" "$needle" "system-prompt"
+done
+ok system-prompt
 
 echo "PASS"
