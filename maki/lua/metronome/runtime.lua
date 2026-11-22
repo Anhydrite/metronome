@@ -1700,28 +1700,74 @@ function M.new(deps)
     return (scheduler_dirty or #scheduler_extra > 0) and not scheduler_running
   end
 
+  -- Bound on the re-entry, so a pathological dirty-setter cannot spin forever.
+  -- A wake that lands in the exit window costs one more pass; only a task that
+  -- re-arms the scheduler from its own completion path and never lets the queue
+  -- empty reaches the cap. The work is not dropped: it stays pending for the
+  -- poller (`has_pending`), and the log says why the drain gave up.
+  local MAX_DRAIN_PASSES = 32
+  local MAX_DRAIN_STALLS = 2
+
+  local function wake_pending()
+    return scheduler_dirty or #scheduler_extra > 0
+  end
+
   function runtime.run_pending()
     if scheduler_running or not scheduler_job then
       return
     end
-    scheduler_running = true
     local job = scheduler_job
-    local ok, err = pcall(function()
-      while #scheduler_extra > 0 or scheduler_dirty do
-        while #scheduler_extra > 0 do
-          local fn = table.remove(scheduler_extra, 1)
-          fn()
+    local passes, stalls = 0, 0
+    while true do
+      scheduler_running = true
+      local progressed = false
+      local ok, err = pcall(function()
+        while wake_pending() do
+          while #scheduler_extra > 0 do
+            local fn = table.remove(scheduler_extra, 1)
+            progressed = true
+            fn()
+          end
+          if scheduler_dirty then
+            scheduler_dirty = false
+            progressed = true
+            runtime.last_background = after_questions(
+              job.opts, job.paths, job.cfg, job.runner, job.session)
+          end
         end
-        if scheduler_dirty then
-          scheduler_dirty = false
-          runtime.last_background = after_questions(
-            job.opts, job.paths, job.cfg, job.runner, job.session)
+        -- Exit window: the body has drained everything, but `scheduler_running`
+        -- is still true, so a task finishing right now has its own
+        -- `run_pending` refused and only leaves `scheduler_dirty` behind.
+        -- `deps.scheduler_exit` is the seam that places that wake here in a
+        -- test. Running it inside the pcall keeps a failing seam logged like
+        -- any other body error.
+        if type(deps.scheduler_exit) == "function" then
+          deps.scheduler_exit()
         end
+      end)
+      -- The decision is taken AFTER `scheduler_running` is false: a wake that
+      -- landed during the exit window re-enters the drain instead of being
+      -- dropped, which is what used to stall the pipeline silently.
+      scheduler_running = false
+      passes = passes + 1
+      if not ok then
+        progressed = false
+        log(job.paths, "background scheduler error: " .. tostring(err))
       end
-    end)
-    scheduler_running = false
-    if not ok then
-      log(job.paths, "background scheduler error: " .. tostring(err))
+      if not wake_pending() then
+        return
+      end
+      if progressed then
+        stalls = 0
+      else
+        stalls = stalls + 1
+      end
+      if passes >= MAX_DRAIN_PASSES or stalls >= MAX_DRAIN_STALLS then
+        log(job.paths, string.format(
+          "background scheduler: stopping after %d pass(es) with %d without progress;"
+            .. " the pending work stays queued for the poller", passes, stalls))
+        return
+      end
     end
   end
 
