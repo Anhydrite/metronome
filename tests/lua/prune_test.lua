@@ -38,10 +38,12 @@ return function()
         end,
         pr_close = function(ref)
           if hooks.pr_close then hooks.pr_close(ref) end
+          if hooks.pr_close_result ~= nil then return hooks.pr_close_result end
           return { closed = true }
         end,
         delete_branch = function(_, branch)
           if hooks.delete_branch then hooks.delete_branch(branch) end
+          if hooks.delete_result ~= nil then return hooks.delete_result end
           return { ok = true }
         end,
       },
@@ -207,4 +209,37 @@ return function()
     "the summary names a gone branch")
   eq(summary_has(gone, "closed (gone): #70 branch metronome/gone"), true,
     "the summary names the gone PR close and its number")
+
+  -- A failed remote delete is reported as an error, not as deleted -----------
+  -- git.delete_branch returns `nil, err` or a table with `remote_error`; it
+  -- does not raise. A delete that failed (auth, protected branch) must not be
+  -- reported as `deleted (abandoned)` with `ok = true`.
+  local failing_rt = make_runtime({
+    ABANDONED = { id = "ABANDONED", status = "abandoned", branch = "metronome/abandoned" },
+  }, {}, { "metronome/abandoned" }, {
+    delete_result = { ok = true, remote_error = "protected branch" },
+  })
+  local failed_delete = failing_rt.prune({})
+  eq(failed_delete.ok, false, "a failed remote delete makes prune not ok")
+  eq(find_deleted(failed_delete, "metronome/abandoned"), nil,
+    "a failed remote delete is not reported as deleted")
+  eq(#(failed_delete.errors or {}), 1, "a failed remote delete is reported in errors")
+  eq(failed_delete.errors and failed_delete.errors[1].branch, "metronome/abandoned",
+    "the error names the branch")
+  eq(summary_has(failed_delete, "deleted (abandoned): ABANDONED branch metronome/abandoned"), false,
+    "the summary does not claim a failed delete succeeded")
+
+  -- A failed PR close is reported as an error, not as closed ------------------
+  -- git.pr_close returns `nil, err` on a real failure and never raises. A nil
+  -- result must not be reported as `closed (abandoned)`.
+  local nil_close_rt = make_runtime({
+    ABANDONED = { id = "ABANDONED", status = "abandoned", branch = "metronome/abandoned" },
+  }, {
+    { number = 80, head = "metronome/abandoned", url = "u" },
+  }, {}, {
+    pr_close_result = false,
+  })
+  local nil_close = nil_close_rt.prune({})
+  eq(find_closed(nil_close, 80), nil, "a PR close that returned nil is not reported as closed")
+  eq(nil_close.ok, false, "a failed PR close makes prune not ok")
 end

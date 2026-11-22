@@ -3077,6 +3077,23 @@ function M.new(deps)
     return KEEP_REASON[status] or "in progress"
   end
 
+  -- `git.delete_branch` returns `nil, err` on bad arguments and otherwise a
+  -- table that reports the remote and local sides separately (see git.lua).
+  -- The remote delete is what prune promises, so a raise, a nil result or a
+  -- `remote_error` all mean the remote branch is still there. A fake that only
+  -- returns `{ ok = true }` counts as success.
+  local function remote_branch_gone(res)
+    if type(res) ~= "table" then return false end
+    if res.remote_error then return false end
+    return (res.remote_deleted or res.remote_missing or res.ok) and true or false
+  end
+
+  -- `git.pr_close` returns `nil, err` on failure and `{ closed = true }` on
+  -- success. A raised error or a nil result is a close that did not happen.
+  local function pr_closed_ok(res)
+    return type(res) == "table" and res.closed == true
+  end
+
   function runtime.prune(_input)
     local paths = project_paths()
     local cfg, cerr = load_config(nil)
@@ -3154,7 +3171,8 @@ function M.new(deps)
         else
           local task = abandoned_branches[head]
           local reason = task and "abandoned" or "gone"
-          local ok = pcall(deps.git.pr_close, pr.number, { gh = "gh", worktree = paths.repo })
+          local called, closed_res = pcall(deps.git.pr_close, pr.number, { gh = "gh", worktree = paths.repo })
+          local ok = called and pr_closed_ok(closed_res)
           if ok then
             closed[#closed + 1] = { number = pr.number, branch = head, task = task, reason = reason }
             -- Name the close decision in the summary too: a human reading the
@@ -3170,11 +3188,14 @@ function M.new(deps)
             -- A closed PR leaves a branch nobody will read: drop it too, but
             -- only report it deleted if the delete actually succeeded.
             if type(deps.git.delete_branch) == "function" then
-              local deleted_ok = pcall(deps.git.delete_branch, paths.repo, head, { remote = "origin" })
-              if deleted_ok then
+              local called_del, delete_res = pcall(deps.git.delete_branch, paths.repo, head, { remote = "origin" })
+              if called_del and remote_branch_gone(delete_res) then
                 forget(head, task, reason)
               else
-                errors[#errors + 1] = { branch = head, error = "delete failed" }
+                errors[#errors + 1] = {
+                  branch = head,
+                  error = (type(delete_res) == "table" and delete_res.remote_error) or "delete failed",
+                }
               end
             end
           else
@@ -3195,11 +3216,14 @@ function M.new(deps)
       elseif not pr_branches[branch] then
         local task = abandoned_branches[branch]
         local reason = task and "abandoned" or "gone"
-        local ok = pcall(deps.git.delete_branch, paths.repo, branch, { remote = "origin" })
-        if ok then
+        local called, delete_res = pcall(deps.git.delete_branch, paths.repo, branch, { remote = "origin" })
+        if called and remote_branch_gone(delete_res) then
           forget(branch, task, reason)
         else
-          errors[#errors + 1] = { branch = branch, error = "delete failed" }
+          errors[#errors + 1] = {
+            branch = branch,
+            error = (type(delete_res) == "table" and delete_res.remote_error) or "delete failed",
+          }
         end
       end
     end
