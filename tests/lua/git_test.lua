@@ -15,6 +15,23 @@ return function()
   local remote = maki.fs.joinpath(base, "remote.git")
   local worktree = maki.fs.joinpath(base, "wt")
 
+  -- Locale pin (T-20261122-0012) ---------------------------------------------
+  --
+  -- git's messages are classified by English strings, so every child must
+  -- answer in C whatever the user's locale is. The probe also proves the
+  -- pinning does not drop the inherited environment: HOME and PATH survive.
+  local probe, proberr = git.run({
+    "sh", "-c", [[printf '%s|%s|%s|%s' "$LC_ALL" "$LANG" "${HOME:-}" "${PATH:-}"]],
+  }, { cwd = base })
+  eq(proberr, nil, "locale probe runs: " .. tostring(proberr))
+  eq(probe and probe.code, 0, "locale probe exits 0")
+  local p_lc, p_lang, p_home, p_path =
+    ((probe and probe.stdout) or ""):match("^(.-)|(.-)|(.-)|(.*)$")
+  eq(p_lc, "C", "git child sees LC_ALL=C")
+  eq(p_lang, "C", "git child sees LANG=C")
+  eq(type(p_home) == "string" and p_home ~= "", true, "git child still sees HOME")
+  eq(type(p_path) == "string" and p_path ~= "", true, "git child still sees PATH")
+
   local function sh(args, cwd)
     local job = maki.fn.jobstart(args, { cwd = cwd, scope = "plugin" })
     local res = maki.fn.jobwait(job, 30000)

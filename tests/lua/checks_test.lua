@@ -25,6 +25,22 @@ return function()
 
   -- Running the declared checks ---------------------------------------------
 
+  -- Locale pin (T-20261122-0012): a declared check must answer the same way
+  -- whatever the user's locale is, and the pinning must not drop the inherited
+  -- environment (HOME survives).
+  local probe, proberr = checks.run({
+    [[printf '%s|%s|%s' "$LC_ALL" "$LANG" "${HOME:-}"]],
+  }, { worktree = work })
+  eq(proberr, nil, "locale probe run has no error: " .. tostring(proberr))
+  eq(probe and probe.ok, true, "locale probe is ok")
+  eq(probe and probe.results[1].command, [[printf '%s|%s|%s' "$LC_ALL" "$LANG" "${HOME:-}"]],
+    "the probe check is recorded verbatim")
+  local p_lc, p_lang, p_home =
+    ((probe and probe.results[1].stdout) or ""):match("^(.-)|(.-)|(.*)$")
+  eq(p_lc, "C", "check child sees LC_ALL=C")
+  eq(p_lang, "C", "check child sees LANG=C")
+  eq(type(p_home) == "string" and p_home ~= "", true, "check child still sees HOME")
+
   local green, gerr = checks.run({ "true", "echo hi" }, { worktree = work })
   eq(gerr, nil, "green run has no error: " .. tostring(gerr))
   eq(green and green.ok, true, "green run is ok")
