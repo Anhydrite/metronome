@@ -56,6 +56,49 @@ function M.task_base(task, cfg)
   return cfg and cfg.project and cfg.project.base_ref or "main"
 end
 
+-- Sequencing defects ---------------------------------------------------------
+
+-- The journal refuses a move that is not legal from the task's current status,
+-- and names the cause with this prefix. A refusal like that, raised inside the
+-- runtime, is a defect in the runtime's own sequencing: another driver moved
+-- the task while this one was working. It is not a fault of the task, and it
+-- must never be recorded as one.
+local function is_illegal_transition(message)
+  return tostring(message or ""):match("^%s*illegal transition") ~= nil
+end
+
+-- Statuses in which another pilot already owns the task: a review round, a fix
+-- round, a check run, a pull request waiting on a human, a merge or a deploy.
+-- A dispatch that reaches `run_task` in one of these would put a second pilot
+-- on the same worktree, racing the one that moved the task there. `ready`,
+-- `running`, `failed` and `abandoned` are not in the set: a fresh dispatch, a
+-- retry and a resume all legitimately start from them.
+local OWNED_STATUSES = {
+  awaiting_answers = true,
+  verifying = true,
+  reviewing = true,
+  changes_requested = true,
+  pr_open = true,
+  merging = true,
+  merged = true,
+  deploying = true,
+  deployed = true,
+}
+
+-- Statuses that prove a review round's fix turn is no longer ours: the task was
+-- resumed by another driver, shipped, or parked while the round was running.
+-- Fixing it then would re-implement a task that has moved on.
+local REVIEW_ROUND_LOST = {
+  running = true,
+  pr_open = true,
+  merging = true,
+  merged = true,
+  deploying = true,
+  deployed = true,
+  failed = true,
+  abandoned = true,
+}
+
 -- Paths ---------------------------------------------------------------------
 
 function M.paths(opts)
@@ -971,6 +1014,26 @@ function M.new(deps)
       return { ok = false, error = "unknown task: " .. tostring(task_id) }
     end
 
+    -- One pilot per task. Another driver — a second dispatch, a late resume, a
+    -- review round that outlived its turn — may have moved the task on while
+    -- this one was starting. Re-read the journal here, at the entry point, and
+    -- abandon quietly: running both would redo the same worktree twice and race
+    -- the branch. Nothing was attempted, so the result is not a failure.
+    -- An epic is exempt: its dispatch is a merge-and-deploy driver over the same
+    -- PR, and a resumed epic legitimately restarts from its merged state.
+    local entry_status = tostring(task.status or "unknown")
+    if task.kind ~= "epic" and OWNED_STATUSES[entry_status] then
+      local reason = "task already owned: status=" .. entry_status
+      log(paths, "task " .. tostring(task_id) .. " not dispatched: " .. reason)
+      return {
+        ok = true,
+        skipped = true,
+        task_id = task_id,
+        status = entry_status,
+        reason = reason,
+      }
+    end
+
     -- An epic is a different shape of work: one PR, no implementation. The
     -- dispatch lives here so every caller (scheduler, retry, resume) gets the
     -- same behaviour.
@@ -1266,8 +1329,46 @@ function M.new(deps)
       -- reviewer, an invalid answer) ends the task before that.
       local function fix(result)
         local findings = type(result) == "table" and result.findings or nil
+        -- The round was opened on a task in `reviewing`; by the time its verdict
+        -- lands another pilot may have moved the task on (a second dispatch, a
+        -- stop, a merge). Re-read the journal before re-implementing: a fix turn
+        -- on a task that is no longer ours would be a second pilot, and the
+        -- journal would refuse `running -> changes_requested` for both.
+        local current_state = state.load(paths.root)
+        local current = current_state and current_state.tasks
+          and current_state.tasks[task_id] or nil
+        local status = type(current) == "table" and tostring(current.status or "")
+          or "unknown"
+        if REVIEW_ROUND_LOST[status] then
+          local text = "review fix turn discarded: task no longer reviewing (status="
+            .. status .. ")"
+          log(paths, "task " .. tostring(task_id) .. ": " .. text)
+          if type(state.append) == "function" then
+            pcall(state.append, paths.root, {
+              kind = "note",
+              task_id = task_id,
+              text = text,
+            })
+          end
+          return { ok = true, stale = true, discarded = true, status = status }
+        end
         local moved, merr = state.transition(paths.root, task_id, "running", { phase = "implement" })
         if not moved then
+          if is_illegal_transition(merr) then
+            -- The move was refused because the task left the round between the
+            -- read above and this write. Same rule: drop the turn, journal it,
+            -- never fail the task for a sequencing defect.
+            local text = "review fix turn discarded: " .. tostring(merr)
+            log(paths, "task " .. tostring(task_id) .. ": " .. text)
+            if type(state.append) == "function" then
+              pcall(state.append, paths.root, {
+                kind = "note",
+                task_id = task_id,
+                text = text,
+              })
+            end
+            return { ok = true, stale = true, discarded = true, status = status }
+          end
           return { ok = false, error = merr or "cannot resume after review" }
         end
         log(paths, string.format("task %s: review round %s requested changes, re-implementing",
@@ -1303,6 +1404,23 @@ function M.new(deps)
       else
         reviewed = deps.review.review(review_opts)
       end
+      if type(reviewed) == "table" and (reviewed.discarded or reviewed.stale) then
+        -- The verdict belonged to a round this task already left. The review
+        -- module journaled it as a stale note and dropped it; the run must not
+        -- turn that into a task failure.
+        local text = "task " .. tostring(task_id)
+          .. ": stale review verdict discarded, nothing is shipped"
+        log(paths, text)
+        return {
+          ok = true,
+          skipped = true,
+          stale = true,
+          task_id = task_id,
+          pr = pr,
+          reason = text,
+        }
+      end
+
       if not reviewed.ok or not reviewed.approved then
         local reason = (reviewed and reviewed.error) or "review not approved"
         if type(reviewed) == "table" and reviewed.escalated then
@@ -1740,7 +1858,7 @@ function M.new(deps)
     -- That is what makes the drain unblockable — a slow, stuck or crashing task
     -- leaves the loop free to start the next one.
     local function dispatch_one(task)
-      local handle = spawn(function()
+      local spawned, handle = pcall(spawn, function()
         -- `run_and_handle` already guards the failure policy; this guard also
         -- covers anything it returns or raises outside it, so `results` and
         -- `task_handles` are always settled and the re-drain always fires.
@@ -1755,6 +1873,17 @@ function M.new(deps)
         task_handles[task.id] = nil
         redrain()
       end)
+      if not spawned then
+        -- The spawn itself failed, so the task never ran: settle its result and
+        -- re-drain. One task that cannot even be started must not stop the
+        -- other ready ones from being dispatched by this loop.
+        log(paths, "task " .. tostring(task.id)
+          .. " could not be dispatched: " .. tostring(handle))
+        results[#results + 1] = { ok = false, error = tostring(handle) }
+        task_handles[task.id] = nil
+        redrain()
+        return nil
+      end
       if handle ~= nil then
         task_handles[task.id] = handle
       end
@@ -1767,8 +1896,18 @@ function M.new(deps)
     -- the tick would use its own default bound instead of the project's. A zero
     -- bound makes `retry_ready` select nothing; the drain only starts `ready`
     -- tasks here, and a failed task is resumed by its own scheduled job.
+    local tick_crashed = false
+    local tick_crashes = 0
     for _ = 1, 32 do
-      local tick = deps.pipeline.tick({
+      if type(deps.pipeline.tick) ~= "function" then
+        return { ok = false, error = "the pipeline module is missing tick", results = results }
+      end
+      -- The tick runs on the drain's own turn: an error raised anywhere inside
+      -- it (a dispatch, a lock, a module defect) would abandon the loop and
+      -- leave the other ready tasks waiting for a drain that already returned.
+      -- Catch it, record it, and keep ticking: the queue behind a crash is
+      -- still work that must be dispatched.
+      local ticked, tick = pcall(deps.pipeline.tick, {
         state = deps.state,
         root = paths.root,
         max_parallel = max_parallel,
@@ -1778,10 +1917,25 @@ function M.new(deps)
         max_attempts = 0,
         recover = recover_module(),
       })
-      if not tick.ok then
+      if not ticked then
+        tick_crashes = tick_crashes + 1
+        log(paths, "scheduler tick error: " .. tostring(tick))
+        results[#results + 1] = { ok = false, error = tostring(tick) }
+        -- In the async path the drain has no caller left watching it: re-arm so
+        -- the scheduler wakes up and resumes the rest of the queue. Once per
+        -- pass: re-arming on every crash of the same tick would spin forever.
+        if not tick_crashed then
+          tick_crashed = true
+          redrain()
+        end
+        -- A tick that fails three times in a row dispatches nothing: stop
+        -- hammering it and let the re-armed scheduler try again later.
+        if tick_crashes >= 3 then
+          break
+        end
+      elseif not tick.ok then
         return { ok = false, error = tick.error, results = results }
-      end
-      if #tick.started == 0 then
+      elseif #tick.started == 0 then
         break
       end
     end
@@ -1790,7 +1944,12 @@ function M.new(deps)
     -- check and the final deploy belong to the synchronous path (the scripted
     -- e2e driver), where every task has already finished by now.
     if deps.async then
-      return { ok = true, results = results, background = true }
+      return {
+        ok = true,
+        results = results,
+        background = true,
+        crashed = tick_crashed,
+      }
     end
 
     local loaded = deps.state.load(paths.root)
@@ -1997,6 +2156,32 @@ function M.new(deps)
       or "implement"
     local diagnosis = type(result) == "table" and result.diagnosis or nil
 
+    -- A transition the journal refused inside the runtime is a defect in the
+    -- runtime's sequencing, not a fault of the task: another pilot already moved
+    -- the task on. Failing the task for it would condemn work that is very
+    -- likely in progress elsewhere, and the failure_reason would blame the task
+    -- for the scheduler. Journal it as a note, leave the status and the failure
+    -- fields alone, and hand the caller a non-failing result so it does not
+    -- retry or escalate a task that did nothing wrong.
+    if is_illegal_transition(message) then
+      local text = "illegal transition reconciled: " .. message
+      log(paths, "task " .. tostring(task_id) .. ": " .. text)
+      if type(deps.state.append) == "function" then
+        pcall(deps.state.append, paths.root, {
+          kind = "note",
+          task_id = task_id,
+          text = text,
+        })
+      end
+      return {
+        ok = true,
+        reconciled = true,
+        reason = message,
+        phase = phase,
+        decision = { action = "none", delay_secs = 0, max_attempts = 1, phase = phase },
+      }
+    end
+
     local ropts = recover_opts(cfg)
     ropts.phase = phase
     ropts.now = type(opts) == "table" and tonumber(opts.now) or nil
@@ -2162,6 +2347,17 @@ function M.new(deps)
       return result
     end
     local out = type(result) == "table" and result or { ok = false }
+    if handled.reconciled then
+      -- The runtime reconciled its own defect: the dispatch is not a task
+      -- failure, so the step's error must not survive on the result. Callers
+      -- key on `ok`, `error` and `failure`; all three say "fine" here.
+      out.ok = true
+      out.reconciled = true
+      out.error = nil
+      out.failure = nil
+      out.reason = handled.reason or out.reason
+      return out
+    end
     out.ok = false
     out.failure = handled.failure or out.failure
     out.decision = handled.decision or out.decision
@@ -2250,6 +2446,13 @@ function M.new(deps)
           scheduler_dirty = false
           runtime.last_background = after_questions(
             job.opts, job.paths, job.cfg, job.runner, job.session)
+          -- The drain's own loop failed and re-armed itself. Give the next burst
+          -- of work a fresh pass instead of spinning on the same failing tick:
+          -- the crashed pass already kept ticking and dispatched what it could.
+          local bg = runtime.last_background
+          if type(bg) == "table" and bg.crashed and scheduler_dirty then
+            break
+          end
         end
       end
     end)
