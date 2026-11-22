@@ -427,7 +427,7 @@ function M.analyze(tasks, opts)
             severity = "blocking",
             rule = "missing_dependency",
             message = string.format(
-              "task %s depends on %s, which is neither a task id, a task title nor an index of the batch",
+              "task %s depends on %s, which is neither a task id, a 'T<n>' batch position, a 1-based batch index nor a task title",
               ids[i], dep
             ),
             tasks = { ids[i] },
@@ -1041,12 +1041,27 @@ end
 
 -- Gate -----------------------------------------------------------------------
 
+-- The first `depends_on` entry of `task` that names no task of `known_ids`, or
+-- nil when every dependency resolves. A ready task with one of these can never
+-- be dispatched, so the gate has to pull it back into qualification.
+local function unresolved_dependency(task, known_ids)
+  for _, dep in ipairs(string_list(type(task) == "table" and task.depends_on or nil)) do
+    if not known_ids[dep] then
+      return dep
+    end
+  end
+  return nil
+end
+
 -- The `qualifying -> ready` gate.
 --
--- Select the sheets that are waiting (or the ones the caller names), analyze
--- them, write the report, and only then move the ones still qualifying to
--- ready. A blocking finding moves nothing: the whole batch stays where it is
--- so the user can fix the sheets and re-run.
+-- Select the sheets that are waiting, or the ready ones whose dependency does
+-- not resolve (or the ones the caller names), analyze them, write the report,
+-- and only then move the ones still qualifying to ready. A ready task with an
+-- unresolved dependency goes back to qualifying whatever the verdict, so no
+-- task stays ready-but-never-dispatchable without a signal. A blocking finding
+-- promotes nothing: the whole batch stays where it is so the user can fix the
+-- sheets and re-run.
 function M.gate(state, root, opts)
   opts = type(opts) == "table" and opts or {}
   if type(state) ~= "table" or type(state.load) ~= "function" then
@@ -1062,6 +1077,11 @@ function M.gate(state, root, opts)
   end
   local all = type(loaded.tasks) == "table" and loaded.tasks or {}
 
+  local known_ids = {}
+  for id in pairs(all) do
+    known_ids[id] = true
+  end
+
   local selected = {}
   if type(opts.tasks) == "table" then
     for i, task in ipairs(opts.tasks) do
@@ -1070,8 +1090,12 @@ function M.gate(state, root, opts)
   else
     local ids = {}
     for id, task in pairs(all) do
-      if type(task) == "table" and task.status == "qualifying" then
-        ids[#ids + 1] = id
+      if type(task) == "table" then
+        local eligible = task.status == "qualifying"
+          or (task.status == "ready" and unresolved_dependency(task, known_ids) ~= nil)
+        if eligible then
+          ids[#ids + 1] = id
+        end
       end
     end
     table.sort(ids)
@@ -1081,12 +1105,7 @@ function M.gate(state, root, opts)
   end
 
   if #selected == 0 then
-    return { ok = true, verdict = "ok", findings = {}, tasks = {} }
-  end
-
-  local known_ids = {}
-  for id in pairs(all) do
-    known_ids[id] = true
+    return { ok = true, verdict = "ok", findings = {}, tasks = {}, demoted = {} }
   end
 
   local result = M.run({
@@ -1110,14 +1129,34 @@ function M.gate(state, root, opts)
     return nil, report_err
   end
 
-  local moved = {}
-  if result.ok then
-    local fresh = state.load(root)
-    local current_tasks = type(fresh) == "table" and type(fresh.tasks) == "table" and fresh.tasks or {}
-    for _, task in ipairs(selected) do
-      local id = task_id(task, 1)
-      local current = current_tasks[id]
-      if type(current) == "table" and current.status == "qualifying" then
+  local moved, demoted = {}, {}
+  local fresh = state.load(root)
+  local current_tasks = type(fresh) == "table" and type(fresh.tasks) == "table" and fresh.tasks or {}
+  for _, selected_task in ipairs(selected) do
+    local id = task_id(selected_task, 1)
+    local current = current_tasks[id]
+    if type(current) == "table" then
+      local unresolved
+      if current.status == "ready" then
+        unresolved = unresolved_dependency(current, known_ids)
+      end
+      if current.status == "ready" and unresolved then
+        -- Re-analysis pulls a ready task back to qualification whatever the
+        -- verdict: its dependency points at nothing, so it would never run.
+        local demoted_ok, transitioned, transition_err = pcall(
+          state.transition, root, id, "qualifying", {
+            phase = "analyze",
+            reason = "unresolved dependency: " .. unresolved,
+          }
+        )
+        if not demoted_ok then
+          return nil, "cannot move " .. id .. " back to qualifying: " .. tostring(transitioned)
+        end
+        if not transitioned then
+          return nil, transition_err
+        end
+        demoted[#demoted + 1] = id
+      elseif result.ok and current.status == "qualifying" then
         local moved_ok, transitioned, transition_err = pcall(
           state.transition, root, id, "ready", { phase = "analyze" }
         )
@@ -1137,6 +1176,7 @@ function M.gate(state, root, opts)
     verdict = result.verdict,
     findings = result.findings,
     tasks = moved,
+    demoted = demoted,
   }
 end
 

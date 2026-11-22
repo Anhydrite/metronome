@@ -27,7 +27,10 @@ local TRANSITIONS = {
   draft = { qualifying = true, abandoned = true },
   qualifying = { awaiting_answers = true, ready = true, failed = true, abandoned = true },
   awaiting_answers = { qualifying = true, abandoned = true },
-  ready = { running = true, failed = true, abandoned = true },
+  -- `ready -> qualifying` is the gate's re-analysis edge: a task marked ready
+  -- whose dependency does not resolve must go back through qualification
+  -- instead of staying ready-but-never-dispatchable.
+  ready = { qualifying = true, running = true, failed = true, abandoned = true },
   running = { verifying = true, failed = true, stalled = true, abandoned = true },
   verifying = { running = true, reviewing = true, failed = true, abandoned = true },
   reviewing = { changes_requested = true, pr_open = true, failed = true, abandoned = true },
