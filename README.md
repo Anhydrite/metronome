@@ -119,6 +119,15 @@ The scheduler (`pipeline.lua`) decides what may run, never how a step runs: depe
 
 One intention can qualify into several tasks. Those tasks never merge into the project base directly: qualification cuts an epic branch `metronome/epic/<slug>-<first-task-suffix>` from the fresh base, pushes it, and cuts every subtask from it. A subtask opens its PR against the epic branch, merges there, re-runs its checks on that branch and stops at `merged` — it never deploys. Once every subtask is merged, a single `epic` task opens the one PR from the epic branch to the project base, merges it, re-runs the declared checks on the merged base, and only then deploys. An intention that produces exactly one task is unchanged: it merges into the project base and deploys as before.
 
+## Recovery
+
+A failure is a state, not a verdict. No transient failure — git identity, network, a missing binary, a timeout, a killed process, a dead session, a quota or a 429 — permanently condemns a task.
+
+- **Nothing is thrown away.** A failed task keeps its worktree, its branch, its checkpoints and its transcript. It restarts from the last stable state, never from scratch.
+- **Bounded automatic retry.** `recover.lua` classifies the error into a closed, typed cause with an actionable remedy, then retries with exponential backoff, capped at 3 attempts, 30 s base and 900 s max (`recover.DEFAULTS`). The scheduler never stops because a task is `failed`; each run is spawned on its own, so a retry never blocks the drain.
+- **Visible diagnosis.** `metronome_status` and `/metronome status <id>` expose, per task, the `checkpoint` to resume from, the typed `last_error` and the `retry_action` (`auto_retry`, `human` or `none`).
+- **Manual relaunch.** `/metronome retry <id>` resumes a failed task from its last checkpoint; `/metronome resume` relaunches tasks interrupted by a `/reload`. Human escalation is the last resort, only when a retry is impossible.
+
 ## Architecture
 
 Metronome is a set of Lua modules under `maki/lua/metronome/`, a JSONL journal, and a scheduler.

@@ -71,9 +71,9 @@ Report what the pipeline recorded. Red is red.
 ## Tools
 
 - `metronome_submit` — create an intent and start qualification. Call it immediately, verbatim; never analyze the repository first.
-- `metronome_status` — read all tasks, or one in detail.
+- `metronome_status` — read all tasks, or one in detail. For a failed task, read `checkpoint` (last stable SHA), `last_error` (typed cause) and `retry_action` (`auto_retry`/`human`/`none` + remedy) before acting.
 - `metronome_answer` — deliver answers to the pending round.
-- `metronome_retry` — restart a failed task from its last stable phase.
+- `metronome_retry` — relaunch a failed task from its last stable phase; the worktree, branch, checkpoints and transcript are kept.
 - `metronome_abandon` — archive a task.
 - `metronome_calibrate` — analyze the repo and generate `review-rules.md`.
 - `metronome_config` — read the project configuration, or update it with `answers` (merged with the config on disk).
@@ -86,12 +86,12 @@ Report what the pipeline recorded. Red is red.
 - `/metronome status [id]` — task state, or one task in detail.
 - `/metronome answer` — open the pending question queue.
 - `/metronome calibrate` — generate `review-rules.md` from the repo.
-- `/metronome retry <id>` — restart a failed task from its last stable phase.
+- `/metronome retry <id>` — relaunch a failed task from its last stable phase; worktree, branch, checkpoints and transcript are kept.
 - `/metronome abandon <id>` — archive a task.
 - `/metronome config [key=value ...]` — show `config.toml`, or update it in place.
 - `/metronome panel` — open or close the live panel.
-- `/metronome resume` — restart tasks interrupted by a `/reload`.
-- `/metronome feedback <id>` — rate a review's findings to calibrate the reviewer.
+- `/metronome resume` — relaunch the tasks interrupted by a `/reload`; a relaunch, not a restart from scratch.
+- `/metronome feedback <id>` — rate a review's findings to calibrate the reviewer, then relaunch the review turn with the rating in context.
 - `/metronome on` — turn on natural-language routing: a plain request calls the
   matching tool. Binds a fresh project first if needed.
 - `/metronome off` — turn natural-language routing off.
@@ -113,6 +113,15 @@ notes are hidden until `v` switches to verbose. `Enter` focuses a transcript,
 `Space` peeks without attaching, `r` retries, `a` answers, `v` toggles
 quiet/verbose, `q` closes.
 
+## Recovery
+
+A failure is never final. `failed` is a resumable state: the worktree, the branch, the checkpoints and the transcript are always kept, and a transient failure (git identity, network, missing binary, timeout, killed process, dead session, quota/429) never condemns a task. The scheduler never stops on a failed task — each run runs in its own spawn, so a retry never blocks the drain.
+
+- **Read the diagnosis** — `metronome_status` exposes, per task, the `checkpoint` to resume from, the typed `last_error`, and the `retry_action` (`auto_retry`, `human` or `none`, with the remedy).
+- **Auto-retry** — a transient cause is retried automatically with bounded exponential backoff; you do not have to intervene.
+- **Relaunch** — `metronome_retry`, `/metronome retry <id>`, `/metronome resume` after a `/reload`, and `metronome_feedback` (which relaunches the review turn with the rating in context) are all relaunches of the same workflow, not new tasks: they resume from the last checkpoint.
+- **Escalate last** — human escalation is the last resort, only when a retry is impossible (missing credential, unrecoverable conflict, protected-path finding, a decision only the user can make).
+
 ## Constraints
 
 - Never write code directly — delegate through the pipeline.
@@ -122,6 +131,7 @@ quiet/verbose, `q` closes.
 - Never touch protected paths.
 - Respect T0/T1: T0 — test red first; T1 — make it green, then commit.
 - Never skip a checkpoint on an architecture, destructive, or scope-expansion decision.
+- Never treat a failure as final: read `last_error`/`retry_action`, relaunch from the checkpoint, escalate only when a retry is impossible.
 
 ## Anti-rationalization
 

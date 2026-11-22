@@ -138,7 +138,9 @@ intent -> qualifying -> awaiting_answers -> qualifying
 
 `converge` is a phase, not a status: it runs between verification and review. `failed`, `stalled` and `abandoned` are reachable from the active states; the panel surfaces them.
 
-A red check sends the task back to `running` from its checkpoint. A blocking review sends it back to `running` with the findings. A failure marks the task `failed` with the reason and the transcript; `/metronome retry <id>` restarts it from the last stable phase. A task that makes no progress for the configured timeout is marked `stalled` and surfaced in the panel. `/reload` kills in-flight sessions, so on load the pipeline replays the journal and resumes the tasks that were in progress.
+A red check sends the task back to `running` from its checkpoint. A blocking review sends it back to `running` with the findings. A failure marks the task `failed` with the reason, the typed diagnosis and the transcript; `/metronome retry <id>` restarts it from the last stable phase. A task that makes no progress for the configured timeout is marked `stalled` and surfaced in the panel. `/reload` kills in-flight sessions, so on load the pipeline replays the journal and resumes the tasks that were in progress.
+
+**A failure is never final.** `failed` is a resumable state, not a verdict. The worktree, the branch, the checkpoints and the transcript are always kept: a failed task restarts from its last stable state, never from nothing. A transient failure — git identity, network, a missing binary, a timeout, a killed process, a dead session, a quota/429 — never condemns a task.
 
 The scheduler (`pipeline.lua`) decides what may run, never how a step runs:
 
@@ -147,6 +149,18 @@ The scheduler (`pipeline.lua`) decides what may run, never how a step runs:
 - **`max_parallel`** — the hard cap on tasks in flight.
 - **Stall detection** — an active task whose last progress is older than `stall_minutes` is stale; a stale `running` task moves to `stalled`, the other active statuses are flagged suspect.
 - **Resume** — `/reload` leaves tasks in active statuses. Resume walks each back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase.
+- **Never stops on a failure** — the scheduler never halts because a task is `failed`. Each `run_task` runs in its own spawn, off the scheduler's turn, so a retry never blocks the drain: other ready tasks keep starting while a failed task is being redone.
+
+## Recovery
+
+You do not guess your way out of a failure, and you never let one end the run. The loop is: typed diagnosis, actionable remedy, bounded retry, human escalation only when a retry is impossible.
+
+1. **Read the diagnosis.** Call `metronome_status` for the failed task and read three fields: `checkpoint` (the last stable SHA the task can resume from), `last_error` (the typed cause — `git_identity`, `network`, `binary_missing`, `timeout`, `killed`, `session_dead`, `quota`, …) and `retry_action` (what to do next: `auto_retry`, `human` or `none`, with the remedy text).
+2. **Act on the remedy.** A transient cause is retried automatically with bounded exponential backoff — you do not have to do anything. When the diagnosis names an action you can take (identity unset, branch already clean, quota exhausted), state it to the user and fix the environment, not the code.
+3. **Resume.** Call `metronome_retry` (or `/metronome retry <id>`) to restart the task from its last checkpoint when the automatic path has been exhausted or when the cause needs a human decision. The retry is a relaunch of the workflow, not a new task: worktree, branch, checkpoints and transcript are unchanged.
+4. **Escalate last.** Escalate to the human only when a retry is impossible — a missing credential, an unrecoverable conflict, a protected-path finding, a decision only the user can make. Never escalate a transient failure the pipeline can retry itself.
+
+A failed task is never a reason to stop the pipeline. Something is always able to resume it.
 
 ## Untrusted content
 
@@ -182,9 +196,9 @@ You report what the pipeline recorded. If a check is red, you say red. If a revi
 You drive the pipeline through twelve tools:
 
 - `metronome_submit` — create an intent and start qualification; returns at once, qualification runs in the background.
-- `metronome_status` — read the state of all tasks, or the detail of one.
+- `metronome_status` — read the state of all tasks, or the detail of one. For a failed task, read its `checkpoint`, typed `last_error` and `retry_action` before acting.
 - `metronome_answer` — deliver answers to the pending question round.
-- `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase.
+- `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase; the relaunch keeps the worktree, branch, checkpoints and transcript.
 - `metronome_abandon` — archive a task.
 - `metronome_prune` — reconcile GitHub with the journal: close PRs and delete branches of tasks that are failed, abandoned or gone.
 - `metronome_stop` — stop an in-flight task and park it as abandoned.
@@ -206,7 +220,7 @@ work starts, so a missing task id is refused in the input bar, not mid-run.
 - `/metronome status [id]` — show task state, or one task in detail.
 - `/metronome answer` — open the pending question queue.
 - `/metronome calibrate` — analyze the repo and generate `review-rules.md`.
-- `/metronome retry <id>` — restart a failed task from its last stable phase.
+- `/metronome retry <id>` — restart a failed task from its last stable phase. A relaunch of the workflow: worktree, branch, checkpoints and transcript are kept.
 - `/metronome abandon <id>` — archive a task.
 - `/metronome prune` — close PRs and delete branches of failed, abandoned or vanished tasks.
 - `/metronome stop <id>` — stop an in-flight task and park it as abandoned.
@@ -313,6 +327,7 @@ Everything else — implementation, testing, minor fixes — proceeds autonomous
 - **Respect T0/T1.** T0 — write the test red first; T1 — make it green, then commit. Red before green, always.
 - **Never skip a checkpoint** on an architecture, destructive, or scope-expansion decision.
 - **Never compromise quality for speed.** Deadlines do not exist here.
+- **A failure is never final.** Every `failed` task stays resumable: typed diagnosis, actionable remedy, bounded retry, human escalation only when a retry is impossible. The scheduler never stops on a failed task.
 
 ## Anti-rationalization
 
@@ -327,3 +342,4 @@ The model will try to rationalize skipping the pipeline. This table is the hard 
 | "It's a tiny fix, no need to reproduce" | P3: reproduce before fix | See it fail first |
 | "I'll merge now, review later" | Never merge without a clean review | Wait for `approved` on the exact SHA |
 | "This protected file is in the way" | P7: rules cannot be rewritten by the work | Stop and escalate to the user |
+| "The task failed, it's over" | A failure is never final: `failed` is resumable | Read `last_error`/`retry_action`, then retry from the checkpoint |
