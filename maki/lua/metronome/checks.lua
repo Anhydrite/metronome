@@ -40,19 +40,39 @@ local function truncate(text, limit)
   return text
 end
 
+-- A declared check must answer the same way whatever the user's locale is: a
+-- check that greps a tool's message would otherwise go green on one machine
+-- and red on another. maki.fn.jobstart has no option to merge extra variables
+-- into the inherited environment, so the argv is prefixed with
+-- `env LC_ALL=C LANG=C`: the locale is pinned for the child while every
+-- inherited variable (HOME, PATH, GIT_*) survives untouched.
+local LOCALE_PREFIX = { "env", "LC_ALL=C", "LANG=C" }
+
+local function with_c_locale(args)
+  local argv = {}
+  for i = 1, #LOCALE_PREFIX do
+    argv[i] = LOCALE_PREFIX[i]
+  end
+  for i = 1, #args do
+    argv[#argv + 1] = args[i]
+  end
+  return argv
+end
+
 -- jobstart raises (rather than returning nil) when there is no active task to
 -- own the job, which happens at plugin top level. Retrying with a plugin scope
 -- keeps the same code usable from a tool handler and from a test.
 local function start(args, cwd)
+  local argv = with_c_locale(args)
   local job_opts = { cwd = cwd }
-  local ok_start, job, err = pcall(maki.fn.jobstart, args, job_opts)
+  local ok_start, job, err = pcall(maki.fn.jobstart, argv, job_opts)
   if not ok_start then
     err = job
     job = nil
   end
   if not job and tostring(err):find("no active task", 1, true) then
     job_opts.scope = "plugin"
-    local ok_retry, retry_job, retry_err = pcall(maki.fn.jobstart, args, job_opts)
+    local ok_retry, retry_job, retry_err = pcall(maki.fn.jobstart, argv, job_opts)
     if ok_retry then
       job, err = retry_job, retry_err
     else

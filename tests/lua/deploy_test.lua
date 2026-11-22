@@ -806,6 +806,27 @@ return function()
   eq(third.no_pending, true, "the coalesced base leaves nothing pending")
   eq(extra_calls, 0, "the second deploy is the last one: the merges never produce N deploys")
 
+  -- Regression: a direct M.run (outside any drain) must not clear a flag that a
+  -- merge moved during the run either. Only the base captured before the runner
+  -- may be drained.
+  local id_moved = "T-20261114-dp31"
+  make_task(id_moved)
+  write_checks(id_moved, true)
+  state.set_deploy_pending(root, "moved-before")
+  local moved_run = deploy.run(opts_for(id_moved, {
+    confirmed = true,
+    runner = function()
+      state.set_deploy_pending(root, "moved-during")
+      return { ok = true, text = "direct deploy\n" }
+    end,
+  }))
+  eq(moved_run.ok, true, "a direct run with a moved flag still deploys: "
+    .. tostring(moved_run.error))
+  eq(state.deploy_pending(root).base, "moved-during",
+    "a direct run does not clear a flag moved during the run")
+  eq(state.load(root).tasks[id_moved].status, "deployed", "the direct run still deploys the task")
+  state.clear_deploy_pending(root)
+
   -- One deployer at a time, from the outside: a second drainer that starts while
   -- the first is inside its runner is refused, never calls the runner, and
   -- leaves the flag for the deployer that already holds the lock.
