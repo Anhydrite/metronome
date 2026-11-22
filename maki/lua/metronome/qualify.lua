@@ -1009,22 +1009,39 @@ function M.apply(state, root, result, opts)
     preview.ids[id] = true
   end
 
-  -- Resolution map for depends_on entries: a real task id stays itself, a
-  -- 1-based batch position maps to the preassigned id, a batch title maps to
-  -- that task's id. Anything else is left verbatim so the analysis gate can
-  -- block it with a clear message. Positions are filled first so they win over
-  -- a title that happens to look like one; both lose to an existing id, which
-  -- the loop below checks before consulting this map.
+  -- Resolution map for depends_on entries, by ascending precedence: a batch
+  -- title maps to that task's id, a 1-based batch position (bare number) maps
+  -- to the preassigned id, and the "T<n>" form designates the n-th task of the
+  -- batch. The table is filled in reverse precedence order so a later write
+  -- wins: titles are only inserted when absent, bare positions overwrite a
+  -- title that happens to look numeric, and "T<n>" overwrites a title that
+  -- happens to look like it. All of them lose to a real task id, which the
+  -- loop below checks (state and preassigned batch ids) before this map.
+  -- Anything else is left verbatim so the analysis gate can block it with a
+  -- clear message.
   local resolve_dep = {}
-  for i, id in ipairs(preassigned) do
-    resolve_dep[tostring(i)] = id
-  end
   local batch = result.tasks or {}
   for i, id in ipairs(preassigned) do
     local title = batch[i] and batch[i].title
     if title and resolve_dep[title] == nil then
       resolve_dep[title] = id
     end
+  end
+  for i, id in ipairs(preassigned) do
+    resolve_dep[tostring(i)] = id
+  end
+  for i, id in ipairs(preassigned) do
+    resolve_dep["T" .. i] = id
+  end
+
+  -- Every id that a dependency can name exactly: a task already in state or a
+  -- task preassigned earlier in this batch.
+  local known_ids = {}
+  for dep_id in pairs(current.tasks or {}) do
+    known_ids[dep_id] = true
+  end
+  for _, id in ipairs(preassigned) do
+    known_ids[id] = true
   end
 
   for i, task in ipairs(result.tasks or {}) do
@@ -1037,7 +1054,7 @@ function M.apply(state, root, result, opts)
     if #(task.depends_on or {}) > 0 then
       resolved_depends = {}
       for _, dep in ipairs(task.depends_on) do
-        if type(dep) == "string" and current.tasks[dep] then
+        if type(dep) == "string" and known_ids[dep] then
           resolved_depends[#resolved_depends + 1] = dep
         else
           resolved_depends[#resolved_depends + 1] = resolve_dep[dep] or dep
