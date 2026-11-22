@@ -711,6 +711,8 @@ return function()
   eq(gated and #gated.tasks, 2, "the gate moves both tasks")
   eq(gated and gated.tasks[1], "T-20261114-m001", "the first moved task is sorted")
   eq(gated and gated.tasks[2], "T-20261114-m002", "the second moved task is sorted")
+  eq(type(gated and gated.blocked), "table", "the gate reports a blocked array")
+  eq(gated and #gated.blocked, 0, "a coherent pair blocks nothing")
 
   local after_gate = state.load(root)
   eq(after_gate.tasks["T-20261114-m001"].status, "ready", "the first task moved to ready")
@@ -728,6 +730,7 @@ return function()
   eq(empty_gate and empty_gate.ok, true, "a gate with no qualifying task is ok")
   eq(empty_gate and #empty_gate.tasks, 0, "a gate with no qualifying task moves nothing")
   eq(empty_gate and #empty_gate.findings, 0, "a gate with no qualifying task has no findings")
+  eq(empty_gate and #(empty_gate.blocked or {}), 0, "a gate with no qualifying task blocks nothing")
 
   state.create(root, {
     id = "T-20261114-m003",
@@ -754,4 +757,68 @@ return function()
   local after_blocked = state.load(root)
   eq(after_blocked.tasks["T-20261114-m003"].status, "qualifying", "the first duplicate stays qualifying")
   eq(after_blocked.tasks["T-20261114-m004"].status, "qualifying", "the second duplicate stays qualifying")
+  eq(blocked_gate and #(blocked_gate.blocked or {}), 2, "both duplicates are reported as blocked")
+  eq(blocked_gate and blocked_gate.blocked[1].id, "T-20261114-m003", "the first blocked id is sorted")
+  eq(blocked_gate and blocked_gate.blocked[2].id, "T-20261114-m004", "the second blocked id is sorted")
+  local dup_named = blocked_gate and named(blocked_gate.blocked[1].findings[1])
+  eq(dup_named and dup_named["T-20261114-m003"], true, "the blocked entry carries the finding naming it")
+
+  -- gate: per-task verdict -------------------------------------------------
+
+  -- One offending sheet must not freeze the clean ones beside it. The batch is
+  -- still analysed in one run (so cross-task findings see the whole
+  -- selection), but the verdict is partitioned per task: the task named by a
+  -- blocking finding stays qualifying, every other task moves to ready.
+  local mixed_root = maki.fs.joinpath(base, "mixed")
+  state.create(mixed_root, {
+    id = "T-20261114-n001",
+    title = "Clean sheet",
+    files = { "src/clean.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+  })
+  state.create(mixed_root, {
+    id = "T-20261114-n002",
+    title = "Broken sheet",
+    files = { "src/broken.lua" },
+    checks = {},
+    status = "qualifying",
+  })
+
+  local mixed = analyze.gate(state, mixed_root, { intention = "mixed", now = "2026-11-14T00:02:00Z" })
+  eq(mixed and mixed.ok, false, "a mixed batch is not ok: one task carries a blocking finding")
+  eq(mixed and mixed.verdict, "blocked", "a mixed batch reports verdict blocked")
+  eq(mixed and #mixed.tasks, 1, "a mixed batch still moves its clean task")
+  eq(mixed and mixed.tasks[1], "T-20261114-n001", "the clean task is the one moved")
+  eq(mixed and #(mixed.blocked or {}), 1, "only the offending task is blocked")
+  eq(mixed and mixed.blocked[1].id, "T-20261114-n002", "the blocked task is named")
+  local mixed_findings = (mixed and mixed.blocked[1].findings) or {}
+  eq(#mixed_findings, 1, "the blocked entry carries exactly its blocking finding")
+  eq(mixed_findings[1] and mixed_findings[1].rule, "empty_checks", "the blocking finding keeps its rule")
+  eq(mixed_findings[1] and mixed_findings[1].severity, "blocking", "the reported finding is blocking")
+  eq(find_rule(mixed, "empty_checks") ~= nil, true, "the full finding list is still returned")
+
+  local after_mixed = state.load(mixed_root)
+  eq(after_mixed.tasks["T-20261114-n001"].status, "ready", "the clean task reaches ready")
+  eq(after_mixed.tasks["T-20261114-n002"].status, "qualifying", "the blocked task stays qualifying")
+
+  local mixed_report_text = maki.fs.read(maki.fs.joinpath(mixed_root, "analysis.json"))
+  eq(type(mixed_report_text), "string", "a blocked gate still writes analysis.json")
+  local mixed_report_ok, mixed_report = pcall(maki.json.decode, mixed_report_text)
+  eq(mixed_report_ok, true, "the blocked analysis.json decodes")
+  eq(mixed_report and mixed_report.verdict, "blocked", "analysis.json records the blocked verdict")
+
+  -- The blocked task stays repairable: fix its sheet and gate again, and it
+  -- moves to ready without any task being recreated.
+  state.set_fields(mixed_root, "T-20261114-n002", { checks = { "make test" } })
+  local repaired = analyze.gate(state, mixed_root, { intention = "mixed", now = "2026-11-14T00:03:00Z" })
+  eq(repaired and repaired.ok, true, "the repaired task passes the gate")
+  eq(repaired and repaired.verdict, "ok", "the repaired gate verdict is ok")
+  eq(repaired and #repaired.tasks, 1, "the repaired task is moved")
+  eq(repaired and repaired.tasks[1], "T-20261114-n002", "the repaired task is the one moved")
+  eq(type(repaired and repaired.blocked), "table", "a passing gate still reports a blocked array")
+  eq(repaired and #repaired.blocked, 0, "a repaired batch has no blocked task")
+  local after_repaired = state.load(mixed_root)
+  eq(after_repaired.tasks["T-20261114-n002"].status, "ready", "the repaired task reaches ready")
+  eq(after_repaired.tasks["T-20261114-n001"].status, "ready", "the clean task is untouched by the repair")
 end
