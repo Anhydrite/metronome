@@ -100,7 +100,7 @@ function M.definitions()
     },
     {
       name = "metronome_prune",
-      description = "Reconcile GitHub with the journal: close a pull request and delete a remote branch only when its task is explicitly abandoned or gone from the journal. A failed or stalled task is retryable and is kept intact with its branch, PR and checkpoints. Reports the reason per task.",
+      description = "Reconcile GitHub with the journal: close open pull requests and delete remote branches whose task is failed, abandoned or gone. Reports what it closed, deleted and kept.",
       permission = "run",
       schema = { type = "object", properties = {} },
     },
