@@ -18,6 +18,7 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `analyze.lua` | Cross-task structural and semantic analysis; gate `qualifying -> ready`. |
 | `implement.lua` | Prepare the worktree, checkpoint, run the implementer turn, commit and push. |
 | `checks.lua` | Run the declared commands, capture the report, roll back on red. |
+| `preflight.lua` | Prove the environment before binding: git identity, a throwaway probe commit, declared commands on `PATH`, the base branch on `origin`, and `python3` importing `jsonschema`; structured, actionable failures in one pass. |
 | `converge.lua` | Compare the diff with the task's declared files; one repair turn if they differ. |
 | `review.lua` | Review one exact SHA, store findings, bound the rounds, escalate, and mirror findings onto the PR. |
 | `no_mistakes.lua` | Run the local `no-mistakes` gate as the review engine: clean, push, open the PR, then merge without a review/implement loop. |
