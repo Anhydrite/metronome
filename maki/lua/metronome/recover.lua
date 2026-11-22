@@ -144,6 +144,10 @@ local RULES = {
     -- the real incident: `git commit` exits 1 with "Sur la branche ... / rien a
     -- valider" when the machine runs in a French locale, and the tree was in
     -- fact clean.
+    -- Only the specific phrases count. A bare branch header ("Sur la branche",
+    -- "On branch") must never match: a real failure (hook rejection, conflict)
+    -- often carries a `git status` dump that starts with it, and dropping that
+    -- failure as benign would leave it unrecovered.
     patterns = {
       "nothing to commit",
       "working tree clean",
@@ -151,16 +155,21 @@ local RULES = {
       "rien a valider",
       "rien à valider",
       "arbre de travail est propre",
-      "sur la branche",
-      "on branch",
+      "arbre de travail propre",
     },
     transient = false,
     remedy = "none: the tree already holds the requested state; carry on.",
   },
   {
     cause = "quota",
+    -- The numeric status is only a quota signal in an HTTP context: a bare
+    -- "429" would swallow a genuine message such as "timed out after 429s".
     patterns = {
-      "429",
+      "http 429",
+      "status 429",
+      "status code 429",
+      "error: 429",
+      "429 too many",
       "rate limit",
       "ratelimit",
       "rate_limit",
@@ -174,9 +183,19 @@ local RULES = {
   },
   {
     cause = "auth",
+    -- Same rule for auth: "401"/"403" are only credentials signals when they
+    -- carry an HTTP-status context ("timed out after 401s" is a timeout).
     patterns = {
-      "401",
-      "403",
+      "http 401",
+      "http 403",
+      "status 401",
+      "status 403",
+      "status code 401",
+      "status code 403",
+      "error: 401",
+      "error: 403",
+      "401 unauthorized",
+      "403 forbidden",
       "permission denied",
       "authentication",
       "unauthorized",
@@ -268,7 +287,12 @@ local RULES = {
       "sigkill",
       "sigterm",
       "signal",
-      "oom",
+      -- `oom` must be bounded: "boom", "room", "zoom" are not OOM kills.
+      "oom-kill",
+      "oom kill",
+      "out of memory",
+      "out-of-memory",
+      "killed process",
     },
     transient = true,
     remedy = "retry; the process was killed by a signal or the OOM killer.",

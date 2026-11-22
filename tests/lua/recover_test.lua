@@ -58,7 +58,28 @@ return function()
   local french = cause_of("exit 1: Sur la branche metronome/x\nrien à valider, l'arbre de travail est propre")
   eq(french, "nothing_to_commit", "French git commit output is benign")
   eq(cause_of("rien à valider"), "nothing_to_commit", "French 'rien à valider' is benign")
-  eq(cause_of("Sur la branche master"), "nothing_to_commit", "French 'Sur la branche' is benign")
+  -- A bare branch header is NOT a benign signal: a real failure often appends a
+  -- `git status` dump that starts with it, and it must stay recoverable.
+  eq(cause_of("Sur la branche master"), "unknown", "a bare 'Sur la branche' header is not benign")
+  eq(cause_of("On branch main"), "unknown", "a bare 'On branch' header is not benign")
+  eq(cause_of("Sur la branche x\nrien à valider, l'arbre de travail est propre"), "nothing_to_commit",
+    "the French header plus the specific phrase is benign")
+
+  -- Bare numeric tokens must not steal a transient failure (review feedback).
+  local slow = recover.classify("turn timed out after 401s")
+  eq(slow.cause, "timeout", "'timed out after 401s' is a timeout, not auth")
+  eq(recover.decide(recover.record("turn timed out after 401s", nil, { now = 0 })).action, "auto_retry",
+    "a timeout carrying 401 stays retryable")
+  eq(cause_of("turn timed out after 429s"), "timeout", "'timed out after 429s' is a timeout, not quota")
+  eq(cause_of("exit 137 after 403ms"), "killed", "'exit 137 ... 403ms' is killed, not auth")
+  eq(cause_of("the tool said boom"), "unknown", "'boom' is not an OOM kill")
+  eq(cause_of("no more room in the buffer"), "unknown", "'room' is not an OOM kill")
+  eq(cause_of("the kernel: oom-kill:constraint=CONSTRAINT_NONE"), "killed", "'oom-kill' is killed")
+  eq(cause_of("fatal: out of memory"), "killed", "'out of memory' is killed")
+
+  -- A benign phrase does not hide a genuine failure appended after it.
+  eq(cause_of("On branch main\nCONFLICT (content): Merge conflict in maki/init.lua"), "conflict",
+    "a conflict dump with a branch header stays a conflict")
 
   -- Structural fields -------------------------------------------------------
 
