@@ -75,7 +75,12 @@
           "default": []
         },
         "re_run_after_merge": { "type": "boolean", "default": true },
-        "timeout_secs": { "type": "integer", "minimum": 1, "default": 600 }
+        "timeout_secs": { "type": "integer", "minimum": 1, "default": 600 },
+        "xdg_state_home": {
+          "type": "string",
+          "description": "State directory handed to every declared check as XDG_STATE_HOME. Empty (the default) means one directory per task, under <state>/checks/<task-id>/state, so concurrent tasks never share their check state. A check that sets XDG_STATE_HOME itself is never rewritten.",
+          "default": ""
+        }
       }
     },
     "review": {

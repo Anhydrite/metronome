@@ -48,10 +48,13 @@ end
 -- inherited variable (HOME, PATH, GIT_*) survives untouched.
 local LOCALE_PREFIX = { "env", "LC_ALL=C", "LANG=C" }
 
-local function with_c_locale(args)
+local function with_c_locale(args, xdg_state_home)
   local argv = {}
   for i = 1, #LOCALE_PREFIX do
     argv[i] = LOCALE_PREFIX[i]
+  end
+  if is_non_empty(xdg_state_home) then
+    argv[#argv + 1] = "XDG_STATE_HOME=" .. xdg_state_home
   end
   for i = 1, #args do
     argv[#argv + 1] = args[i]
@@ -59,11 +62,43 @@ local function with_c_locale(args)
   return argv
 end
 
+-- Every execution gets its own XDG_STATE_HOME, so a third-party check (a shop,
+-- an application script) cannot destroy another task's state: two checks that
+-- run at the same time used to share the inherited directory and reset each
+-- other into false failures.
+--
+-- Precedence, resolved per execution:
+--   1. opts.xdg_state_home (explicit config) wins verbatim;
+--   2. a command that sets XDG_STATE_HOME itself (word-initial assignment) is
+--      never rewritten: the project has pinned its value on purpose;
+--   3. a scoped call (opts.task_id and opts.root) gets
+--      <root>/checks/<task_id>/state, created on demand;
+--   4. an unscoped call (a unit test, a tool) injects nothing and keeps the
+--      inherited environment intact.
+-- Returns (value_or_nil, err). nil means "inject nothing".
+local function resolve_state_home(check, opts)
+  if is_non_empty(opts.xdg_state_home) then
+    return opts.xdg_state_home, nil
+  end
+  if type(check) == "string" and check:find("%f[%w]XDG_STATE_HOME=") then
+    return nil, nil
+  end
+  if is_non_empty(opts.task_id) and is_non_empty(opts.root) then
+    local dir = fs.joinpath(opts.root, "checks", tostring(opts.task_id), "state")
+    local made, mkerr = fs.mkdir(dir, { parents = true })
+    if not made then
+      return nil, "cannot create check state directory: " .. tostring(mkerr)
+    end
+    return dir, nil
+  end
+  return nil, nil
+end
+
 -- jobstart raises (rather than returning nil) when there is no active task to
 -- own the job, which happens at plugin top level. Retrying with a plugin scope
 -- keeps the same code usable from a tool handler and from a test.
-local function start(args, cwd)
-  local argv = with_c_locale(args)
+local function start(args, cwd, xdg_state_home)
+  local argv = with_c_locale(args, xdg_state_home)
   local job_opts = { cwd = cwd }
   local ok_start, job, err = pcall(maki.fn.jobstart, argv, job_opts)
   if not ok_start then
@@ -111,8 +146,13 @@ function M.run(checks, opts)
       return nil, string.format("check %d is not a non-empty string", i)
     end
 
+    local state_home, sherr = resolve_state_home(check, opts)
+    if sherr then
+      return nil, sherr
+    end
+
     local started = os.time()
-    local job, jerr = start({ "sh", "-c", check }, opts.worktree)
+    local job, jerr = start({ "sh", "-c", check }, opts.worktree, state_home)
     if not job then
       return nil, jerr
     end
@@ -135,6 +175,7 @@ function M.run(checks, opts)
       stderr = truncate(stderr, max_output),
       timed_out = timed_out,
       duration_ms = (os.time() - started) * 1000,
+      xdg_state_home = state_home,
     }
     results[#results + 1] = entry
     if not entry.ok then
