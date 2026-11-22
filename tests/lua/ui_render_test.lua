@@ -65,6 +65,46 @@ return function()
   eq(render.detail(task("T-1", "a", "running", { phase = "implement" })), "implement",
     "detail shows the phase when there is one")
 
+  -- quarantine -------------------------------------------------------------
+
+  local quarantined = task("T-20261114-q001", "missing dep", "qualifying", {
+    quarantine = { reason = "missing_dependency", rules = { "missing_dependency" } },
+  })
+  eq(render.quarantine_label(quarantined), "missing_dependency", "quarantine_label names the rule")
+  eq(render.detail(quarantined), "blocked: missing_dependency",
+    "detail says why a qualifying task is quarantined")
+  eq(render.quarantine_label(task("T-1", "a", "qualifying")), nil,
+    "a qualifying task without quarantine is not quarantined")
+  eq(render.detail(task("T-1", "a", "qualifying")), "qualifying",
+    "a task without quarantine keeps its usual detail")
+  local reason_only = task("T-2", "b", "qualifying", {
+    quarantine = { reason = "analysis failed: timeout" },
+  })
+  eq(render.detail(reason_only), "blocked: analysis failed: timeout",
+    "a quarantine with only a reason shows that reason")
+  eq(render.detail(task("T-3", "c", "qualifying", { quarantine = {} })), "blocked: analysis",
+    "an empty quarantine still names the analysis hold")
+  eq(render.detail(task("T-4", "d", "ready", {
+    quarantine = { reason = "missing_dependency", rules = { "missing_dependency" } },
+  })), "ready", "a quarantine on a non-qualifying task does not change its detail")
+
+  local quarantine_rows = render.rows({
+    quarantined,
+    task("T-20261114-q002", "clean", "qualifying"),
+  })
+  local quarantined_row, clean_row
+  for _, row in ipairs(quarantine_rows) do
+    if row.id == "T-20261114-q001" then quarantined_row = row end
+    if row.id == "T-20261114-q002" then clean_row = row end
+  end
+  eq(quarantined_row.blocked, true, "a quarantined task is flagged blocked")
+  eq(quarantined_row.waiting, false, "a quarantined task is not a quiet waiting row")
+  eq(quarantined_row.bucket, "progress", "quarantine does not change the bucket")
+  eq(quarantined_row.detail, "blocked: missing_dependency", "the row carries the reason")
+  eq(clean_row.blocked, false, "a task without quarantine is not blocked")
+  eq(clean_row.waiting, false, "qualifying is not drawn as waiting")
+  eq(clean_row.detail, "qualifying", "a clean task keeps its usual detail")
+
   eq(render.role_name("qualifier"), "chef de pupitre", "qualifier has an orchestra name")
   eq(render.role_name("analyst"), "harmoniste", "analyst has an orchestra name")
   eq(render.role_name("implementer"), "instrumentiste", "implementer has an orchestra name")

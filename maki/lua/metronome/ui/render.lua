@@ -146,9 +146,36 @@ function M.short_id(id)
   return "T-…" .. tail
 end
 
+-- A task held back by the analysis gate stays `qualifying` and carries the
+-- persisted `quarantine` record the runtime wrote. Name the rule the sheet
+-- broke: that is what the user has to fix. The free-form reason is the
+-- fallback (a gate that could not run), and a record with neither still means
+-- the task is held for analysis, never that it is quietly waiting.
+function M.quarantine_label(task)
+  if type(task) ~= "table" or task.status ~= "qualifying" then
+    return nil
+  end
+  local quarantine = task.quarantine
+  if type(quarantine) ~= "table" then
+    return nil
+  end
+  local rules = quarantine.rules
+  if type(rules) == "table" and type(rules[1]) == "string" and rules[1] ~= "" then
+    return rules[1]
+  end
+  if type(quarantine.reason) == "string" and quarantine.reason ~= "" then
+    return quarantine.reason
+  end
+  return "analysis"
+end
+
 -- The detail column: what the task is doing, in the fewest words that still
 -- distinguish a blocked task from a running one.
 function M.detail(task, bucket)
+  local quarantined = M.quarantine_label(task)
+  if quarantined then
+    return "blocked: " .. quarantined
+  end
   bucket = bucket or M.bucket(task)
   if bucket == "questions" then
     local pending = #M.pending_questions(task)
@@ -465,7 +492,8 @@ function M.rows(tasks, opts)
         spinner = M.spinner(frame),
         active = not TERMINAL[task.status],
         waiting = bucket == "progress" and (task.status == "ready" or task.status == "draft"),
-        blocked = #M.pending_questions(task) > 0 or task.status == "awaiting_answers",
+        blocked = #M.pending_questions(task) > 0 or task.status == "awaiting_answers"
+          or M.quarantine_label(task) ~= nil,
         intent = M.request_of(task),
         depends_on = M.short_deps(task.depends_on),
         depends_on_ids = type(task.depends_on) == "table" and task.depends_on or {},
