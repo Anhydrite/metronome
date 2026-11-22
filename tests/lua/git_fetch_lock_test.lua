@@ -83,8 +83,8 @@ return function()
       for _, arg in ipairs(args) do
         if arg == "fetch" then
           children = children + 1
-          registered = git.fetch_in_flight[git.fetch_key(lock, "origin")]
-          other_registered = git.fetch_in_flight[git.fetch_key(lock, "no-mistakes")]
+          registered = git.fetch_registered(git.fetch_key(lock, "origin"))
+          other_registered = git.fetch_registered(git.fetch_key(lock, "no-mistakes"))
           break
         end
       end
@@ -99,9 +99,139 @@ return function()
   eq(type(registered), "table", "the in-flight fetch is registered under (lock, remote)")
   eq(other_registered, nil,
     "a caller for another remote does not see the origin fetch as its own")
-  eq(git.fetch_in_flight[git.fetch_key(lock, "origin")], nil,
+  eq(git.fetch_registered(git.fetch_key(lock, "origin")), nil,
     "the registry is empty once the fetch returns")
   eq(maki.fs.metadata(lock), nil, "the lock is released after a successful fetch")
+
+  -- (a2) A second caller for the same (repo, remote) while a fetch is in
+  -- flight waits for it and reuses its result -- it must not start a second
+  -- `git fetch` child. Coroutines stand in for the two callers: maki's jobwait
+  -- and the pause primitive yield, so the test can interleave them in-process.
+  local saved_async = maki.async
+  local fetched_children, in_fetch, pauses = 0, false, 0
+  git.run = function(args, opts)
+    if type(args) == "table" then
+      for _, arg in ipairs(args) do
+        if arg == "fetch" then
+          fetched_children = fetched_children + 1
+          if not in_fetch then
+            in_fetch = true
+            coroutine.yield("in-fetch")
+          end
+          break
+        end
+      end
+    end
+    return real_run(args, opts)
+  end
+  maki.async = { sleep = function()
+    pauses = pauses + 1
+    coroutine.yield("pause")
+  end }
+  -- The real sleep is what drives maki's job loop: a coroutine parked in a
+  -- jobwait only advances when the host gets a turn.
+  local real_sleep = saved_async and saved_async.sleep
+  local function tick()
+    if type(real_sleep) == "function" then
+      real_sleep(1)
+    end
+  end
+
+  local function resume_until(co, cond, label, limit)
+    for _ = 1, limit or 400 do
+      if coroutine.status(co) == "dead" then
+        return
+      end
+      local ok, err = coroutine.resume(co)
+      eq(ok, true, label .. " did not raise: " .. tostring(err))
+      if cond and cond() then
+        return
+      end
+      tick()
+    end
+  end
+
+  local first = coroutine.create(function() return git.fetch(repo, "origin") end)
+  resume_until(first, function() return in_fetch end, "the first fetch")
+  eq(in_fetch, true, "the first fetch is in flight")
+  eq(coroutine.status(first), "suspended", "the first fetch is parked inside git fetch")
+  eq(fetched_children, 1, "the first caller started one git fetch child")
+
+  local second = coroutine.create(function() return git.fetch(repo, "origin") end)
+  resume_until(second, function() return pauses > 0 end, "the second fetch")
+  eq(pauses > 0, true, "the second caller waits for the in-flight fetch")
+  eq(coroutine.status(second), "suspended", "the second caller is still waiting")
+  eq(fetched_children, 1, "the waiting caller starts no second git fetch child")
+
+  local first_value, first_err
+  for _ = 1, 400 do
+    local ok, value, err = coroutine.resume(first)
+    eq(ok, true, "the first fetch did not raise: " .. tostring(value))
+    if coroutine.status(first) == "dead" then
+      first_value, first_err = value, err
+      break
+    end
+    tick()
+  end
+  eq(first_value, true, "the first fetch succeeds: " .. tostring(first_err))
+
+  local second_value, second_err
+  for _ = 1, 400 do
+    local ok, value, err = coroutine.resume(second)
+    eq(ok, true, "the second fetch did not raise: " .. tostring(value))
+    if coroutine.status(second) == "dead" then
+      second_value, second_err = value, err
+      break
+    end
+    tick()
+  end
+  eq(second_value, true, "the second caller reuses the first result: " .. tostring(second_err))
+  eq(fetched_children, 1, "the reused result cost no extra git fetch child")
+  eq(git.fetch_registered(git.fetch_key(lock, "origin")), nil,
+    "the shared fetch is unregistered once every caller has its result")
+
+  -- (a3) The in-process wait is bounded too: a waiter behind a fetch that never
+  -- finishes gives up with git_lock instead of hanging, and starts no child.
+  in_fetch, fetched_children, pauses = false, 0, 0
+  local slow_first = coroutine.create(function() return git.fetch(repo, "origin") end)
+  resume_until(slow_first, function() return in_fetch end, "the slow fetch")
+  eq(in_fetch, true, "the slow fetch is in flight")
+  eq(coroutine.status(slow_first), "suspended", "the slow fetch is parked inside git fetch")
+
+  local timed = coroutine.create(function()
+    return git.fetch(repo, "origin", { lock_timeout_ms = 120 })
+  end)
+  local timed_result
+  for _ = 1, 400 do
+    local ok, a, b, c = coroutine.resume(timed)
+    eq(ok, true, "the waiting fetch did not raise: " .. tostring(a))
+    if coroutine.status(timed) == "dead" then
+      timed_result = { a, b, c }
+      break
+    end
+    tick()
+  end
+  eq(type(timed_result), "table", "the waiter gave up instead of hanging")
+  eq(timed_result[1], nil, "the timed-out waiter does not succeed")
+  eq(timed_result[3] and timed_result[3].cause, "git_lock", "the timed-out waiter names git_lock")
+  eq(timed_result[3] and timed_result[3].retryable, true, "the timed-out waiter is retryable")
+  eq(fetched_children, 1, "the timed-out waiter never started a second git fetch child")
+
+  local slow_value, slow_err
+  for _ = 1, 400 do
+    local ok, value, err = coroutine.resume(slow_first)
+    eq(ok, true, "the in-flight fetch did not raise: " .. tostring(value))
+    if coroutine.status(slow_first) == "dead" then
+      slow_value, slow_err = value, err
+      break
+    end
+    tick()
+  end
+  eq(slow_value, true, "the in-flight fetch succeeds: " .. tostring(slow_err))
+  eq(fetched_children, 1, "the in-flight fetch was the only child")
+
+  maki.async = saved_async
+  git.run = real_run
 
   -- (b) Four concurrent fetches from four real processes --------------------
   --
@@ -191,6 +321,14 @@ return function()
 
   -- (c) The lock survives neither an error nor an abandoned owner -----------
 
+  -- A path that is not a checkout must fail immediately with the honest
+  -- diagnosis, not spin the wait bound and blame git_lock.
+  local not_a_repo = maki.fs.joinpath(base, "not-a-repo")
+  maki.fs.mkdir(not_a_repo, { parents = true })
+  local nr_value, nr_err = git.fetch(not_a_repo, "origin", { lock_timeout_ms = 5000 })
+  eq(nr_value, nil, "a fetch outside a repository fails")
+  has(nr_err or "", "not a git repository", "a non-repository names its real cause")
+
   -- An error raised *inside* the fetch must still give the lock back. The
   -- raise happens below M.fetch's own pcall in run_fetch, which is the path a
   -- cancelled or broken child takes.
@@ -272,6 +410,17 @@ return function()
     eq(diag.message:find("inspect the command output", 1, true), nil,
       "the git_lock message is not the generic one: " .. stderr)
   end
+
+  -- Ref contention on another ref-writing command is the same transient
+  -- contention, so it gets the same cause; only a push keeps its rejection.
+  local rebase_diag = git.classify("rebase", {
+    code = 1,
+    stderr = "error: cannot lock ref 'refs/heads/task': is at a but expected b",
+    command = "git rebase origin/main",
+  })
+  eq(rebase_diag.cause, "git_lock", "ref contention on rebase is git_lock")
+  eq(rebase_diag.transient, true, "ref contention on rebase is transient")
+  eq(rebase_diag.retryable, true, "ref contention on rebase is retryable")
 
   -- Unrelated failures keep the catch-all, and are not announced as retryable
   -- ref contention.

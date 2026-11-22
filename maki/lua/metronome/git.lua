@@ -142,19 +142,6 @@ function M.classify(what, result)
       cause = "remote_missing"
       message = "the remote is not reachable"
       hint = "check the remote name/URL with `git remote -v`"
-    elseif what == "fetch" and (has("cannot lock ref")
-      or has("unable to update local ref") or has("failed to update ref")) then
-      -- Ref-lock contention is not a broken clone: another git process touched
-      -- the same ref at once. It is transient and retryable, so it gets its own
-      -- cause (and a remedy that names it) instead of the generic "inspect the
-      -- output". Only fetch says so: on a push, "failed to update ref" is part
-      -- of a rejection the caller must handle differently, so it keeps the more
-      -- specific cause below.
-      cause = "git_lock"
-      message = "another git operation holds a ref of this repository"
-      hint = "wait for the in-flight fetch to finish and retry; the ref contention is transient"
-      transient = true
-      retryable = true
     elseif what == "push" and (has("non-fast-forward") or has("[rejected]")
       or has("failed to push some refs") or has("fetch first")) then
       cause = "push_rejected"
@@ -205,6 +192,22 @@ function M.classify(what, result)
       message = "the GitHub repository is not reachable"
       hint = "check the git remote and that the repository exists"
     end
+  end
+
+  -- Ref-lock contention is not a broken clone: another git process touched the
+  -- same ref at once. It is transient and retryable, so it gets its own cause
+  -- (and a remedy that names it) instead of the generic "inspect the output".
+  -- Any ref-writing command can hit it -- fetch, rebase, branch reset, worktree
+  -- add -- so the match is not tied to a single verb. A push is deliberately
+  -- excluded: "failed to update ref" there is part of a rejection the caller
+  -- must handle by rebasing, so it keeps its specific cause above.
+  if not cause and what ~= "push" and (has("cannot lock ref")
+    or has("unable to update local ref") or has("failed to update ref")) then
+    cause = "git_lock"
+    message = "another git operation holds a ref of this repository"
+    hint = "wait for the in-flight fetch to finish and retry; the ref contention is transient"
+    transient = true
+    retryable = true
   end
 
   if not cause then
@@ -355,9 +358,12 @@ local FETCH_RETRY_DELAYS_MS = { 100, 400 }
 
 -- registry key -> the fetch currently in flight in this process.
 local fetch_in_flight = {}
--- Exposed so a test can prove the registry is empty after a fetch and that the
--- key distinguishes remotes; callers keep to M.fetch.
-M.fetch_in_flight = fetch_in_flight
+
+-- Read-only view of one registry slot. The table itself stays module-local: a
+-- caller can observe single-flight but cannot mutate it into a bogus owner.
+function M.fetch_registered(key)
+  return fetch_in_flight[key]
+end
 
 local function now_ms()
   return os.time() * 1000
@@ -415,17 +421,29 @@ end
 -- The common git dir is the one shared by every worktree of the clone, so a
 -- fetch started from a task worktree queues behind the one started from the
 -- main checkout. `rev-parse` answers a path relative to the repo when the repo
--- sits inside it; a repo that cannot answer falls back to `.git`.
+-- sits inside it. A path that is not a repository (or whose common dir is
+-- missing) fails here with the honest diagnosis instead of waiting for a lock
+-- that could never be created.
 function M.fetch_lock_path(repo)
   local result, err = run({ "git", "-C", repo, "rev-parse", "--git-common-dir" })
   if not result then
     return nil, err
   end
-  local dir = result.ok and (result.stdout:gsub("%s+$", "")) or ""
+  if not result.ok then
+    return nil, "not a git repository: " .. tostring(repo)
+  end
+  local dir = result.stdout:gsub("%s+$", "")
   if dir == "" then
     dir = maki.fs.joinpath(repo, ".git")
   elseif not dir:match("^/") then
     dir = maki.fs.joinpath(repo, dir)
+  end
+  -- The lock has to live in an existing directory: without this guard a path
+  -- that is not a checkout would spin the whole wait bound and then report
+  -- git_lock instead of the honest "not a git repository".
+  local meta = maki.fs.metadata(dir)
+  if type(meta) ~= "table" or not meta.is_dir then
+    return nil, "not a git repository: " .. tostring(repo)
   end
   return maki.fs.joinpath(dir, FETCH_LOCK_NAME)
 end
@@ -488,15 +506,26 @@ end
 -- a later caller can tell an abandoned lock from a live one. maki.fs has no
 -- exclusive create, hence the one-line child.
 local function try_lock(path)
-  local pid = own_pid()
-  local owner = string.format("pid=%s time=%d", pid and tostring(pid) or "0", now_ms())
-  local result = run({
-    "sh", "-c", 'set -C; printf %s "$2" > "$1"', "sh", path, owner,
-  })
-  if result ~= nil and result.ok then
-    return true
+  -- Taking over a stale lock only removes the file. The caller must then try
+  -- the exclusive create again: returning true right after the removal would
+  -- let two takers both claim a lock neither owns, and a later process would
+  -- create a fresh file while the first taker is still fetching. The loop is
+  -- bounded because a failed create can also mean "live lock" or "unwritable
+  -- directory"; the outer wait reports those as git_lock.
+  for _ = 1, 3 do
+    local pid = own_pid()
+    local owner = string.format("pid=%s time=%d", pid and tostring(pid) or "0", now_ms())
+    local result = run({
+      "sh", "-c", 'set -C; printf %s "$2" > "$1"', "sh", path, owner,
+    })
+    if result ~= nil and result.ok then
+      return true
+    end
+    if not take_over_stale_lock(path) then
+      return false
+    end
   end
-  return take_over_stale_lock(path)
+  return false
 end
 
 local function release_lock(path)
