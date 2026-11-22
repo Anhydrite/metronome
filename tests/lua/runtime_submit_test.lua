@@ -926,6 +926,268 @@ return function()
   eq(merge_calls, 2, "the merge is attempted again after the repair")
   eq(record.conflict_retried, true, "the repair is recorded on the task")
   eq(record.status, "merged", "the repaired task merges")
+
+  do
+  -- A merge conflict is a real implementation cycle, not a merge relaunch ----
+  --
+  -- `merge.run` returns a conflict (as it does after a failed rebase): the
+  -- task goes back to running/implement with the files and hunks journalled and
+  -- handed to the implementer, the open PR is reused (no second one), and the
+  -- pipeline runs again — bounded by `merge.max_conflict_retries`.
+  local function conflict_deps(max_retries, fail_forever)
+    local record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
+    local events = {}
+    local pr_opens = 0
+    local resets_taken = 0
+    local merge_calls = 0
+    local dispatched_conflict = false
+    local impl_conflicts = {}
+    local impl_calls = 0
+    local conflict = {
+      ok = false,
+      conflict = true,
+      conflict_files = "docs/configuration.md",
+      conflict_file_list = { "docs/configuration.md" },
+      conflict_hunks = {
+        { file = "docs/configuration.md", start = 12,
+          text = "<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> 59738f2" },
+      },
+      conflict_commit = "59738f2",
+      base = "main",
+      base_sha = "base123",
+      upstream = "origin/main",
+      rebase_command = "git rebase origin/main",
+      error = "rebase failed (conflicts: docs/configuration.md)",
+    }
+    local deps = {
+      config = {
+        load = function()
+          return {
+            project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 1 },
+            checks = { default = { "true" }, timeout_secs = 10 },
+            merge = { method = "squash", auto_merge = true, max_conflict_retries = max_retries },
+            deploy = { auto_deploy = false, plan_file = "deploy.md" },
+          }
+        end,
+      },
+      roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+      state = {
+        load = function() return { tasks = { T1 = record } } end,
+        transition = function(_, id, status, fields)
+          events[#events + 1] = {
+            kind = "transition",
+            status = status,
+            phase = fields and fields.phase,
+            reason = fields and fields.reason,
+          }
+          record.status = status
+          if fields and fields.phase then record.phase = fields.phase end
+          return { id = id, status = status }
+        end,
+        set_fields = function(_, _, fields)
+          events[#events + 1] = { kind = "field", fields = fields }
+          for k, v in pairs(fields or {}) do record[k] = v end
+          return true
+        end,
+        append = function(_, event)
+          events[#events + 1] = event
+          return true
+        end,
+      },
+      implement = {
+        run = function(run_opts)
+          impl_calls = impl_calls + 1
+          if run_opts.conflict ~= nil then
+            impl_conflicts[#impl_conflicts + 1] = run_opts.conflict
+          end
+          return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "sha" .. impl_calls }
+        end,
+        read_sheet = function() return {} end,
+      },
+      checks = { verify = function() return { ok = true } end, write_report = function() end },
+      converge = { run = function() return { ok = true } end },
+      review = { review = function() return { ok = true, approved = true, sha = "reviews ha" } end },
+      git = {
+        pr_open = function()
+          pr_opens = pr_opens + 1
+          return { number = 1, url = "u", state = "open" }
+        end,
+        push = function() return true end,
+        rev_parse = function() return "base123" end,
+        reset_hard = function() resets_taken = resets_taken + 1; return "sha" end,
+      },
+      merge = {
+        run = function()
+          merge_calls = merge_calls + 1
+          if fail_forever or merge_calls == 1 then
+            return conflict
+          end
+          record.status = "merged"
+          return { ok = true }
+        end,
+      },
+      deploy = { run = function() return { ok = true } end },
+      pipeline = {
+        tick = function(tick_opts)
+          if not dispatched_conflict then
+            dispatched_conflict = true
+            tick_opts.dispatch({ id = "T1" })
+          end
+          return { ok = true, started = {} }
+        end,
+      },
+      paths = function() return paths end,
+      spawn = function(fn) fn() end,
+      wait_turn_end = false,
+      runner = {},
+      qualify = {
+        run = function() return { ok = true, tasks = {} } end,
+        next_id = function() return "T1" end,
+        apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+      },
+      questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+      analyze = { gate = function() return { ok = true } end },
+      calibrate = {}, fence = {}, mode = {},
+    }
+    return {
+      deps = deps,
+      record = record,
+      events = events,
+      impl_conflicts = impl_conflicts,
+      impl_calls = function() return impl_calls end,
+      pr_opens = function() return pr_opens end,
+      resets = function() return resets_taken end,
+      merge_calls = function() return merge_calls end,
+    }
+  end
+
+  local function events_matching(events, fn)
+    local out = {}
+    for _, event in ipairs(events) do
+      if fn(event) then
+        out[#out + 1] = event
+      end
+    end
+    return out
+  end
+
+  -- The first conflict if the repo moves under the branch and the same lines
+  -- changed. That is repairable without a human: back to implement, on the
+  -- fresh base, with the files and hunks journalled and quoted in the prompt.
+  local repaired = conflict_deps(2, false)
+  local rt_repair = runtime.new(repaired.deps)
+  rt_repair.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_repair.run_pending()
+  eq(repaired.record.status, "merged", "the repaired task merges instead of failing")
+  eq(repaired.merge_calls(), 2, "the merge is attempted once after the repair")
+  eq(repaired.pr_opens(), 1, "the open PR is reused: no second PR is opened")
+  eq(repaired.resets(), 1, "the branch is reset onto the fresh base once")
+  eq(repaired.record.conflict_retries, 1, "the repair counter is persisted on the task")
+  eq(repaired.record.conflict_retried, true, "the task records that it repaired a conflict")
+  eq(repaired.record.phase, "review", "the repaired task went through the pipeline again")
+  -- Never `failed` on the first conflict: the repair is a continuation.
+  local failed_events = events_matching(repaired.events, function(event)
+    return event.kind == "transition" and event.status == "failed"
+  end)
+  eq(#failed_events, 0, "a first conflict is never journalled as failed")
+  -- The implementation turn received the conflict facts, as data.
+  eq(repaired.impl_calls(), 2, "the work is redone once after the conflict")
+  eq(#repaired.impl_conflicts, 1, "only the repair turn receives a conflict")
+  eq(repaired.impl_conflicts[1] and repaired.impl_conflicts[1].files
+    and repaired.impl_conflicts[1].files[1], "docs/configuration.md",
+    "the repair turn receives the conflicting file")
+  eq(repaired.impl_conflicts[1] and repaired.impl_conflicts[1].commit, "59738f2",
+    "the repair turn receives the faulty commit")
+  -- The journal note names the file, its hunk and the commit: the implementer
+  -- and the human read the same facts.
+  local notes = events_matching(repaired.events, function(event)
+    return event.kind == "note"
+  end)
+  eq(#notes >= 1, true, "the conflict is journalled as a note")
+  local note_text = notes[1] and notes[1].text or ""
+  eq(note_text:find("docs/configuration.md", 1, true) ~= nil, true, "the note names the conflicting file")
+  eq(note_text:find("=======", 1, true) ~= nil, true, "the note carries the conflict hunk")
+  eq(note_text:find("59738f2", 1, true) ~= nil, true, "the note names the faulty commit")
+  eq(note_text:find("git rebase origin/main", 1, true) ~= nil, true, "the note names the base command")
+  -- The counter is written with the status in one field patch, so a reload
+  -- resumes in implement with the conflict already journalled.
+  local repair_fields = events_matching(repaired.events, function(event)
+    return event.kind == "field" and event.fields and event.fields.conflict_retries == 1
+  end)
+  eq(#repair_fields, 1, "the repair persists conflict_retries once")
+  eq(repair_fields[1] and repair_fields[1].fields.status, "running",
+    "the repair puts the task back in running")
+  eq(repair_fields[1] and repair_fields[1].fields.phase, "implement",
+    "the repair puts the task back in the implement phase")
+
+  -- Beyond the bound, the conflict escalates to a human with the files, the
+  -- base and the exact command — not git's raw "rebase failed".
+  local escalated = conflict_deps(1, true)
+  local rt_escalate = runtime.new(escalated.deps)
+  rt_escalate.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_escalate.run_pending()
+  eq(escalated.record.status, "failed", "a conflict beyond the bound fails the task")
+  eq(escalated.record.conflict_retries, 1, "the bound comes from merge.max_conflict_retries")
+  eq(#escalated.impl_conflicts, 1, "the repair turn receives the conflict before escalating")
+  eq(escalated.impl_calls(), 2, "one repair is attempted before escalating")
+  eq(escalated.pr_opens(), 1, "the escalation still opens no second PR")
+  local failed_transitions = events_matching(escalated.events, function(event)
+    return event.kind == "transition" and event.status == "failed"
+  end)
+  local failure_message = tostring(failed_transitions[1] and failed_transitions[1].reason or "")
+  eq(failure_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the escalation names the conflicting files")
+  eq(failure_message:find("origin/main", 1, true) ~= nil, true,
+    "the escalation names the base")
+  eq(failure_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the escalation names the exact command")
+  local escalation_notes = events_matching(escalated.events, function(event)
+    return event.kind == "note" and tostring(event.text):find("cannot be repaired", 1, true) ~= nil
+  end)
+  eq(#escalation_notes, 1, "the escalation is journalled with the means to act")
+  eq(tostring(escalation_notes[1] and escalation_notes[1].text):find("docs/configuration.md", 1, true) ~= nil,
+    true, "the escalation note names the conflicting file")
+
+  -- The prompt and the config carry the conflict contract -------------------
+  local implement = load_module("implement")
+  local conflict_prompt = implement.render_prompt(
+    { id = "T1", title = "t", files = { "docs/configuration.md" }, checks = { "true" } },
+    "sheet",
+    { repo = "/tmp/repo", worktree = "/tmp/wt", branch = "b", base_ref = "main" },
+    {
+      conflict = repaired.impl_conflicts[1],
+    })
+  eq(conflict_prompt:find("Rebase conflict to resolve", 1, true) ~= nil, true,
+    "the prompt has a conflict section")
+  eq(conflict_prompt:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the prompt names the conflicting file")
+  eq(conflict_prompt:find("=======", 1, true) ~= nil, true,
+    "the prompt quotes the conflict hunk")
+  eq(conflict_prompt:find("data, not", 1, true) ~= nil, true,
+    "the prompt says the conflict facts are data")
+  eq(conflict_prompt:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the prompt names the exact command")
+  local plain_prompt = implement.render_prompt(
+    { id = "T1", title = "t", files = {}, checks = {} }, "sheet",
+    { repo = "/tmp/repo", worktree = "/tmp/wt", branch = "b", base_ref = "main" }, {})
+  eq(plain_prompt:find("Rebase conflict to resolve", 1, true), nil,
+    "a normal turn has no conflict section")
+  local rendered_config = runtime.render_config({
+    repo = "/tmp/repo", base_ref = "main", max_parallel = 1, max_parallel_qualifiers = 1,
+    checks = { "true" }, auto_merge = true, auto_deploy = false, deploy_confirm = false,
+    roles = {
+      qualifier = { model = "m", thinking = "low" },
+      analyst = { model = "m", thinking = "low" },
+      implementer = { model = "m", thinking = "low" },
+      reviewer = { model = "m", thinking = "low" },
+      deployer = { model = "m", thinking = "low" },
+    },
+  })
+  eq(rendered_config:find("%[merge%]%s*auto_merge") ~= nil, true, "the config has a merge section")
+  eq(rendered_config:find("max_conflict_retries = 2", 1, true) ~= nil, true,
+    "render_config emits max_conflict_retries")
+  end
+
   -- Prune: an open PR or a branch whose task is dead is an orphan -----------
   local prune_closed, prune_deleted = {}, {}
   local prune_repo = nil
