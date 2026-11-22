@@ -128,6 +128,15 @@ return function()
   eq(#started, 1, "a lone task with no declared files starts")
   eq(#skipped, 0, "a lone undeclared task is not skipped")
 
+  -- The same rule holds against a task already in flight, not only against one
+  -- selected in this pass.
+  local in_flight = { task("T-run", "running", { files = { "src/1" } }) }
+  started, skipped = pipeline.schedule({ task("T-solo", "ready") }, in_flight, { max_parallel = 4 })
+  eq(#started, 0, "an undeclared task does not start beside an in-flight task")
+  eq(#skipped, 1, "the undeclared task is skipped")
+  eq(skipped[1].reason:find("runs alone", 1, true) ~= nil, true,
+    "the skip reason is the runs-alone rule")
+
   -- schedule: dependencies -------------------------------------------------
 
   local dep_tasks = {
