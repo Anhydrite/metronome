@@ -201,8 +201,10 @@ end
 -- Depth-first search with the usual white/gray/black colours. A back edge to
 -- a gray node is a cycle; its nodes are the gray tail of the stack. Each
 -- canonical cycle is reported once. Self-loops are skipped: self_dependency
--- owns them, and reporting them twice would double the noise.
-local function find_cycles(ids, dep_map, id_set)
+-- owns them, and reporting them twice would double the noise. `allowed` is
+-- the group being searched: an edge that leaves it is ignored, so a cycle
+-- spanning two base branches is never reported.
+local function find_cycles(ids, dep_map, id_set, allowed)
   local color = {}
   local stack = {}
   local position = {}
@@ -214,7 +216,7 @@ local function find_cycles(ids, dep_map, id_set)
     stack[#stack + 1] = node
     position[node] = #stack
     for _, dep in ipairs(dep_map[node] or {}) do
-      if dep ~= node and id_set[dep] then
+      if dep ~= node and id_set[dep] and (not allowed or allowed[dep]) then
         local state = color[dep] or 0
         if state == 0 then
           visit(dep)
@@ -450,10 +452,12 @@ function M.analyze(tasks, opts)
   -- never scheduled together.
   for _, indexes in pairs(group_indexes) do
     local group_ids = {}
+    local group_set = {}
     for k, i in ipairs(indexes) do
       group_ids[k] = ids[i]
+      group_set[ids[i]] = true
     end
-    for _, cycle in ipairs(find_cycles(group_ids, dep_map, id_set)) do
+    for _, cycle in ipairs(find_cycles(group_ids, dep_map, id_set, group_set)) do
       local path = table.concat(cycle, " -> ") .. " -> " .. cycle[1]
       findings[#findings + 1] = {
         severity = "blocking",

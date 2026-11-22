@@ -180,6 +180,35 @@ return function()
   }, { base_ref = "metronome/epic/b" })
   eq(find_rule(task_base_wins, "duplicate_title"), nil, "a task base_ref overrides the batch base_ref")
 
+  -- A dependency cycle that spans two base branches is not a cycle: those
+  -- tasks are never scheduled together, so the edges never both matter.
+  local cross_epic_cycle = analyze.analyze({
+    { id = "T-20261122-a006", title = "First", files = { "src/a.lua" },
+      checks = { "make test" }, depends_on = { "T-20261122-b006" },
+      base_ref = "metronome/epic/a" },
+    { id = "T-20261122-b006", title = "Second", files = { "src/b.lua" },
+      checks = { "make test" }, depends_on = { "T-20261122-a006" },
+      base_ref = "metronome/epic/b" },
+  })
+  eq(find_rule(cross_epic_cycle, "dependency_cycle"), nil,
+    "a cycle spanning two base_ref groups is not reported")
+  eq(cross_epic_cycle.ok, true, "cross-group edges do not block")
+
+  -- Per-task rules still run on every task, whatever its group.
+  local per_task_groups = analyze.analyze({
+    { id = "T-20261122-a007", title = "No files", files = {},
+      checks = { "make test" }, depends_on = {}, base_ref = "metronome/epic/a" },
+    { id = "T-20261122-b007", title = "No checks", files = { "src/b.lua" },
+      checks = {}, depends_on = {}, base_ref = "metronome/epic/b" },
+  })
+  local empty_files_finding = find_rule(per_task_groups, "empty_files")
+  local empty_checks_finding = find_rule(per_task_groups, "empty_checks")
+  eq(empty_files_finding and empty_files_finding.tasks[1], "T-20261122-a007",
+    "empty_files still fires inside its own group")
+  eq(empty_checks_finding and empty_checks_finding.tasks[1], "T-20261122-b007",
+    "empty_checks still fires inside its own group")
+  eq(per_task_groups.ok, false, "per-task findings still block across groups")
+
   local ordered = analyze.analyze({
     task("T-20261114-c003", "Second", { "src/shared.lua", "src/two.lua" }, nil, { "T-20261114-c004" }),
     task("T-20261114-c004", "First", { "src/shared.lua", "src/one.lua" }),
