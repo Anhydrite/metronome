@@ -90,7 +90,7 @@ A task is done when these commands exit 0, not when a model says so. A red check
 
 ## Preflight
 
-`/metronome init` and `/metronome config` verify the environment before they write anything: a project bound with a missing checker, no git identity or a base branch absent from `origin` would otherwise only fail on the first task, far from the command that created it. The preflight runs five mandatory checks in one pass, so a single refusal lists every problem:
+`/metronome init` and `/metronome config` verify the environment before they write anything: a project bound with a missing checker, no git identity or a base branch absent from `origin` would otherwise only fail on the first task, far from the command that created it. The preflight runs five mandatory checks in one pass — git identity, a test commit, the declared checks, the `origin` base branch and the toolchain — so a single refusal lists every problem:
 
 | Check | What it proves | Remedy it names |
 | --- | --- | --- |

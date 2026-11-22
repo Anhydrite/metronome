@@ -51,7 +51,7 @@ The installer copies `maki/lua/` into `$MAKI_CONFIG_DIR` (default `$XDG_CONFIG_H
 
 1. **git identity** — `user.name` and `user.email` are set and non-empty in the repository.
 2. **Test commit** — a probe commit passes in a throwaway worktree cut from the base branch, so a blocked commit (identity, pre-commit hook, permissions) surfaces here instead of in the first task.
-3. **Declared checks executable** — the first word of every command in `[checks]` resolves on `PATH` with its dependencies, so `npm test` fails here rather than at exit 127 mid-task when `node`/`npm` are absent.
+3. **Executable declared checks** — the first word of every command in `[checks]` resolves on `PATH` with its dependencies, so `npm test` fails here rather than at exit 127 mid-task when `node`/`npm` are absent.
 4. **Origin base branch** — the repository has an `origin`, and that `origin` has the declared base branch.
 5. **Locale and toolchain** — every git and check child runs under `LC_ALL=C`, and `python3` imports `jsonschema` for `scripts/validate.sh`.
 
