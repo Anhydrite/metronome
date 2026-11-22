@@ -189,6 +189,18 @@ function M.validate(config)
     problems[#problems + 1] = string.format("review.engine: unknown engine %q", tostring(review.engine))
   end
 
+  local merge = config.merge
+  if type(merge) == "table" and merge.max_conflict_retries ~= nil then
+    local retries = merge.max_conflict_retries
+    if type(retries) ~= "number" or retries ~= math.floor(retries)
+      or retries < 0 or retries > 10 then
+      problems[#problems + 1] = string.format(
+        "merge.max_conflict_retries must be an integer between 0 and 10, got %q",
+        tostring(retries)
+      )
+    end
+  end
+
   if #problems > 0 then
     return nil, problems
   end
@@ -218,6 +230,7 @@ function M.validate(config)
   config.merge.auto_merge = config.merge.auto_merge or false
   config.merge.method = config.merge.method or "squash"
   config.merge.auto_rebase = config.merge.auto_rebase ~= false
+  config.merge.max_conflict_retries = config.merge.max_conflict_retries or 2
 
   config.deploy = config.deploy or {}
   config.deploy.auto_deploy = config.deploy.auto_deploy or false

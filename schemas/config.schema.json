@@ -105,7 +105,14 @@
       "properties": {
         "auto_merge": { "type": "boolean", "default": false },
         "method": { "type": "string", "enum": ["squash", "merge", "rebase"], "default": "squash" },
-        "auto_rebase": { "type": "boolean", "default": true }
+        "auto_rebase": { "type": "boolean", "default": true },
+        "max_conflict_retries": {
+          "type": "integer",
+          "description": "How many conflict resolutions are attempted before escalating to the human.",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 2
+        }
       }
     },
     "deploy": {
