@@ -209,6 +209,26 @@ function M.schedule(tasks, running, opts)
   return selected, skipped
 end
 
+-- Named reasons for every ready task the scheduler would not start right now.
+-- `status` shows them so a ready task that never gets dispatched (a ghost
+-- dependency, a full queue) is visible instead of silently waiting forever.
+-- `running` is derived from the tasks themselves: every active status occupies
+-- a slot, exactly as the caller of `schedule` would count it.
+function M.ready_reasons(tasks, opts)
+  opts = type(opts) == "table" and opts or {}
+  local running = {}
+  for _, task in ipairs(M.collect(tasks)) do
+    if ACTIVE[task.status] then
+      running[#running + 1] = task
+    end
+  end
+  local _, skipped = M.schedule(tasks, running, { max_parallel = opts.max_parallel })
+  table.sort(skipped, function(a, b)
+    return a.id < b.id
+  end)
+  return skipped
+end
+
 -- Stall detection -----------------------------------------------------------
 
 -- Active tasks whose last progress is older than `stall_minutes`. `now` is a

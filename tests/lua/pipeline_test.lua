@@ -170,6 +170,40 @@ return function()
   eq(#started, 1, "a dependent task starts once its dependency is merged")
   eq(started[1].id, "T-b", "the dependent task is the one selected")
 
+  -- ready_reasons: every ready task that will not start is named -----------
+
+  local reason_tasks = {
+    task("T-f", "ready", { files = { "src/f" } }),
+    task("T-c", "ready", { files = { "src/c" }, depends_on = { "T-draft" } }),
+    task("T-b", "ready", { files = { "src/b" }, depends_on = { "T-ghost" } }),
+    task("T-a", "ready", { files = { "src/a" } }),
+    task("T-e", "ready", { files = { "src/e" } }),
+    task("T-draft", "draft", { files = { "src/d" } }),
+  }
+  local waiting = pipeline.ready_reasons(reason_tasks, { max_parallel = 2 })
+  eq(#waiting, 3, "every ready task the scheduler skips is named")
+  eq(waiting[1].id, "T-b", "the reasons are sorted by id (1)")
+  eq(waiting[1].reason:find("missing dependency: T-ghost", 1, true) ~= nil, true,
+    "the reason names the missing dependency")
+  eq(waiting[2].id, "T-c", "the reasons are sorted by id (2)")
+  eq(waiting[2].reason:find("waiting on T-draft (draft)", 1, true) ~= nil, true,
+    "the reason names the waiting dependency and its status")
+  eq(waiting[3].id, "T-f", "the reasons are sorted by id (3)")
+  eq(waiting[3].reason:find("max_parallel", 1, true) ~= nil, true,
+    "the reason is the parallel cap")
+
+  -- An active task occupies a slot of its own: only one more may start.
+  local with_active = pipeline.ready_reasons({
+    task("T-run", "running", { files = { "src/r" } }),
+    task("T-1", "ready", { files = { "src/1" } }),
+    task("T-2", "ready", { files = { "src/2" } }),
+  }, { max_parallel = 2 })
+  eq(#with_active, 1, "an active task takes a slot")
+  eq(with_active[1].id, "T-2", "the second ready task waits for the cap")
+
+  eq(#pipeline.ready_reasons({ task("T-free", "ready", { files = { "src/x" } }) }, { max_parallel = 2 }), 0,
+    "a dispatchable ready task is not named")
+
   -- schedule: only ready tasks ---------------------------------------------
 
   local mixed = {
