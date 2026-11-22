@@ -477,6 +477,67 @@ return function()
   eq(one and one.depends_on and one.depends_on[2], "ghost",
     "an unknown reference is left verbatim for the gate to block")
 
+  -- The qualifier sometimes names a dependency by batch position in the "T<n>"
+  -- form: it must resolve to the id of the n-th task of the batch.
+  local tn_root = maki.fs.joinpath(base, "qualify-tn")
+  maki.fs.mkdir(tn_root, { parents = true })
+  local tn_result = {
+    ok = true,
+    tasks = {
+      { title = "First", intent = "1", files = { "a" }, checks = { "c" }, depends_on = {} },
+      { title = "Second", intent = "2", files = { "b" }, checks = { "c" }, depends_on = { "T1" } },
+      { title = "Third", intent = "3", files = { "c" }, checks = { "c" }, depends_on = { "T2" } },
+    },
+    questions = {},
+    truncated_questions = 0,
+  }
+  local tn_applied, tn_err = q.apply(state, tn_root, tn_result, {})
+  eq(tn_err, nil, "apply with a T<n> dependency has no error")
+  local tn_first = tn_applied and tn_applied.tasks[1]
+  local tn_second = tn_applied and tn_applied.tasks[2]
+  local tn_third = tn_applied and tn_applied.tasks[3]
+  eq(tn_second and tn_second.depends_on and tn_second.depends_on[1], tn_first and tn_first.id,
+    "T1 resolves to the first task id when no task carries the id T1")
+  eq(tn_third and tn_third.depends_on and tn_third.depends_on[1], tn_second and tn_second.id,
+    "T2 resolves to the second task id")
+  local tn_state = state.load(tn_root)
+  eq(tn_third and tn_state.tasks[tn_third.id] and tn_state.tasks[tn_third.id].depends_on[1],
+    tn_second and tn_second.id, "the stored record keeps the resolved T<n> id")
+  local tn_sheet = maki.fs.read(maki.fs.joinpath(tn_root, "tasks", (tn_third and tn_third.id or "") .. ".md"))
+  has(tn_sheet or "", "- Depends on: " .. tostring(tn_second and tn_second.id),
+    "the sheet shows the resolved T<n> id")
+
+  -- A real id wins over the "T<n>" form, even when the batch order would map
+  -- "T1" to another task.
+  local prec_root = maki.fs.joinpath(base, "qualify-precedence")
+  maki.fs.mkdir(prec_root, { parents = true })
+  local prec_result = {
+    ok = true,
+    tasks = {
+      { title = "Left", intent = "l", files = { "a" }, checks = { "c" }, depends_on = { "T1", "ghost" } },
+      { title = "Right", intent = "r", files = { "b" }, checks = { "c" }, depends_on = {} },
+    },
+    questions = {},
+    truncated_questions = 0,
+  }
+  local prec_applied, prec_err = q.apply(state, prec_root, prec_result, {
+    id_factory = function(index)
+      if index == 1 then
+        return "T2"
+      end
+      return "T1"
+    end,
+  })
+  eq(prec_err, nil, "apply with a real T<n>-looking id has no error")
+  local prec_left = prec_applied and prec_applied.tasks[1]
+  eq(prec_left and prec_left.id, "T2", "the first task got the factory id T2")
+  eq(prec_applied and prec_applied.tasks[2] and prec_applied.tasks[2].id, "T1",
+    "the second task got the factory id T1")
+  eq(prec_left and prec_left.depends_on and prec_left.depends_on[1], "T1",
+    "a real id wins over the T<n> batch position")
+  eq(prec_left and prec_left.depends_on and prec_left.depends_on[2], "ghost",
+    "an unknown reference is still left verbatim")
+
   local dup_result = {
     ok = true,
     tasks = { { title = "Duplicate", files = { "x" }, checks = { "y" } } },
