@@ -965,9 +965,9 @@ function M.list_branches(repo, remote, opts)
   return names
 end
 
--- Close a pull request without merging it. A failed, stopped or abandoned task
--- must not leave an open PR nobody will ever merge, nor a branch nobody will
--- look at.
+-- Close a pull request without merging it. This is only for a task a human has
+-- explicitly abandoned or deleted: a failed task is retryable by construction,
+-- so it keeps its open PR (and its review threads) for the retry to update.
 function M.pr_close(ref, opts)
   opts = type(opts) == "table" and opts or {}
   if ref == nil or tostring(ref) == "" then
@@ -1084,26 +1084,35 @@ end
 
 -- The whole step: open the PR, record it on the task, then move the task.
 --
+-- When the task already carries an open PR, that PR is reused as is -- same
+-- number, same url, same review threads -- and simply re-recorded, so a retry
+-- of a failed task updates the preserved PR instead of replacing it.
+--
 -- The PR is stored before the move so a refused transition still leaves the
 -- work visible: the caller can retry the move without opening a second PR.
 function M.pr_open(state, root, task_id, opts)
   opts = opts or {}
-  -- A retry must not accumulate pull requests. Close the previous open one
-  -- first; a merged or already-closed PR is left alone.
+  -- A retry reuses the PR the task already carries when it is still open: same
+  -- number, same review threads, no close and no create. The pipeline's push
+  -- keeps that PR up to date. Only a merged or closed PR is replaced, through
+  -- the normal create path.
   local loaded = type(state.load) == "function" and state.load(root) or nil
   local existing = loaded and loaded.tasks and loaded.tasks[task_id]
     and loaded.tasks[task_id].pr or nil
+  local pr
   if existing and existing.number
     and existing.state ~= "merged" and existing.state ~= "closed" then
-    pcall(M.pr_close, existing.number, {
-      gh = opts.gh,
-      worktree = opts.worktree,
-      timeout_ms = opts.timeout_ms,
-    })
-  end
-  local pr, err = M.pr_create(opts)
-  if not pr then
-    return nil, err
+    local reused, nerr = M.normalize_pr(existing)
+    if not reused then
+      return nil, nerr
+    end
+    pr = reused
+  else
+    local created, err = M.pr_create(opts)
+    if not created then
+      return nil, err
+    end
+    pr = created
   end
   local task, aerr = M.pr_attach(state, root, task_id, pr)
   if not task then
