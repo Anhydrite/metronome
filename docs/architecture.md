@@ -24,7 +24,7 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `merge.lua` | Rebase on the fresh base, merge the PR, re-run the checks on the merged base. |
 | `deploy.lua` | Run `deploy.md` with the user in the loop, guarded by a merged PR and green checks. |
 | `calibrate.lua` | Analyze the repository and generate `review-rules.md`; ingest feedback. |
-| `pipeline.lua` | Scheduler: dependencies, file overlap, `max_parallel`, stall detection, resume. |
+| `pipeline.lua` | Scheduler: dependencies, `max_parallel`, runs-alone rule for undeclared files, stall detection, resume. |
 | `runtime.lua` | The production runtime the tools and commands call: paths, init, config (read and merge-update), submit, status, answer, retry, abandon, calibrate, panel, resume, feedback, mode. |
 | `mode.lua` | Persist the on/off routing flag, contribute a routing prompt hint evaluated before every run, and guard the main session from `write`/`edit`/`bash` while the mode is on. |
 | `fence.lua` | Wrap untrusted output in sentinels and escape forged sentinels. |
@@ -70,7 +70,7 @@ draft -> qualifying -> awaiting_answers -> qualifying
 One task goes through these phases, each owned by a module:
 
 1. **Qualify** — `qualify.lua` turns the intention into task sheets, one per unit of work, with declared files, checks and acceptance criteria. A task that asks a question is parked in `awaiting_answers`; the rest become `ready` after the analysis gate.
-2. **Analyze** — `analyze.lua` checks the sheets against each other: duplicate titles, duplicate file sets, overlapping files without a dependency, missing dependencies, dependency cycles, gate coupling (a check that runs a file another task owns, which deadlocks when the owner waits on this task), empty checks. A blocking finding keeps the task in `qualifying`.
+2. **Analyze** — `analyze.lua` checks the sheets against each other: duplicate titles, missing dependencies, dependency cycles, gate coupling (a check that runs a file another task owns, which deadlocks when the owner waits on this task), empty checks. A blocking finding keeps the task in `qualifying`. Overlapping files and identical file sets are reported as informative (`minor`) findings only: each task has its own worktree and branch, so shared files are expected and any conflict resolves at merge. Cross-task rules only compare tasks cut from the same `base_ref` — two epics have different base branches and are never compared.
 3. **Implement** — `implement.lua` creates the worktree from the base branch, checkpoints the starting SHA, runs the implementer, commits and pushes.
 4. **Verify** — `checks.lua` runs the declared commands in the worktree. A red check rolls back to the checkpoint and sends the task back to `running`.
 5. **Converge** — `converge.lua` compares the diff with the declared files. A missing or unexpected file gets one repair turn; the verdict is the diff after the turn, never the model's word.
@@ -88,7 +88,7 @@ An intention that qualifies into more than one task does not merge those tasks i
 `pipeline.lua` decides what may run, never how a step runs:
 
 - **Dependencies** — a task starts only when every `depends_on` task is `merged` or `deployed`. A missing, failed or abandoned dependency blocks it with a named reason.
-- **File overlap** — two tasks that declare a common file never run together, even below `max_parallel`.
+- **Parallelism** — a task starts as soon as its `depends_on` tasks are `merged` or `deployed` and `max_parallel` has a free slot. Declared files never serialise anything: two tasks that declare the same file run in parallel because each works in its own worktree on its own branch, and any textual conflict is resolved at merge time. The only file-driven case is the opposite one — a task that declares no files at all has an unknown blast radius and runs alone until the pipeline is empty (naming a file buys the parallelism back).
 - **`max_parallel`** — the hard cap on tasks in flight.
 - **Stall detection** — an active task whose last progress is older than `stall_minutes` is stale. A stale `running` task moves to `stalled`; the other active statuses are flagged `stall.suspect`.
 - **Resume** — `/reload` kills in-flight sessions. Resume walks each interrupted task back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase.
