@@ -278,7 +278,7 @@ return function()
   eq(missing_finding and missing_finding.severity, "blocking", "missing_dependency is blocking")
   eq(missing_finding and missing_finding.tasks[1], "T-20261114-e001", "missing_dependency names the task")
   has(missing_finding and missing_finding.message or "", "T-20261114-ffff", "missing_dependency names the unknown id")
-  has(missing_finding and missing_finding.message or "", "neither a task id, a task title nor an index", "missing_dependency explains the reference kinds")
+  has(missing_finding and missing_finding.message or "", "neither a task id, a 'T<n>' batch position, a 1-based batch index nor a task title", "missing_dependency explains the reference kinds")
   eq(missing.ok, false, "missing_dependency blocks")
 
   local known = analyze.analyze({
@@ -1059,4 +1059,66 @@ return function()
   eq(retry_second and retry_second.tasks[1], "T-20261114-r001", "the retried pass moves the task to ready")
   local retry_after = state.load(retry_root)
   eq(retry_after.tasks["T-20261114-r001"].quarantine, nil, "the retried pass clears the marker")
+
+  -- gate: a ready task with an unresolved dependency is re-analyzed --------
+
+  -- A task created straight in ready never went through the gate. If its
+  -- depends_on names nothing the state knows, it is ready-but-never-
+  -- dispatchable: the gate must notice it, report it and pull it back.
+  local gate_root = maki.fs.joinpath(base, "state-gate")
+  local created_n001 = state.create(gate_root, {
+    id = "T-20261114-n001",
+    title = "Add search",
+    files = { "src/search.lua" },
+    checks = { "make test" },
+    depends_on = { "T1" },
+    status = "ready",
+  })
+  eq(type(created_n001), "table", "a ready task with a phantom dependency is created")
+  state.create(gate_root, {
+    id = "T-20261114-n002",
+    title = "Add filters",
+    files = { "src/filters.lua" },
+    checks = { "make test" },
+    depends_on = { "T-20261114-n001" },
+    status = "ready",
+  })
+
+  -- No task is qualifying: a gate that returned early would hide the defect
+  -- forever. It must select the unresolved ready task instead.
+  local demotion_gate = analyze.gate(state, gate_root, {
+    intention = "re-analyze ready tasks",
+    now = "2026-11-14T00:02:00Z",
+  })
+  eq(demotion_gate and demotion_gate.ok, true, "a completed analysis is ok even when it demotes")
+  eq(demotion_gate and demotion_gate.verdict, "blocked", "the demoting gate verdict is blocked")
+  eq(demotion_gate and #demotion_gate.tasks, 0, "a blocked gate promotes nothing")
+  eq(demotion_gate and #demotion_gate.demoted, 1, "the gate lists exactly the demoted task")
+  eq(demotion_gate and demotion_gate.demoted[1], "T-20261114-n001", "the demoted task is the unresolved one")
+  local demoted_finding = find_rule(demotion_gate, "missing_dependency")
+  eq(demoted_finding and demoted_finding.severity, "blocking", "the demoted task carries a blocking missing_dependency")
+  eq(demoted_finding and demoted_finding.tasks[1], "T-20261114-n001", "the finding names the demoted task")
+  has(demoted_finding and demoted_finding.message or "", "T1", "the finding names the phantom dependency")
+  eq(count_rule(demotion_gate, "missing_dependency"), 1, "a ready task whose dependencies resolve is not re-analyzed")
+
+  local after_demotion = state.load(gate_root)
+  eq(after_demotion.tasks["T-20261114-n001"].status, "qualifying", "the unresolved ready task goes back to qualifying")
+  eq(after_demotion.tasks["T-20261114-n001"].phase, "analyze", "the demotion carries the analyze phase")
+  eq(after_demotion.tasks["T-20261114-n001"].failure_reason, "unresolved dependency: T1", "the demotion names the dependency")
+  eq(after_demotion.tasks["T-20261114-n002"].status, "ready", "a ready task whose dependency is known stays ready")
+
+  local demotion_report_text = maki.fs.read(maki.fs.joinpath(gate_root, "analysis.json"))
+  eq(type(demotion_report_text), "string", "the demoting gate writes analysis.json")
+  local demotion_report_ok, demotion_report = pcall(maki.json.decode, demotion_report_text)
+  eq(demotion_report_ok, true, "the demoting analysis.json decodes")
+  eq(find_rule(demotion_report, "missing_dependency") ~= nil, true, "the missing_dependency finding lands in analysis.json")
+  eq(demotion_report and demotion_report.verdict, "blocked", "analysis.json records the demoting verdict")
+
+  -- Now the unresolved task is qualifying: a still-blocking gate must not
+  -- promote it, and must not demote it twice.
+  local still_blocked = analyze.gate(state, gate_root, { intention = "re-analyze ready tasks" })
+  eq(still_blocked and still_blocked.ok, true, "the now-qualifying task still blocks the verdict")
+  eq(still_blocked and #still_blocked.tasks, 0, "a blocking gate promotes no qualifying task")
+  eq(still_blocked and #still_blocked.demoted, 0, "a qualifying task is not demoted again")
+  eq(state.load(gate_root).tasks["T-20261114-n001"].status, "qualifying", "the blocked task stays qualifying")
 end
