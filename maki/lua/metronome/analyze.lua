@@ -1044,9 +1044,16 @@ end
 -- The `qualifying -> ready` gate.
 --
 -- Select the sheets that are waiting (or the ones the caller names), analyze
--- them, write the report, and only then move the ones still qualifying to
--- ready. A blocking finding moves nothing: the whole batch stays where it is
--- so the user can fix the sheets and re-run.
+-- them in ONE batch (so cross-task rules still see the whole selection), write
+-- the report, and then partition the verdict PER TASK: a task named by a
+-- blocking finding stays qualifying and is reported in `blocked`, every other
+-- task moves to ready and is reported in `tasks`. One offending sheet must
+-- never freeze the clean ones beside it: a mixed batch moves its clean tasks.
+--
+-- A blocking finding that names no task at all (a semantic finding with an
+-- empty `tasks` list, or a batch-wide rule) cannot be attributed, so it
+-- quarantines EVERY selected task: nothing unverified leaves qualifying, but
+-- the finding is reported per task instead of aborting the caller.
 function M.gate(state, root, opts)
   opts = type(opts) == "table" and opts or {}
   if type(state) ~= "table" or type(state.load) ~= "function" then
@@ -1081,7 +1088,7 @@ function M.gate(state, root, opts)
   end
 
   if #selected == 0 then
-    return { ok = true, verdict = "ok", findings = {}, tasks = {} }
+    return { ok = true, verdict = "ok", findings = {}, tasks = {}, blocked = {} }
   end
 
   local known_ids = {}
@@ -1110,12 +1117,58 @@ function M.gate(state, root, opts)
     return nil, report_err
   end
 
+  -- Attribute the blocking findings to the selected tasks. A finding naming an
+  -- id outside this batch names nothing here; an unattributed blocking finding
+  -- is kept aside and applies to the whole batch.
+  local selected_ids = {}
+  local order = {}
+  for i, task in ipairs(selected) do
+    local id = task_id(task, i)
+    if not selected_ids[id] then
+      selected_ids[id] = true
+      order[#order + 1] = id
+    end
+  end
+  table.sort(order)
+
+  local attributed = {}
+  local unattributed = {}
+  for _, finding in ipairs(result.findings or {}) do
+    if finding.severity == "blocking" then
+      local names = type(finding.tasks) == "table" and finding.tasks or {}
+      if #names == 0 then
+        unattributed[#unattributed + 1] = finding
+      else
+        local seen = {}
+        for _, name in ipairs(names) do
+          if selected_ids[name] and not seen[name] then
+            seen[name] = true
+            attributed[name] = attributed[name] or {}
+            local list = attributed[name]
+            list[#list + 1] = finding
+          end
+        end
+      end
+    end
+  end
+
+  local fresh = state.load(root)
+  local current_tasks = type(fresh) == "table" and type(fresh.tasks) == "table" and fresh.tasks or {}
+
   local moved = {}
-  if result.ok then
-    local fresh = state.load(root)
-    local current_tasks = type(fresh) == "table" and type(fresh.tasks) == "table" and fresh.tasks or {}
-    for _, task in ipairs(selected) do
-      local id = task_id(task, 1)
+  local blocked = {}
+  for _, id in ipairs(order) do
+    local finding_list = {}
+    for _, finding in ipairs(attributed[id] or {}) do
+      finding_list[#finding_list + 1] = finding
+    end
+    for _, finding in ipairs(unattributed) do
+      finding_list[#finding_list + 1] = finding
+    end
+
+    if #finding_list > 0 then
+      blocked[#blocked + 1] = { id = id, findings = finding_list }
+    else
       local current = current_tasks[id]
       if type(current) == "table" and current.status == "qualifying" then
         local moved_ok, transitioned, transition_err = pcall(
@@ -1132,11 +1185,13 @@ function M.gate(state, root, opts)
     end
   end
 
+  local ok = #blocked == 0
   return {
-    ok = result.ok,
-    verdict = result.verdict,
+    ok = ok,
+    verdict = ok and "ok" or "blocked",
     findings = result.findings,
     tasks = moved,
+    blocked = blocked,
   }
 end
 
