@@ -427,7 +427,10 @@ end
 
 -- Find the tasks a reload interrupted and, unless `apply = false`, walk each
 -- back to `running` through legal transitions. `dispatch` is called for every
--- resumed task with `(task, phase)`.
+-- resumed task with `(task, phase)` — only for the entries actually applied.
+-- Each step is a compare-and-set: the status is re-read just before the move,
+-- so a task another actor already restarted is left untouched and reported as
+-- skipped instead of being dispatched a second time.
 function M.resume(state, root, opts)
   opts = type(opts) == "table" and opts or {}
   if type(state) ~= "table" or type(state.load) ~= "function" then
@@ -462,20 +465,55 @@ function M.resume(state, root, opts)
     end
   end
 
+  local stamp = opts.now_iso
+  if not is_non_empty(stamp) then
+    stamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+  end
+
   local errors = {}
+  local skipped = {}
   if opts.apply ~= false then
     for _, entry in ipairs(entries) do
+      -- Compare-and-set: the entry comes from a projection read once, before
+      -- the loop. Another actor (a late review verdict, a second resume, a
+      -- repair in flight) may have moved the task since. Re-read the status
+      -- right before *every* step and refuse to walk a path from a status the
+      -- task no longer holds: two pilots on one task is the bug this guards
+      -- against, and a stale walk would dispatch a task already restarted.
+      local expected = entry.from
       local moved = true
       for _, to in ipairs(entry.path) do
-        local ok, merr = state.transition(root, entry.id, to, { phase = entry.phase })
-        if not ok then
+        local current_state = state.load(root)
+        local current = type(current_state) == "table"
+          and current_state.tasks and current_state.tasks[entry.id] or nil
+        if not current then
           moved = false
-          errors[#errors + 1] = { id = entry.id, error = merr }
+          entry.reason = string.format("status unreadable before %s at %s", to, stamp)
           break
         end
+        if current.status ~= expected then
+          moved = false
+          entry.reason = string.format("status already moved to %s at %s", current.status, stamp)
+          break
+        end
+        local ok, merr = state.transition(root, entry.id, to, { phase = entry.phase })
+        if not ok then
+          -- A refused transition is a sequencing defect, not a fault of the
+          -- task: record it and keep resuming the other entries. Nothing here
+          -- is fatal to the run, and an "illegal transition" never escapes as
+          -- the resume's own error.
+          moved = false
+          entry.reason = merr
+          errors[#errors + 1] = { id = entry.id, skipped = true, reason = merr }
+          break
+        end
+        expected = to
       end
       entry.applied = moved
-      if moved and type(opts.dispatch) == "function" then
+      if not moved then
+        entry.skipped = true
+        skipped[#skipped + 1] = { id = entry.id, skipped = true, reason = entry.reason }
+      elseif type(opts.dispatch) == "function" then
         local current = state.load(root)
         local task = current and current.tasks and current.tasks[entry.id] or entry.task
         pcall(opts.dispatch, task, entry.phase)
@@ -483,7 +521,7 @@ function M.resume(state, root, opts)
     end
   end
 
-  return { resumed = entries, errors = errors }
+  return { resumed = entries, errors = errors, skipped = skipped }
 end
 
 -- One scheduling tick -------------------------------------------------------

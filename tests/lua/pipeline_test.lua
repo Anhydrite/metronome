@@ -349,6 +349,104 @@ return function()
   eq(resume.resumed[4].phase, "merge", "a merging task resumes the merge phase")
   eq(resume.resumed[5].phase, "deploy", "a deploying task resumes the deploy phase")
 
+  -- resume compare-and-set: never a second pilot on the same task ----------
+  --
+  -- The journal of T-20261122-002d shows a late review verdict walking
+  -- reviewing -> changes_requested -> running while a repair had already put the
+  -- task back in running: two `running` in a row, then an "illegal transition".
+  -- The resume must re-read the status before every step and give up on a task
+  -- another actor already moved.
+
+  local cas_root = tmp_root("pipeline-resume-cas")
+  state.create(cas_root, {
+    id = "T-20261122-cas001",
+    title = "moved by another actor",
+    status = "reviewing",
+  })
+  -- Between the resume's initial read (reviewing) and the path walk, another
+  -- actor applies the review verdict and moves the task to changes_requested.
+  -- Walking the stale path from there would re-dispatch a task already handed
+  -- to a repair: this is the double pilot in the T-20261122-002d journal.
+  state.transition(cas_root, "T-20261122-cas001", "changes_requested")
+
+  local cas_calls = 0
+  local cas_proxy = {
+    transition = state.transition,
+    load = function(root)
+      cas_calls = cas_calls + 1
+      if cas_calls == 1 then
+        -- The stale projection the resume selects its entry from.
+        return { tasks = { ["T-20261122-cas001"] = task("T-20261122-cas001", "reviewing") } }
+      end
+      return state.load(root)
+    end,
+  }
+
+  local cas_dispatched = {}
+  local cas_resume = pipeline.resume(cas_proxy, cas_root, {
+    now_iso = "2026-11-22T18:31:25Z",
+    dispatch = function(t, phase)
+      cas_dispatched[#cas_dispatched + 1] = { id = t.id, phase = phase }
+    end,
+  })
+  eq(#cas_resume.resumed, 1, "the stale entry is still selected from the initial projection")
+  eq(cas_resume.resumed[1].skipped, true, "a task already moved is reported as skipped")
+  eq(#cas_resume.skipped, 1, "the skipped entry is listed")
+  eq(cas_resume.skipped[1].id, "T-20261122-cas001", "the skipped entry names the task")
+  eq(cas_resume.skipped[1].reason:find("status already moved to changes_requested", 1, true) ~= nil, true,
+    "the skip reason names the current status")
+  eq(#cas_dispatched, 0, "a task already moved is not dispatched again")
+  eq(state.load(cas_root).tasks["T-20261122-cas001"].status, "changes_requested",
+    "the moved task keeps the status the other actor gave it")
+  local cas_illegal = false
+  for _, e in ipairs(cas_resume.errors) do
+    if tostring(e.error or e.reason):find("illegal transition", 1, true) then
+      cas_illegal = true
+    end
+  end
+  eq(cas_illegal, false, "a skipped entry never reports an illegal transition")
+
+  -- A refused transition is consigned, never fatal: the other entries resume.
+  local refuse_root = tmp_root("pipeline-resume-refuse")
+  state.create(refuse_root, { id = "T-20261122-r001", title = "refused", status = "stalled" })
+  state.create(refuse_root, { id = "T-20261122-r002", title = "fine", status = "stalled" })
+  local refuse_dispatched = {}
+  local refuse_proxy = {
+    load = state.load,
+    transition = function(root, id, to, extra)
+      if id == "T-20261122-r001" then
+        return nil, 'illegal transition running -> running for T-20261122-r001'
+      end
+      return state.transition(root, id, to, extra)
+    end,
+  }
+  local refuse_resume = pipeline.resume(refuse_proxy, refuse_root, {
+    dispatch = function(t, phase)
+      refuse_dispatched[#refuse_dispatched + 1] = { id = t.id, phase = phase }
+    end,
+  })
+  eq(#refuse_resume.errors, 1, "the refused entry is consigned in errors")
+  eq(refuse_resume.errors[1].id, "T-20261122-r001", "the refused entry names the task")
+  eq(#refuse_resume.skipped, 1, "the refused entry is skipped")
+  eq(#refuse_dispatched, 1, "only the applied entry is dispatched")
+  eq(refuse_dispatched[1].id, "T-20261122-r002", "the other task is still resumed")
+  eq(state.load(refuse_root).tasks["T-20261122-r002"].status, "running",
+    "a refusal on one entry does not stop the next")
+
+  -- A genuinely interrupted task (stalled, no live pilot) still resumes once.
+  local live_root = tmp_root("pipeline-resume-live")
+  state.create(live_root, { id = "T-20261122-l001", title = "crashed", status = "stalled" })
+  local live_dispatched = {}
+  local live_resume = pipeline.resume(state, live_root, {
+    dispatch = function(t, phase)
+      live_dispatched[#live_dispatched + 1] = { id = t.id, phase = phase }
+    end,
+  })
+  eq(#live_resume.skipped, 0, "a stalled task is not skipped")
+  eq(#live_dispatched, 1, "a stalled task is dispatched exactly once")
+  eq(state.load(live_root).tasks["T-20261122-l001"].status, "running",
+    "a stalled task is brought back to running")
+
   -- retry_ready: a transient failure under the bound and due -------------
 
   local retry_now = 1000000
