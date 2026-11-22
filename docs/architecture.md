@@ -26,6 +26,7 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `calibrate.lua` | Analyze the repository and generate `review-rules.md`; ingest feedback. |
 | `pipeline.lua` | Scheduler: dependencies, `max_parallel`, runs-alone rule for undeclared files, stall detection, resume. |
 | `runtime.lua` | The production runtime the tools and commands call: paths, init, config (read and merge-update), submit, status, answer, retry, abandon, calibrate, panel, resume, feedback, mode. |
+| `recover.lua` | Classify a run error into a closed, typed cause with an actionable remedy, then record and decide a bounded exponential-backoff retry (`auto_retry`, `human` or `none`). No I/O, never raises. |
 | `mode.lua` | Persist the on/off routing flag, contribute a routing prompt hint evaluated before every run, and guard the main session from `write`/`edit`/`bash` while the mode is on. |
 | `fence.lua` | Wrap untrusted output in sentinels and escape forged sentinels. |
 | `tools.lua` | The twelve agent tools, as thin adapters over an injected runtime. |
