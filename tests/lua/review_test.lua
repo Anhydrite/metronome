@@ -527,6 +527,145 @@ return function()
   has(esc_note, "escalated", "the escalation leaves a note")
   has(esc_note, "3 rounds", "the note names the round count")
 
+  -- review: a verdict that arrives after the task left reviewing --------------
+  --
+  -- The same review round can be applied twice: another driver moved the task
+  -- back to `running` (a re-implementation was dispatched) while this round was
+  -- ending, so the verdict is about a status the task no longer has. Applying it
+  -- used to raise "illegal transition running -> changes_requested" and fail the
+  -- task. It is now journaled as a stale verdict and dropped.
+
+  local wt_stale, id_stale, sha_stale = seed_worktree({ ["src/stale.lua"] = "return 20\n" })
+  make_task(id_stale)
+  -- Round 1 already ran and asked for changes; the task was then re-dispatched
+  -- to implement, exactly as the two `running` entries in the reported journal.
+  state.set_fields(root, id_stale, { review = { round = 1, max_rounds = 3, commit_sha = sha_stale } })
+  local moved_ok, moved_err = state.transition(root, id_stale, "changes_requested", { phase = "review" })
+  eq(type(moved_ok), "table", "the first round asked for changes: " .. tostring(moved_err))
+  moved_ok, moved_err = state.transition(root, id_stale, "running", { phase = "implement" })
+  eq(type(moved_ok), "table", "the task was re-dispatched to implement: " .. tostring(moved_err))
+
+  -- The round-1 run artifact. A second model turn would add a sibling, which is
+  -- what "a stale verdict spends no turn" means in the run directory.
+  local stale_run_dir = maki.fs.joinpath(run_state_root, "runs", id_stale, "review", "1")
+  maki.fs.mkdir(stale_run_dir, { parents = true })
+  maki.fs.append(maki.fs.joinpath(stale_run_dir, "log.txt"), "round 1\n")
+
+  local stale_calls = 0
+  local function stale_runner()
+    stale_calls = stale_calls + 1
+    maki.fs.mkdir(maki.fs.joinpath(run_state_root, "runs", id_stale, "review", "2"), { parents = true })
+    return { ok = true, text = BLOCKING }
+  end
+
+  local stale_result = review.review(review_opts(id_stale, wt_stale, stale_runner, { sha = sha_stale }))
+  eq(stale_result.ok ~= false, true, "a stale verdict does not fail the task: " .. tostring(stale_result.error))
+  eq(stale_result.error, nil, "a stale verdict carries no error")
+  eq(stale_result.stale, true, "a verdict on a task that left reviewing is stale")
+  eq(stale_result.discarded, true, "a stale verdict is discarded")
+  eq(stale_result.changes_requested, nil, "a stale verdict asks for no changes")
+  eq(stale_result.escalated, nil, "a stale verdict escalates nothing")
+  eq(stale_result.round, 2, "the stale verdict names the round it belonged to")
+  eq(stale_calls, 0, "a stale verdict spends no model turn")
+
+  local after_stale = state.load(root).tasks[id_stale]
+  eq(after_stale.status, "running", "a stale verdict leaves the status alone")
+  eq(after_stale.failure_reason, nil, "a stale verdict leaves no failure reason")
+  eq(after_stale.review and after_stale.review.round, 1, "a stale verdict stores no extra round")
+  eq(after_stale.review and after_stale.review.findings, nil, "a stale verdict stores no findings")
+  local stale_notes = table.concat(after_stale.notes or {}, "\n")
+  has(stale_notes, "stale review verdict discarded: status=running",
+    "the stale verdict leaves a note naming the current status")
+  has(stale_notes, sha_stale, "the note names the reviewed sha")
+  -- The same line is logged, not only journaled.
+  has(maki.fs.read(maki.fs.joinpath(root, "runtime.log")) or "",
+    "stale review verdict discarded: status=running", "the stale verdict is also logged")
+
+  -- A second identical call (same round, same sha, task still running) is
+  -- idempotent: same outcome, no status move, no extra round, no extra run.
+  local stale_again = review.review(review_opts(id_stale, wt_stale, stale_runner, { sha = sha_stale }))
+  eq(stale_again.ok ~= false, true,
+    "the repeated stale verdict does not fail: " .. tostring(stale_again.error))
+  eq(stale_again.error, nil, "the repeated stale verdict carries no error")
+  eq(stale_again.stale, true, "the repeated verdict is stale too")
+  eq(stale_again.round, stale_result.round, "the repeated verdict is the same round")
+  eq(stale_calls, 0, "the repeated stale verdict spends no model turn")
+
+  local after_again = state.load(root).tasks[id_stale]
+  eq(after_again.status, "running", "the repeated stale verdict leaves the status alone")
+  eq(after_again.failure_reason, nil, "the repeated stale verdict leaves no failure reason")
+  eq(after_again.review and after_again.review.round, 1, "the repeated stale verdict stores no round")
+  eq(#(after_again.notes or {}), #(after_stale.notes or {}) + 1,
+    "each discarded verdict is journaled once")
+  eq(maki.fs.read(maki.fs.joinpath(stale_run_dir, "log.txt")), "round 1\n",
+    "the round-1 run artifact is untouched")
+  eq(maki.fs.read(maki.fs.joinpath(run_state_root, "runs", id_stale, "review", "2", "log.txt")), nil,
+    "no second review run is recorded")
+
+  -- review: a verdict about a commit that is no longer HEAD -------------------
+  --
+  -- Even in `reviewing`, a verdict is only applied to the commit the round was
+  -- dispatched for. A branch that moved since makes the verdict evidence of
+  -- nothing, and the note cites both SHAs.
+
+  local wt_shamoved, id_shamoved, sha_reviewed = seed_worktree({ ["src/shamoved.lua"] = "return 21\n" })
+  make_task(id_shamoved)
+  write_file(wt_shamoved, "src/shamoved2.lua", "return 22\n")
+  local sha_head, sha_herr = git.commit(wt_shamoved, "feat: move after the round started")
+  eq(sha_herr, nil, "the branch moved: " .. tostring(sha_herr))
+  eq(sha_head ~= sha_reviewed, true, "the head is no longer the reviewed sha")
+
+  local shamoved_calls = 0
+  local shamoved_result = review.review(review_opts(id_shamoved, wt_shamoved, function()
+    shamoved_calls = shamoved_calls + 1
+    return { ok = true, text = BLOCKING }
+  end, { sha = sha_reviewed }))
+  eq(shamoved_result.ok ~= false, true,
+    "a verdict about an old sha does not fail: " .. tostring(shamoved_result.error))
+  eq(shamoved_result.error, nil, "a verdict about an old sha carries no error")
+  eq(shamoved_result.stale, true, "a verdict about an old sha is stale")
+  eq(shamoved_result.discarded, true, "a verdict about an old sha is discarded")
+  eq(shamoved_calls, 0, "a stale sha spends no model turn")
+  local after_shamoved = state.load(root).tasks[id_shamoved]
+  eq(after_shamoved.status, "reviewing", "a stale sha leaves the status alone")
+  eq(after_shamoved.failure_reason, nil, "a stale sha leaves no failure reason")
+  eq(after_shamoved.review, nil, "a stale sha stores no review")
+  local shamoved_notes = table.concat(after_shamoved.notes or {}, "\n")
+  has(shamoved_notes, "stale review verdict discarded: status=reviewing",
+    "the stale sha is journaled against the reviewing status")
+  has(shamoved_notes, "sha=" .. sha_head .. " vs " .. sha_reviewed, "the note cites both shas")
+
+  -- review: a protected path on a task that already left reviewing ------------
+  --
+  -- The protected-path branch applies the same guard: a protected change on a
+  -- task another driver re-dispatched is a note, never a task failure.
+
+  local wt_protstale, id_protstale = seed_worktree({ ["AGENTS.md"] = "# rules\n" })
+  make_task(id_protstale)
+  moved_ok, moved_err = state.transition(root, id_protstale, "changes_requested", { phase = "review" })
+  eq(type(moved_ok), "table", "the protected round asked for changes: " .. tostring(moved_err))
+  moved_ok, moved_err = state.transition(root, id_protstale, "running", { phase = "implement" })
+  eq(type(moved_ok), "table", "the protected task was re-dispatched: " .. tostring(moved_err))
+
+  local protstale_ran = false
+  local protstale_result = review.review(review_opts(id_protstale, wt_protstale, function()
+    protstale_ran = true
+    return { ok = true, text = CLEAN }
+  end))
+  eq(protstale_ran, false, "the runner is never called for a stale protected path")
+  eq(protstale_result.ok ~= false, true,
+    "a stale protected verdict does not fail: " .. tostring(protstale_result.error))
+  eq(protstale_result.stale, true, "a protected verdict on a running task is stale")
+  eq(protstale_result.protected, nil, "a stale protected verdict is not applied")
+  eq(protstale_result.changes_requested, nil, "a stale protected verdict asks for no changes")
+  local after_protstale = state.load(root).tasks[id_protstale]
+  eq(after_protstale.status, "running", "a stale protected verdict leaves the status alone")
+  eq(after_protstale.failure_reason, nil, "a stale protected verdict leaves no failure reason")
+  eq(after_protstale.review, nil, "a stale protected verdict stores no review")
+  has(table.concat(after_protstale.notes or {}, "\n"),
+    "stale review verdict discarded: status=running",
+    "the stale protected verdict is journaled as a note")
+
   -- store --------------------------------------------------------------------
 
   local wt_store, id_store, sha_store = seed_worktree({ ["src/store.lua"] = "return 11\n" })
