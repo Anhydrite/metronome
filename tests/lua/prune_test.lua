@@ -175,6 +175,8 @@ return function()
   eq(ab_deleted[1], "metronome/abandoned", "the abandoned branch was actually deleted")
   eq(summary_has(abandoned, "deleted (abandoned): ABANDONED branch metronome/abandoned"), true,
     "the summary names the abandoned deletion")
+  eq(summary_has(abandoned, "closed (abandoned): ABANDONED #60 branch metronome/abandoned"), true,
+    "the summary names the abandoned PR close and its number")
 
   -- A branch/PR whose task is absent from the journal is gone --------------
   local gone_closed, gone_deleted = {}, {}
@@ -203,4 +205,6 @@ return function()
   eq(find_deleted(gone, "metronome/live"), nil, "a live task's branch survives")
   eq(summary_has(gone, "deleted (gone): branch metronome/orphan"), true,
     "the summary names a gone branch")
+  eq(summary_has(gone, "closed (gone): #70 branch metronome/gone"), true,
+    "the summary names the gone PR close and its number")
 end

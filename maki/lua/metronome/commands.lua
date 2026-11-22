@@ -128,7 +128,7 @@ M.COMMANDS = {
   },
   {
     name = "prune",
-    description = "Close open PRs and delete branches whose task is no longer alive.",
+    description = "Close PRs and delete branches only for abandoned tasks or tasks gone from the journal; failed and stalled tasks stay intact and retryable.",
     usage = "/metronome prune",
     build = function(rest)
       return {}

@@ -3157,10 +3157,25 @@ function M.new(deps)
           local ok = pcall(deps.git.pr_close, pr.number, { gh = "gh", worktree = paths.repo })
           if ok then
             closed[#closed + 1] = { number = pr.number, branch = head, task = task, reason = reason }
-            -- A closed PR leaves a branch nobody will read: drop it too.
+            -- Name the close decision in the summary too: a human reading the
+            -- output must see which PR was closed and why, not just which
+            -- branch went away.
+            if task then
+              summary[#summary + 1] = string.format("closed (%s): %s #%s branch %s",
+                reason, task, tostring(pr.number), head)
+            else
+              summary[#summary + 1] = string.format("closed (%s): #%s branch %s",
+                reason, tostring(pr.number), head)
+            end
+            -- A closed PR leaves a branch nobody will read: drop it too, but
+            -- only report it deleted if the delete actually succeeded.
             if type(deps.git.delete_branch) == "function" then
-              pcall(deps.git.delete_branch, paths.repo, head, { remote = "origin" })
-              forget(head, task, reason)
+              local deleted_ok = pcall(deps.git.delete_branch, paths.repo, head, { remote = "origin" })
+              if deleted_ok then
+                forget(head, task, reason)
+              else
+                errors[#errors + 1] = { branch = head, error = "delete failed" }
+              end
             end
           else
             errors[#errors + 1] = { number = pr.number, error = "close failed" }
