@@ -1442,12 +1442,18 @@ function M.new(deps)
   -- answered, so answering resumes the pipeline instead of leaving the tasks
   -- stuck in `qualifying` forever.
   local function after_questions(opts, paths, cfg, runner, session)
-    local gate, gerr = deps.analyze.gate(deps.state, paths.root, {
+    -- The gate itself must never abort the drain either: a crash in it is the
+    -- same "nothing can be verified" case as a returned nil.
+    local called, gate, gerr = pcall(deps.analyze.gate, deps.state, paths.root, {
       tasks_dir = paths.tasks,
       repo = paths.repo,
       ref = "origin/" .. tostring(cfg.project.base_ref),
       git = deps.git,
     })
+    if not called then
+      gerr = tostring(gate)
+      gate = nil
+    end
 
     -- A blocked verdict is per task now: the offending sheets stay qualifying
     -- with their blocking findings, everything else is ready. Keep the gate
@@ -1458,52 +1464,72 @@ function M.new(deps)
     local quarantined = {}
     local blocked_findings = {}
     local blocked_rules = {}
+    local quarantined_ids = {}
 
     local function now_iso()
       return os.date("!%Y-%m-%dT%H:%M:%SZ")
     end
 
-    -- A field event cannot delete a key: a Lua nil value is an absent key and
-    -- an explicit JSON null replays as `maki.NIL`, which is truthy. Patch the
-    -- field away first (the contract), then, when the journal primitive is
-    -- available, rewrite the record without it so a repaired task no longer
-    -- shows as quarantined in the projection.
-    local function clear_quarantine(task_id)
-      pcall(deps.state.set_fields, paths.root, task_id, { quarantine = nil })
-      if type(deps.state.append) ~= "function" or type(deps.state.load) ~= "function" then
-        return
-      end
-      local loaded = deps.state.load(paths.root)
-      local current = type(loaded) == "table" and type(loaded.tasks) == "table"
-        and loaded.tasks[task_id] or nil
-      if type(current) ~= "table" or current.quarantine == nil then
-        return
-      end
-      local rewritten = {}
-      for key, value in pairs(current) do
-        if key ~= "quarantine" then
-          rewritten[key] = value
-        end
-      end
-      pcall(deps.state.append, paths.root, {
-        kind = "task_created",
-        task_id = task_id,
-        task = rewritten,
-      })
+    -- One guarded read for the whole pass: the `since` of a task already
+    -- quarantined, and the qualifying set when the gate cannot run at all.
+    -- Guarded because `analyze.gate` returns nil precisely when its own state
+    -- load failed, so a second, unguarded load could raise right here and abort
+    -- the drain before anything is dispatched.
+    local loaded_ok, snapshot = pcall(deps.state.load, paths.root)
+    if not loaded_ok or type(snapshot) ~= "table" then
+      snapshot = nil
     end
 
+    local function current_task(task_id)
+      local tasks = snapshot and snapshot.tasks
+      return type(tasks) == "table" and tasks[task_id] or nil
+    end
+
+    -- A blocked task is held in `qualifying` with a persisted reason, so the
+    -- panel names it and a repaired sheet can remit it; it is never handed to
+    -- `dispatch_one`. The id is de-duplicated and `since` is first-seen: a task
+    -- blocked across many drain passes keeps the timestamp of the pass that
+    -- quarantined it instead of looking freshly broken every time.
     local function quarantine(task_id, reason, rules, findings)
+      if quarantined_ids[task_id] then
+        return
+      end
+      quarantined_ids[task_id] = true
       quarantined[#quarantined + 1] = task_id
-      blocked_findings[task_id] = findings or {}
-      blocked_rules[task_id] = rules or {}
-      pcall(deps.state.set_fields, paths.root, task_id, {
-        quarantine = {
-          reason = reason,
-          rules = rules or {},
-          findings = findings or {},
-          since = now_iso(),
-        },
-      })
+      blocked_findings[task_id] = type(findings) == "table" and findings or {}
+      blocked_rules[task_id] = type(rules) == "table" and rules or {}
+
+      local patch = { reason = reason }
+      -- maki encodes an empty Lua table as `{}`, not `[]`, and the task schema
+      -- declares both lists as arrays: the schema-legal way to say "no rules /
+      -- no findings" is to leave the key out entirely.
+      if type(rules) == "table" and #rules > 0 then
+        patch.rules = rules
+      end
+      if type(findings) == "table" and #findings > 0 then
+        patch.findings = findings
+      end
+      local previous = current_task(task_id)
+      local since = type(previous) == "table" and type(previous.quarantine) == "table"
+        and previous.quarantine.since or nil
+      patch.since = is_non_empty(since) and since or now_iso()
+      pcall(deps.state.set_fields, paths.root, task_id, { quarantine = patch })
+    end
+
+    -- A task the gate moved to ready passed it: its quarantine must go away.
+    -- `maki.NIL` is JSON null and state.lua's replay drops a null field patch,
+    -- so this is a targeted clear instead of rewriting the whole record (which
+    -- would silently discard any event another writer appended in between).
+    -- Skipped when the task is not quarantined, so a clean pass appends nothing.
+    local function clear_quarantine(task_id)
+      local previous = current_task(task_id)
+      if type(previous) ~= "table" then
+        return
+      end
+      if previous.quarantine == nil or previous.quarantine == maki.NIL then
+        return
+      end
+      pcall(deps.state.set_fields, paths.root, task_id, { quarantine = maki.NIL })
     end
 
     if type(gate) == "table" and type(gate.blocked) == "table" then
@@ -1528,27 +1554,31 @@ function M.new(deps)
       -- A task the gate moved to ready passed it: it must not keep a stale
       -- quarantine from an earlier pass.
       for _, id in ipairs(type(gate.tasks) == "table" and gate.tasks or {}) do
-        if type(id) == "string" then
+        if type(id) == "string" and not quarantined_ids[id] then
           clear_quarantine(id)
         end
       end
     elseif gate == nil then
-      -- The gate itself failed (state load, report write). Nothing can be
-      -- verified, so quarantine every task still waiting for analysis — but
-      -- still dispatch whatever is already ready.
+      -- The gate itself failed (state load, report write). Nothing could be
+      -- verified, so every task still waiting for analysis is quarantined with
+      -- the error as its reason — but whatever is already ready is still
+      -- dispatched below: a red gate is never a reason to launch nothing.
       local err = tostring(gerr or "analysis gate failed")
-      log(paths, "analysis gate failed: " .. err .. "; quarantining qualifying tasks")
-      local loaded = deps.state.load(paths.root)
+      if err == "" or err == "nil" then
+        err = "analysis gate failed"
+      end
+      log(paths, "analysis gate failed: " .. err
+        .. "; quarantining qualifying tasks and dispatching ready ones")
       local ids = {}
-      for id, task in pairs(type(loaded) == "table" and type(loaded.tasks) == "table"
-        and loaded.tasks or {}) do
+      local tasks = snapshot and snapshot.tasks
+      for id, task in pairs(type(tasks) == "table" and tasks or {}) do
         if type(task) == "table" and task.status == "qualifying" then
           ids[#ids + 1] = id
         end
       end
       table.sort(ids)
       for _, id in ipairs(ids) do
-        quarantine(id, "analysis failed: " .. err, {}, {})
+        quarantine(id, "analysis failed: " .. err)
       end
     end
 
