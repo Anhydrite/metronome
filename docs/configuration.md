@@ -135,6 +135,8 @@ An intention that qualifies into several tasks goes through an epic branch, and 
 | `timeout_minutes` | integer | `30` | Wall-clock timeout per task. |
 | `max_questions_per_round` | integer, 1–50 | `15` | Cap on the question round Metronome poses. |
 
+The bounded-retry policy is not configured here: it lives in `recover.DEFAULTS` (`max_attempts = 3`, `backoff_base_secs = 30`, `backoff_max_secs = 900`, `factor = 2`). See [architecture.md](architecture.md#recovery) for the recovery loop and what each constant bounds.
+
 ## Full example
 
 ```toml
