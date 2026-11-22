@@ -119,6 +119,7 @@ function M.rebase(opts)
     info = type(info) == "table" and info or {}
     return nil, rerr, {
       conflict = info.conflict,
+      conflict_files = info.conflict_files,
       hunks = info.hunks,
       commit = info.commit,
       upstream = is_non_empty(info.upstream) and info.upstream or upstream,
@@ -214,13 +215,103 @@ local function cap_hunks(hunks)
   return #out > 0 and out or nil
 end
 
+-- A conflict reaches this module in three shapes: `conflict` as a list of
+-- files, `conflict = true` (the classifier only knew it conflicted), and
+-- `conflict_files` alone (a joined string or a list). All three are the same
+-- repairable situation, so one predicate reads them: the files when git named
+-- them (falling back to the files the hunks name), otherwise an empty list.
+local function conflict_file_list(info)
+  info = type(info) == "table" and info or {}
+
+  local raw = info.conflict
+  local out = {}
+  if type(raw) == "table" then
+    for _, name in ipairs(raw) do
+      if is_non_empty(name) then
+        out[#out + 1] = name
+      end
+    end
+    if #out > 0 then
+      return out
+    end
+  elseif is_non_empty(raw) then
+    for piece in raw:gmatch("[^,]+") do
+      local name = trim(piece)
+      if name ~= "" then
+        out[#out + 1] = name
+      end
+    end
+    if #out > 0 then
+      return out
+    end
+  end
+
+  local files = info.conflict_files
+  if type(files) == "table" then
+    for _, name in ipairs(files) do
+      if is_non_empty(name) then
+        out[#out + 1] = name
+      end
+    end
+  elseif is_non_empty(files) then
+    for piece in files:gmatch("[^,]+") do
+      local name = trim(piece)
+      if name ~= "" then
+        out[#out + 1] = name
+      end
+    end
+  end
+  if #out > 0 then
+    return out
+  end
+
+  -- `conflict = true` carries no names of its own: the hunks git reported do.
+  for _, hunk in ipairs(type(info.hunks) == "table" and info.hunks
+    or (type(info.conflict_hunks) == "table" and info.conflict_hunks or {})) do
+    if type(hunk) == "table" and is_non_empty(hunk.file) then
+      out[#out + 1] = hunk.file
+    end
+  end
+  return out
+end
+
+-- Whether a failed rebase is repairable, and with which files. A conflict is
+-- repairable as soon as any of the three shapes flags it, even when git named
+-- no file at all: the repair is the same work either way.
+local function repairable_conflict(info)
+  if type(info) ~= "table" then
+    return nil
+  end
+  local files = conflict_file_list(info)
+  local flagged = info.conflict == true
+    or type(info.conflict) == "table"
+    or is_non_empty(info.conflict)
+    or info.conflict_files ~= nil
+  if not flagged then
+    return nil
+  end
+  return files
+end
+
 -- The facts a conflict message must name: the files, the base (with its actual
 -- SHA when known), the exact command and, when git reported it, the commit.
 -- Extracted once so the escalation and the repairable note stay consistent.
 local function conflict_facts(result)
   local files = result.conflict_files
+  if type(files) == "table" then
+    files = table.concat(files, ", ")
+  end
+  if not is_non_empty(files) and type(result.conflict_file_list) == "table" then
+    files = table.concat(result.conflict_file_list, ", ")
+  end
   if not is_non_empty(files) and type(result.conflict) == "table" then
     files = table.concat(result.conflict, ", ")
+  end
+  if not is_non_empty(files) then
+    local named = conflict_file_list(result)
+    if #named > 0 then
+      files = table.concat(named, ", ")
+    end
   end
   if not is_non_empty(files) then
     files = "unknown"
@@ -538,8 +629,12 @@ local function run_impl(opts)
     auto_rebase = opts.auto_rebase,
   })
   if not rebase then
-    local conflict = rinfo and rinfo.conflict or nil
-    local repairable = type(conflict) == "table" and #conflict > 0
+    -- The three shapes of a repairable conflict are recognised here, not by a
+    -- single field: `conflict = true`, `conflict` as the file list, or
+    -- `conflict_files` alone. A `failed` must never be written on a turn the
+    -- journal calls repairable.
+    local conflict_files = repairable_conflict(rinfo)
+    local repairable = conflict_files ~= nil
 
     -- A rebase conflict is a repairable result, not a failure: the branch can
     -- be moved back to the fresh base and the work redone there. Writing
@@ -547,22 +642,23 @@ local function run_impl(opts)
     -- the repair details would arrive too late to be acted on. The status is
     -- left untouched (`merging`) and the full conflict is returned.
     if repairable then
-      local upstream = is_non_empty(rinfo.upstream) and rinfo.upstream
+      local upstream = is_non_empty(rinfo and rinfo.upstream) and rinfo.upstream
         or (remote .. "/" .. base)
       local base_sha = nil
       if type(git.rev_parse) == "function" then
         base_sha = git.rev_parse(worktree, upstream)
       end
+      local joined = #conflict_files > 0 and table.concat(conflict_files, ", ") or nil
       local details = {
         conflict = true,
-        conflict_files = table.concat(conflict, ", "),
-        conflict_file_list = conflict,
-        conflict_hunks = cap_hunks(rinfo.hunks),
-        conflict_commit = is_non_empty(rinfo.commit) and rinfo.commit or nil,
+        conflict_files = joined,
+        conflict_file_list = #conflict_files > 0 and conflict_files or nil,
+        conflict_hunks = cap_hunks(rinfo and rinfo.hunks),
+        conflict_commit = is_non_empty(rinfo and rinfo.commit) and rinfo.commit or nil,
         base = base,
         base_sha = is_non_empty(base_sha) and base_sha or nil,
         upstream = upstream,
-        rebase_command = is_non_empty(rinfo.command) and rinfo.command
+        rebase_command = is_non_empty(rinfo and rinfo.command) and rinfo.command
           or ("git rebase " .. upstream),
       }
       -- The escalation wording is what the runtime surfaces when the repair
@@ -570,23 +666,14 @@ local function run_impl(opts)
       -- command and the faulty commit instead of git's raw "rebase failed".
       details.escalation = M.escalation(details)
 
-      -- Journal the conflict (files, hunks, base, command) without touching
-      -- the status: the repair re-enters implement on the fresh base. The note
-      -- says the conflict is being repaired, not that it cannot be.
-      if type(state.append) == "function" then
-        local lines = { "merge conflict (repairable): " .. repair_note(details) }
-        for _, hunk in ipairs(details.conflict_hunks or {}) do
-          lines[#lines + 1] = string.format("--- %s:%s\n%s",
-            tostring(hunk.file), tostring(hunk.start), tostring(hunk.text))
-        end
-        pcall(state.append, root, {
-          kind = "note",
-          task_id = id,
-          text = table.concat(lines, "\n"),
-        })
-      end
-
+      -- The repairable wording is returned, not journaled here. `merge.lua`
+      -- cannot know whether the caller will actually be able to repair (the
+      -- fresh base may not resolve, the worktree may be gone): announcing "will
+      -- be redone" before the repair is committed lets the note coexist with a
+      -- `failed` on the same turn. The runtime journals this note once it has
+      -- committed to the repair, with the hunks attached.
       return {
+        repair_note = repair_note(details),
         ok = false,
         error = details.escalation,
         rebase = rebase,
@@ -610,7 +697,7 @@ local function run_impl(opts)
       ok = false,
       error = rerr,
       rebase = rebase,
-      conflict = conflict,
+      conflict = rinfo and rinfo.conflict or nil,
     }
   end
 
