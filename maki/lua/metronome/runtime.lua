@@ -523,6 +523,40 @@ function M.new(deps)
     }
   end
 
+  -- The preflight gate. `init` and `config` run it on the prospective answers
+  -- before anything is written: a project bound with a missing checker, no git
+  -- identity or no origin branch would only fail on the first task, far from
+  -- the command that created it. Returns nil when the environment is green, or
+  -- the refusal table (with the preflight verdict attached) to return as is.
+  local function preflight_refusal(answers)
+    local mod = deps.preflight
+    if type(mod) ~= "table" or type(mod.run) ~= "function" then
+      return {
+        ok = false,
+        error = "preflight is not wired: refusing to bind the project without an environment check",
+      }
+    end
+    local result = mod.run({
+      repo = answers.repo,
+      base_ref = answers.base_ref,
+      checks = answers.checks,
+    })
+    if type(result) ~= "table" then
+      return { ok = false, error = "preflight returned no verdict: refusing to bind the project" }
+    end
+    if result.ok == true then
+      return nil
+    end
+    local text = type(mod.format) == "function" and mod.format(result) or nil
+    if type(text) ~= "string" or text == "" then
+      text = result.message
+    end
+    if type(text) ~= "string" or text == "" then
+      text = "preflight refused the binding"
+    end
+    return { ok = false, error = text, preflight = result }
+  end
+
   local function session_opts(config, role, paths)
     return deps.roles.session_opts(config, role, paths.prompts, nil)
   end
@@ -1998,6 +2032,10 @@ function M.new(deps)
     end
 
     local answers = normalize_init(input, paths, current)
+    local refusal = preflight_refusal(answers)
+    if refusal then
+      return refusal
+    end
     fs.mkdir(paths.root, { parents = true })
     fs.mkdir(paths.tasks, { parents = true })
     fs.mkdir(paths.worktrees, { parents = true })
@@ -2419,6 +2457,10 @@ function M.new(deps)
             error = "base branch not found on origin: " .. tostring(normalized.base_ref),
           }
         end
+      end
+      local refusal = preflight_refusal(normalized)
+      if refusal then
+        return refusal
       end
       fs.mkdir(paths.root, { parents = true })
       fs.write(paths.config, render_config(normalized))
