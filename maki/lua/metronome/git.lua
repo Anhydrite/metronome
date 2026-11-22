@@ -338,34 +338,65 @@ local FETCH_LOCK_NAME = "metronome-fetch.lock"
 local FETCH_TIMEOUT_MS = 60000
 -- The wait has to outlast the fetch a caller is queued behind: with a bound
 -- shorter than the command timeout, a slow but healthy fetch made every waiter
--- give up with git_lock just before the lock came back.
+-- give up with git_lock just before the lock came back. A fetch that is
+-- retrying in place can hold the lock longer than this; a waiter that gives up
+-- then reports git_lock, which is retryable, instead of hanging.
 local FETCH_LOCK_WAIT_MS = FETCH_TIMEOUT_MS + 15000
--- A lock nobody released -- a cancelled task, a crashed maki -- must not wedge
--- the clone forever. Past this age it is stale and gets taken over. The bound
--- stays below FETCH_LOCK_WAIT_MS so a queued caller reclaims an abandoned lock
--- before its own wait runs out, and above FETCH_TIMEOUT_MS so a slow but
--- healthy fetch is never taken over.
-local FETCH_LOCK_STALE_MS = FETCH_TIMEOUT_MS + 10000
--- A dead owner is spotted much sooner than the age bound, but not so soon that
--- a lock written a moment ago is taken over by mistake.
-local FETCH_LOCK_DEAD_PID_GRACE_MS = 5000
-local FETCH_LOCK_POLL_MS = 20
-local FETCH_LOCK_MAX_POLL_MS = 250
 -- Ref contention is transient even with the disk lock held (a push, a rebase
 -- or the gate may be touching the same refs), so the fetch itself retries a
 -- couple of times before reporting git_lock.
 local FETCH_RETRY_DELAYS_MS = { 100, 400 }
+-- A lock is held for the whole retry sequence, i.e. up to one FETCH_TIMEOUT_MS
+-- per attempt plus the backoff delays -- not just one command. The stale bound
+-- is derived from that true maximum so a slow-but-healthy owner is never
+-- preempted in the middle of its retries, and adds a margin. It is larger than
+-- FETCH_LOCK_WAIT_MS: a waiter that meets a truly abandoned lock reports
+-- git_lock (retryable) and comes back, while the dead-pid and ownerless paths
+-- below still reclaim much sooner.
+local FETCH_LOCK_STALE_MS = FETCH_TIMEOUT_MS * (#FETCH_RETRY_DELAYS_MS + 1) + 15000
+-- A dead owner is spotted much sooner than the age bound, but not so soon that
+-- a lock written a moment ago is taken over by mistake.
+local FETCH_LOCK_DEAD_PID_GRACE_MS = 5000
+-- The takeover/release mutex is held for two file reads at most; a directory
+-- older than this is a critical section whose process died and can be removed.
+local FETCH_LOCK_MUTEX_STALE_MS = 5000
+local FETCH_LOCK_POLL_MS = 20
+local FETCH_LOCK_MAX_POLL_MS = 250
 
 -- registry key -> the fetch currently in flight in this process.
 local fetch_in_flight = {}
 
--- Read-only view of one registry slot. The table itself stays module-local: a
--- caller can observe single-flight but cannot mutate it into a bogus owner.
+-- Sequence for the per-acquisition token; combined with pid and time it keeps
+-- two acquisitions in one process distinct.
+local lock_token_seq = 0
+
+-- Observation-only view of one registry slot. The table itself stays
+-- module-local, and a caller gets a shallow copy so it cannot mutate the live
+-- record (`done`, `value`, ...) into a bogus owner that a later waiter trusts.
 function M.fetch_registered(key)
-  return fetch_in_flight[key]
+  local record = fetch_in_flight[key]
+  if type(record) ~= "table" then
+    return nil
+  end
+  local copy = {}
+  for k, v in pairs(record) do
+    copy[k] = v
+  end
+  return copy
 end
 
+-- Millisecond wall clock. os.time() only has one-second resolution, which
+-- rounds the dead-pid grace and the stale age to whole seconds and makes the
+-- recorded `time=` coarse. `date +%s%3N` gives milliseconds on GNU hosts; a
+-- host that prints the literal format falls back to os.time().
 local function now_ms()
+  local result = run({ "sh", "-c", "date +%s%3N" })
+  if result and result.ok then
+    local ms = tonumber(((result.stdout or ""):gsub("%s+$", "")))
+    if ms then
+      return ms
+    end
+  end
   return os.time() * 1000
 end
 
@@ -386,6 +417,41 @@ local function process_alive(pid)
   end
   local result = run({ "sh", "-c", 'kill -0 "$1" 2>/dev/null', "sh", tostring(pid) })
   return result == nil or result.ok
+end
+
+-- Serialize the lock-state transitions (stale takeover and release) that
+-- inspect then remove a file. `mkdir` is atomic, so only one process enters at
+-- a time; creation itself stays O_EXCL and needs no mutex. That closes the
+-- window a re-read-then-remove leaves open, where two takers could both remove
+-- a stale lock and one could delete the other's fresh lock. The critical
+-- section is a couple of reads, so a mutex older than a few seconds is a
+-- crashed section and is reclaimed.
+local function with_lock_mutex(path, fn)
+  local mutex = path .. ".mutex"
+  local acquired = false
+  for _ = 1, 2 do
+    local result = run({ "sh", "-c", 'mkdir "$1" 2>/dev/null', "sh", mutex })
+    if result ~= nil and result.ok then
+      acquired = true
+      break
+    end
+    local meta = maki.fs.metadata(mutex)
+    if type(meta) == "table" and meta.mtime
+      and (os.time() - meta.mtime) * 1000 >= FETCH_LOCK_MUTEX_STALE_MS then
+      maki.fs.rm(mutex, { recursive = true, force = true })
+    else
+      return false
+    end
+  end
+  if not acquired then
+    return false
+  end
+  local ok, value, extra = pcall(fn)
+  maki.fs.rm(mutex, { recursive = true, force = true })
+  if not ok then
+    error(value, 0)
+  end
+  return true, value, extra
 end
 
 -- Suspend cooperatively for `ms`. maki.async.sleep lets the other tasks (and
@@ -472,39 +538,71 @@ local function lock_owner(path)
   }
 end
 
--- A lock is stale when its owner is demonstrably gone: either it is old enough
--- that no fetch could still hold it (every fetch is bounded by
--- FETCH_TIMEOUT_MS) or its recorded process no longer exists. The file is
--- re-read before it is removed, so a lock taken over meanwhile is left alone.
--- A lock with no readable owner (an older release's empty file, a truncated
--- write) is treated as held: only the timestamp this module writes can prove
--- that its owner is gone.
+-- A lock is stale when its owner is demonstrably gone: it is old enough that
+-- the whole retry sequence could not still hold it, its recorded process no
+-- longer exists, or -- for a file with no parseable owner at all (an older
+-- release, a crash between O_EXCL and the write, a truncated write) -- its
+-- modification time is past the stale bound. The ownerless case is why the
+-- mtime fallback exists: those files have no `time=` to compare, and refusing
+-- them forever would wedge every fetch after one SIGKILL.
+local function lock_stale(owner, meta)
+  local age
+  if owner and owner.ts then
+    age = now_ms() - owner.ts
+  elseif type(meta) == "table" and meta.mtime then
+    age = os.time() * 1000 - meta.mtime * 1000
+  end
+  if not age or age < 0 then
+    return false
+  end
+  if age >= FETCH_LOCK_STALE_MS then
+    return true
+  end
+  if owner and owner.pid and age >= FETCH_LOCK_DEAD_PID_GRACE_MS then
+    return not process_alive(owner.pid)
+  end
+  return false
+end
+
+-- Reclaim an abandoned lock. The stale test and the removal are one critical
+-- section under the mutex, and every remover takes the same mutex, so a fresh
+-- lock can neither be created nor deleted between the check and the rm: O_EXCL
+-- creation fails while the stale file exists, and no other process can be
+-- inside a removal. The caller then retries the exclusive create.
 local function take_over_stale_lock(path)
-  local owner = lock_owner(path)
-  if not owner or not owner.ts then
+  local acquired, removed = with_lock_mutex(path, function()
+    local owner = lock_owner(path)
+    local meta = maki.fs.metadata(path)
+    if type(meta) ~= "table" then
+      return false
+    end
+    if not lock_stale(owner, meta) then
+      return false
+    end
+    -- Re-read inside the mutex as a belt-and-braces identity check.
+    local again = lock_owner(path)
+    if owner then
+      if not again or again.raw ~= owner.raw then
+        return false
+      end
+    elseif again or type(maki.fs.metadata(path)) ~= "table" then
+      return false
+    end
+    maki.fs.rm(path, { force = true })
+    return true
+  end)
+  if not acquired then
     return false
   end
-  local age = now_ms() - owner.ts
-  local abandoned = age >= FETCH_LOCK_STALE_MS
-  if not abandoned and owner.pid and age >= FETCH_LOCK_DEAD_PID_GRACE_MS then
-    abandoned = not process_alive(owner.pid)
-  end
-  if not abandoned then
-    return false
-  end
-  local again = lock_owner(path)
-  if again and again.raw ~= owner.raw then
-    return false
-  end
-  maki.fs.rm(path, { force = true })
-  return true
+  return removed
 end
 
 -- Create the lock file if and only if nobody else holds it. `set -C` gives the
 -- shell noclobber, which is O_EXCL: the create is atomic, so two processes can
--- never both win. The owner (pid + timestamp) is written in the same create so
--- a later caller can tell an abandoned lock from a live one. maki.fs has no
--- exclusive create, hence the one-line child.
+-- never both win. The owner (pid + millisecond timestamp + unique token) is
+-- written in the same create so a later caller can tell an abandoned lock from
+-- a live one and release can remove only the lock it still owns. maki.fs has
+-- no exclusive create, hence the one-line child. Returns the token on success.
 local function try_lock(path)
   -- Taking over a stale lock only removes the file. The caller must then try
   -- the exclusive create again: returning true right after the removal would
@@ -514,22 +612,44 @@ local function try_lock(path)
   -- directory"; the outer wait reports those as git_lock.
   for _ = 1, 3 do
     local pid = own_pid()
-    local owner = string.format("pid=%s time=%d", pid and tostring(pid) or "0", now_ms())
+    local ts = now_ms()
+    lock_token_seq = lock_token_seq + 1
+    local token = string.format("%s.%d.%d", pid and tostring(pid) or "0", ts, lock_token_seq)
+    local owner = string.format("pid=%s time=%d token=%s", pid and tostring(pid) or "0", ts, token)
     local result = run({
       "sh", "-c", 'set -C; printf %s "$2" > "$1"', "sh", path, owner,
     })
     if result ~= nil and result.ok then
-      return true
+      return token
     end
     if not take_over_stale_lock(path) then
-      return false
+      return nil
     end
   end
-  return false
+  return nil
 end
 
-local function release_lock(path)
-  maki.fs.rm(path, { force = true })
+-- Give the lock back only if it is still the one this process took. The check
+-- and the rm are under the mutex, so a lock preempted and re-taken by another
+-- process is left alone instead of being deleted out from under its new owner.
+local function release_lock(path, token)
+  local function remove_if_owned()
+    local owner = lock_owner(path)
+    if not owner then
+      return false
+    end
+    if not token or owner.raw:find("token=" .. token, 1, true) then
+      maki.fs.rm(path, { force = true })
+      return true
+    end
+    return false
+  end
+  local acquired = with_lock_mutex(path, remove_if_owned)
+  if not acquired then
+    -- Never skip the release because the mutex is contended: fall back to the
+    -- guarded removal, which still refuses to delete another owner's lock.
+    remove_if_owned()
+  end
 end
 
 local function lock_diag(lock, timeout_ms, remote)
@@ -582,12 +702,17 @@ end
 -- Take the lock, run the fetch, and always give the lock back -- including when
 -- the command fails, so a failed fetch never wedges the clone.
 local function run_fetch(repo, remote, lock, timeout_ms)
-  if not wait_bounded(function() return try_lock(lock) end, timeout_ms) then
+  local token
+  local locked = wait_bounded(function()
+    token = try_lock(lock)
+    return token ~= nil
+  end, timeout_ms)
+  if not locked or not token then
     local diag = lock_diag(lock, timeout_ms, remote)
     return nil, M.describe(diag), diag
   end
   local ok, value, err, diag = pcall(do_fetch_with_retry, repo, remote)
-  release_lock(lock)
+  release_lock(lock, token)
   if not ok then
     error(value, 0)
   end

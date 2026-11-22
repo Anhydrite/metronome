@@ -392,6 +392,18 @@ return function()
   eq(reclaimed, true, "an abandoned lock is taken over: " .. tostring(reclaimed_err))
   eq(maki.fs.metadata(lock), nil, "the taken-over lock is released after the fetch")
 
+  -- A crash between the shell's O_EXCL create and the `printf` leaves an empty
+  -- or truncated lock with no `time=` to compare. It must be reclaimed by age,
+  -- not polled forever: that was a permanent wedge after one SIGKILL.
+  for _, content in ipairs({ "", "pid=12" }) do
+    maki.fs.write(lock, content)
+    local touched = sh({ "touch", "-d", "10 minutes ago", lock })
+    eq(touched, 0, "the ownerless lock is backdated: " .. content)
+    local aged, aged_err = git.fetch(repo, "origin", { lock_timeout_ms = 5000 })
+    eq(aged, true, "an ownerless old lock is reclaimed (" .. content .. "): " .. tostring(aged_err))
+    eq(maki.fs.metadata(lock), nil, "the reclaimed ownerless lock is released (" .. content .. ")")
+  end
+
   -- (d) Ref contention classifies as git_lock -------------------------------
 
   local lock_strings = {
