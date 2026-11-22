@@ -371,16 +371,55 @@ return function()
   git.fetch(repo, "origin")
 
   local before_conflict = git.head_sha(conflict_wt)
-  local conf, conferr = git.rebase(conflict_wt, "origin/main")
+  local conf, conferr, confinfo = git.rebase(conflict_wt, "origin/main")
   eq(conf, nil, "conflicting rebase refused")
   eq(type(conferr), "string", "conflict explains itself")
   has(conferr, "conflict", "conflict message names the conflict")
   has(conferr, "README.md", "conflict message names the file")
+  -- The repair needs the fresh base and the exact command, not only git's raw
+  -- output: they are what the human or the implementer is told to re-run.
+  has(conferr, "origin/main", "conflict message names the upstream base")
+  has(conferr, "git rebase origin/main", "conflict message names the exact command")
+
+  eq(type(confinfo), "table", "the conflict details are returned for the repair")
+  eq(confinfo and confinfo.conflict and confinfo.conflict[1], "README.md",
+    "the conflicting file is reported")
+  eq(confinfo and confinfo.upstream, "origin/main", "the upstream base is reported")
+  eq(confinfo and confinfo.command, "git rebase origin/main", "the exact command is reported")
+  -- git names the commit it could not replay as an abbreviated sha; it must be
+  -- a prefix of the branch commit, and it must not be invented when absent.
+  eq(type(confinfo and confinfo.commit), "string", "the failed commit is reported")
+  eq(ccsha:sub(1, #(confinfo and confinfo.commit or "")) == (confinfo and confinfo.commit),
+    true, "the failed commit is the branch commit")
+
+  -- The marked-up blocks are captured before the abort removes them.
+  local hunks = confinfo and confinfo.hunks or {}
+  eq(#hunks >= 1, true, "at least one conflict hunk is reported")
+  local hunk = hunks[1] or {}
+  eq(hunk.file, "README.md", "the hunk names its file")
+  local hunk_text = tostring(hunk.text or "")
+  eq(hunk_text:find("<<<<<<<", 1, true) ~= nil, true, "the hunk has the opening marker")
+  eq(hunk_text:find("=======", 1, true) ~= nil, true, "the hunk has the separator")
+  eq(hunk_text:find(">>>>>>>", 1, true) ~= nil, true, "the hunk has the closing marker")
+  has(hunk_text, "# branch edit", "the hunk holds the branch side")
+  has(hunk_text, "# main edit", "the hunk holds the upstream side")
 
   local st_code, st_out = sh({ "git", "-C", conflict_wt, "status", "--porcelain" })
   eq(st_code, 0, "status ran after the abort")
   eq((st_out:gsub("%s+$", "")), "", "worktree is clean after the abort")
   eq(git.head_sha(conflict_wt), before_conflict, "branch head unchanged after the abort")
+
+  -- A rebase that fails without naming any conflicting file still explains
+  -- itself: the message is never empty and invents neither a file nor a commit.
+  local broken, broken_err, broken_info = git.rebase(conflict_wt, "origin/no-such-base")
+  eq(broken, nil, "a rebase onto a missing upstream is refused")
+  eq(type(broken_err), "string", "the refusal explains itself")
+  eq(#broken_err > 0, true, "the refusal is never empty")
+  has(broken_err, "origin/no-such-base", "the refusal names the upstream")
+  has(broken_err, "git rebase origin/no-such-base", "the refusal names the command")
+  eq(broken_info and broken_info.conflict, nil, "no conflicting file is invented")
+  eq(broken_info and broken_info.commit, nil, "no failed commit is invented")
+  eq(broken_info and broken_info.hunks, nil, "no hunk is invented")
 
   -- A detached worktree has no branch: that is what the post-merge checks need.
   local detach_wt = maki.fs.joinpath(base, "wt-detach")
