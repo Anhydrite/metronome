@@ -28,6 +28,7 @@ local modules = {
   "metronome.commands",
   "metronome.mode",
   "metronome.runtime",
+  "metronome.recover",
   "metronome.ui.render",
   "metronome.ui.panel",
 }
