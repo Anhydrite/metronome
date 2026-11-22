@@ -143,7 +143,7 @@ A red check sends the task back to `running` from its checkpoint. A blocking rev
 The scheduler (`pipeline.lua`) decides what may run, never how a step runs:
 
 - **Dependencies** — a task starts only when every `depends_on` task is `merged` or `deployed`. A missing, failed or abandoned dependency blocks it with a named reason.
-- **File overlap** — two tasks with a common declared file never run together, even below `max_parallel`.
+- **Parallelism** — a task starts only when its `depends_on` tasks are `merged` or `deployed` and `max_parallel` has a free slot: parallelism is bounded only by `max_parallel` and `depends_on`. A shared declared file is not a conflict: each task works in its own worktree on its own branch, several agents may touch the same file at once, and any textual conflict is resolved at merge time. A task that declares no files has an unknown blast radius and runs alone.
 - **`max_parallel`** — the hard cap on tasks in flight.
 - **Stall detection** — an active task whose last progress is older than `stall_minutes` is stale; a stale `running` task moves to `stalled`, the other active statuses are flagged suspect.
 - **Resume** — `/reload` leaves tasks in active statuses. Resume walks each back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase.
