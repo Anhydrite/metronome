@@ -1098,19 +1098,48 @@ function M.new(deps)
         end
 
         local repaired = false
+        local impl_err = nil
         if repairs < repair_bound
           and worktree == epic_wt
           and deps.implement and type(deps.implement.run) == "function" then
-          repairs = repairs + 1
+          -- The implementer prompt, the journal note and the escalation are
+          -- built from the same facts, so the base travels with its SHA even
+          -- when `merge.run` could not resolve it: a human is never asked to
+          -- resolve a conflict on a base named "unknown".
+          local base_sha = type(deps.git.rev_parse) == "function"
+            and deps.git.rev_parse(worktree, "origin/" .. base) or nil
+          if is_non_empty(base_sha) then
+            details.base_sha = details.base_sha or base_sha
+          end
+          details.base = details.base or base
           -- `merging` has no edge back to `running`: the repair continues the
-          -- turn, so the status and the counter are written in one patch, and
-          -- a reload resumes in implement with the conflict already journalled.
+          -- turn, so the status and the phase are written before the
+          -- implementer runs, and a reload resumes in implement with the
+          -- conflict already journalled. The counter is persisted only once
+          -- the turn has actually happened (below): a repair that failed is
+          -- not a repair and must not spend the budget.
           pcall(state.set_fields, paths.root, task_id, {
             status = "running",
             phase = "implement",
             conflict_retried = true,
-            conflict_retries = repairs,
           })
+          -- The epic has no implementation of its own: the branch itself is
+          -- the work. Put it back on a clean, fresh state first, from its
+          -- remote tip — never from `origin/<base>`: the epic branch carries
+          -- every subtask already merged into it, so resetting it onto the
+          -- base would throw that work away. The reset also clears a worktree
+          -- a crashed run left detached mid-rebase, so the implementer starts
+          -- from the branch and not from a half-replayed one. `origin/<base>`
+          -- (with the SHA above) is what the implementer reconciles onto.
+          local tip_sha = type(deps.git.rev_parse) == "function"
+            and deps.git.rev_parse(epic_wt, "origin/" .. branch) or nil
+          if is_non_empty(tip_sha) and type(deps.git.reset_hard) == "function" then
+            local reset, reset_err = deps.git.reset_hard(epic_wt, tip_sha)
+            if not reset then
+              log(paths, "epic " .. task_id .. ": cannot put " .. branch
+                .. " back on origin/" .. branch .. ": " .. tostring(reset_err))
+            end
+          end
           local impl = deps.implement.run({
             task = task,
             repo = paths.repo,
@@ -1130,6 +1159,8 @@ function M.new(deps)
             conflict = details,
           })
           if impl and impl.ok then
+            repairs = repairs + 1
+            pcall(state.set_fields, paths.root, task_id, { conflict_retries = repairs })
             -- The PR is the same PR: the repaired branch is pushed onto it, so
             -- no second PR is opened. The repairable note is written only now:
             -- the implementer has actually redone the branch, so a "will be
@@ -1145,6 +1176,11 @@ function M.new(deps)
               .. (#details.files > 0 and table.concat(details.files, ", ") or "unknown")
               .. "; the implementer redid the branch and the merge is retried")
             repaired = true
+          else
+            -- The implementer could not redo the branch: that is not a repair,
+            -- so the budget is untouched and the escalation says why it gave
+            -- up as well as what a human must do.
+            impl_err = type(impl) == "table" and (impl.error or impl.reason) or nil
           end
         end
 
@@ -1160,6 +1196,17 @@ function M.new(deps)
           -- human gets the means to act: the files, the base with its SHA and
           -- the exact command — never a failure without a message.
           local message = conflict_escalation(details)
+          local diagnosis = conflict_diagnosis(message)
+          if is_non_empty(impl_err) then
+            -- When the repair turn itself failed under the bound, the human
+            -- must know why no repair happened. The reason goes into the
+            -- remedy rather than the message: the failure line caps each field
+            -- separately, and appending to the message would truncate the
+            -- files, the base SHA or the command away.
+            diagnosis.remedy = string.format(
+              "%s (the implementer could not redo the branch: %s)",
+              diagnosis.remedy, tostring(impl_err))
+          end
           journal_conflict(state, paths.root, task_id, details, message)
           if worktree == epic_wt and type(deps.git.worktree_remove) == "function" then
             pcall(deps.git.worktree_remove, paths.repo, epic_wt, { force = true })
@@ -1167,7 +1214,7 @@ function M.new(deps)
           return {
             ok = false,
             error = message,
-            diagnosis = conflict_diagnosis(message),
+            diagnosis = diagnosis,
             phase = "merge",
             task_id = task_id,
             epic = true,
