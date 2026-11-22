@@ -1501,11 +1501,44 @@ function M.new(deps)
     return out
   end
 
+  -- A single bounded line, so a git message with newlines or a runaway
+  -- transcript excerpt never bloats the persisted reason, the journal or the
+  -- status projection. Mirrors `recover.one_line` for the fallback path below.
+  local function one_line(value, max)
+    local text = tostring(value or ""):gsub("%s+", " ")
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    max = tonumber(max) or 160
+    if #text > max then
+      text = text:sub(1, max) .. "…"
+    end
+    return text
+  end
+
   -- One line that names the cause, the remedy and what happens next, so a log
   -- line or a notification is actionable without reading the transcript.
+  -- `recover.describe` is the authority: it normalises the message and bounds
+  -- it. The local formatting only runs when that module is not wired.
   describe_failure = function(failure, decision)
     failure = type(failure) == "table" and failure or {}
     decision = type(decision) == "table" and decision or {}
+    local recover = recover_module()
+    if recover and type(recover.describe) == "function" then
+      local ok, line = pcall(recover.describe, failure)
+      if ok and type(line) == "string" and line ~= "" then
+        -- `describe` recomputes the decision with the module's defaults; the
+        -- runtime's decision may differ (project bounds, `auto_retry = false`),
+        -- so name what will really happen when the two disagree.
+        if type(decision.action) == "string" then
+          local eff_ok, eff = pcall(recover.decide, failure)
+          if eff_ok and type(eff) == "table" and eff.action ~= decision.action then
+            local effective = decision.action == "auto_retry"
+              and "automatic retry" or decision.action
+            line = line .. " — effective: " .. effective
+          end
+        end
+        return line
+      end
+    end
     local action
     if decision.action == "auto_retry" then
       action = string.format("automatic retry in %ds", tonumber(decision.delay_secs) or 0)
@@ -1514,10 +1547,18 @@ function M.new(deps)
     else
       action = "human intervention required"
     end
+    local message = one_line(failure.message, 160)
+    if message == "" then
+      message = "(no message)"
+    end
+    local remedy = one_line(failure.remedy, 160)
+    if remedy == "" then
+      remedy = "inspect the transcript"
+    end
     return string.format("%s: %s — remedy: %s — %s (attempt %s/%s)",
       tostring(failure.cause or "unknown"),
-      tostring(failure.message or "(no message)"),
-      tostring(failure.remedy or "inspect the transcript"),
+      message,
+      remedy,
       action,
       tostring(failure.attempts or 0),
       tostring(decision.max_attempts or "?"))
@@ -1614,6 +1655,21 @@ function M.new(deps)
   local run_and_handle
   local schedule_retry
 
+  -- A task finished, a retry or a resume job completed: a slot may have freed
+  -- a dependent or moved a task on, so trigger another drain. Only in the async
+  -- path, where the current drain returned long ago; setting the flag in the
+  -- synchronous path would make its drain loop forever. Shared by
+  -- `dispatch_one` and `run_pending`'s extra jobs so a successful retry never
+  -- leaves the workflow stopped.
+  local function redrain()
+    if deps.async then
+      scheduler_dirty = true
+      spawn(function()
+        pcall(runtime.run_pending)
+      end)
+    end
+  end
+
   -- The part of a run that follows qualification: the analysis gate, the
   -- scheduler loop and the optional deploy. `submit` reaches it after applying
   -- the qualified tasks; `answer` reaches it after the pending questions are
@@ -1651,18 +1707,19 @@ function M.new(deps)
     -- leaves the loop free to start the next one.
     local function dispatch_one(task)
       local handle = spawn(function()
-        local result = run_and_handle(opts, paths, cfg, runner, session, task.id)
-        results[#results + 1] = result
-        -- A slot just freed: another ready task may start now. Only in the
-        -- async path, where the drain returned long ago; setting the flag in
-        -- the synchronous path would make its drain loop forever.
-        if deps.async then
-          scheduler_dirty = true
-          spawn(function()
-            pcall(runtime.run_pending)
-          end)
+        -- `run_and_handle` already guards the failure policy; this guard also
+        -- covers anything it returns or raises outside it, so `results` and
+        -- `task_handles` are always settled and the re-drain always fires.
+        local called, result = pcall(
+          run_and_handle, opts, paths, cfg, runner, session, task.id)
+        if not called then
+          result = { ok = false, error = tostring(result) }
+          log(paths, "task " .. tostring(task.id)
+            .. " crashed the drain: " .. tostring(result.error))
         end
+        results[#results + 1] = result
         task_handles[task.id] = nil
+        redrain()
       end)
       if handle ~= nil then
         task_handles[task.id] = handle
@@ -1979,6 +2036,35 @@ function M.new(deps)
     return { ok = false, failure = failure, decision = decision, retrying = false, reason = reason }
   end
 
+  -- The failure policy itself must never take a spawn down. A crash inside
+  -- classification or persistence would feed no result, skip the re-drain and
+  -- leave the task unhandled — the exact "drain stops" case this runtime is
+  -- built to rule out. So every call goes through this guard.
+  local function apply_failure(opts, paths, cfg, runner, session, task_id, err, result)
+    local ok, handled = pcall(
+      handle_failure, opts, paths, cfg, runner, session, task_id, err, result)
+    if ok and type(handled) == "table" then
+      return handled
+    end
+    local message = tostring(handled)
+    log(paths, "task " .. tostring(task_id) .. ": failure policy crashed: " .. message)
+    return {
+      ok = false,
+      error = message,
+      reason = message,
+      retrying = false,
+      failure = {
+        cause = "unknown",
+        message = message,
+        remedy = "inspect the transcript and the task state, then retry.",
+        transient = false,
+        attempts = 1,
+        at = os.time(),
+      },
+      decision = { action = "human", delay_secs = 0, max_attempts = 1 },
+    }
+  end
+
   -- Enqueue one bounded re-dispatch of a task that failed transiently. The
   -- backoff comes from the policy; the retry itself is a plain scheduler job,
   -- so `run_pending` spawns it like any other dispatch and never blocks on it.
@@ -2064,7 +2150,7 @@ function M.new(deps)
       -- drain, and the task keeps the artefacts a retry resumes from.
       local failed = { ok = false, error = tostring(result) }
       failed = with_failure(failed,
-        handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed))
+        apply_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed))
       runtime.last_background = failed
       return failed
     end
@@ -2076,7 +2162,7 @@ function M.new(deps)
       if not ok then
         local failed = { ok = false, error = tostring(result) }
         failed = with_failure(failed,
-          handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed))
+          apply_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed))
         runtime.last_background = failed
         return failed
       end
@@ -2092,7 +2178,7 @@ function M.new(deps)
     end
     local err = result.error or result.reason or result
     result = with_failure(result,
-      handle_failure(opts, paths, cfg, runner, session, task_id, err, result))
+      apply_failure(opts, paths, cfg, runner, session, task_id, err, result))
     runtime.last_background = result
     return result
   end
@@ -2110,11 +2196,21 @@ function M.new(deps)
     local ok, err = pcall(function()
       while #scheduler_extra > 0 or scheduler_dirty do
         while #scheduler_extra > 0 do
-          local job = table.remove(scheduler_extra, 1)
+          local extra = table.remove(scheduler_extra, 1)
           -- A retry or a resume is a run_task like any other: it runs in its
           -- own spawn, so a queue of them can never hold the drain. The loop
-          -- keeps draining while the tasks are still in flight.
-          spawn(job)
+          -- keeps draining while the tasks are still in flight. The job's
+          -- completion re-drains like a dispatched task does: in production the
+          -- spawn is asynchronous, so `run_pending` has long returned and
+          -- nothing else would notice that the task moved and freed a slot.
+          spawn(function()
+            local called, result = pcall(extra)
+            if not called then
+              log(job.paths, "retry job error: " .. tostring(result))
+            end
+            redrain()
+            return result
+          end)
         end
         if scheduler_dirty then
           scheduler_dirty = false
@@ -2968,15 +3064,17 @@ function M.new(deps)
     end
     -- The feedback is ingested: drive the tasks it concerns now, instead of
     -- waiting for a new submission. A workflow must never stay stopped after a
-    -- human did something.
+    -- human did something. Ingestion already happened, so a drain that cannot
+    -- start is reported as `ok = true, background = false, error = ...`: the
+    -- human's intervention is not lost, only the immediate drain is missing.
     local cfg, cerr = load_config(nil)
     if not cfg then
-      return { ok = false, error = cerr, result = result }
+      return { ok = true, background = false, error = cerr, result = result }
     end
     local opts = { ctx = background_ctx(nil) }
     local runner, session, _, perr = prepare(opts, cfg, paths)
     if not runner then
-      return { ok = false, error = perr, result = result }
+      return { ok = true, background = false, error = perr, result = result }
     end
     schedule_job(opts, paths, cfg, runner, session)
     return { ok = true, result = result, background = true }

@@ -2262,6 +2262,70 @@ auto_deploy = false
   eq(type(rt_retry.last_background and rt_retry.last_background.error), "string",
     "the background record keeps the raw step error")
 
+  -- An async retry that completes must re-drain after itself: the queued job
+  -- runs off the drain's turn, so nothing else would notice the freed slot or a
+  -- newly ready dependent. A drain that stops after a successful retry is the
+  -- worst case this runtime exists to rule out.
+  local async_record = {
+    id = "T1", status = "failed", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+    failure = { cause = "network", message = "boom", remedy = "retry", transient = true, attempts = 1 },
+  }
+  local async_impl = 0
+  local async_ticks = 0
+  local async_queue = {}
+  local async_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(async_record),
+    implement = {
+      run = function()
+        async_impl = async_impl + 1
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function()
+        async_ticks = async_ticks + 1
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn)
+      async_queue[#async_queue + 1] = fn
+      return { cancel = function() end }
+    end,
+    async = true,
+    defer = function() return {} end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {}, questions = {},
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_async = runtime.new(async_deps)
+  local queued_retry = rt_async.retry({ id = "T1" }, { session = "S1" })
+  eq(queued_retry and queued_retry.ok, true, "the retry is queued, not run")
+  eq(async_impl, 0, "the retry job has not run when the handler returns")
+  local async_guard = 0
+  while #async_queue > 0 and async_guard < 50 do
+    async_guard = async_guard + 1
+    local fn = table.remove(async_queue, 1)
+    fn()
+  end
+  eq(async_impl, 1, "the queued retry job runs the task off the drain's turn")
+  eq(async_ticks >= 2,
+    true, "a completed retry job re-drains the scheduler instead of stopping the workflow")
+
   maki.session.notify = saved_notify
   maki.session.prompt = saved_prompt
 
