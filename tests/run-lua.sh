@@ -17,8 +17,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 MAKI_TEST_TOKEN="${MAKI_TEST_TOKEN:-$(date +%Y%m%d%H%M%S)-$$-${RANDOM}${RANDOM}}"
+# The token becomes a single path component under metronome-tests/ and the
+# cleanup below removes it recursively, so an inherited value must not be able
+# to escape that directory (`MAKI_TEST_TOKEN=../..` would otherwise delete
+# unrelated state). Refuse anything but one safe component.
+if [[ ! "$MAKI_TEST_TOKEN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$MAKI_TEST_TOKEN" == *..* ]]; then
+  echo "FAIL: unsafe MAKI_TEST_TOKEN: use letters, digits, '.', '_' or '-' (no '/', no '..')" >&2
+  exit 2
+fi
 export MAKI_TEST_TOKEN
-TEST_DIR="$STATE_HOME/maki/metronome-tests/$MAKI_TEST_TOKEN"
+TESTS_ROOT="$STATE_HOME/maki/metronome-tests"
+TEST_DIR="$TESTS_ROOT/$MAKI_TEST_TOKEN"
 RESULTS="$TEST_DIR/lua-results.txt"
 ERRFILE="$TEST_DIR/metronome-harness-error.txt"
 
@@ -31,7 +40,11 @@ fi
 # success or failure. The journal validation below runs before this trap, so
 # the journals are still there when they are judged.
 cleanup() {
-  rm -rf "$TEST_DIR"
+  # Belt and braces: even though the token is validated above, only ever delete
+  # a directory that really sits under metronome-tests/.
+  case "$TEST_DIR" in
+    "$TESTS_ROOT"/*) rm -rf -- "$TEST_DIR" ;;
+  esac
 }
 trap cleanup EXIT
 

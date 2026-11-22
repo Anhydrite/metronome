@@ -10,6 +10,9 @@
 -- live there too, so two concurrent runs never overwrite each other. A harness
 -- started without the variable (a test file run alone) derives a suffix that is
 -- specific to this process, so it still shares state with nobody.
+-- Process-local suffix used when MAKI_TEST_TOKEN is absent (a test file or the
+-- harness run on its own). The pid keeps it unique; the fallback stays numeric
+-- so it is always a legal directory name.
 local function local_test_suffix()
   local pid
   if type(maki.uv) == "table" then
@@ -17,12 +20,13 @@ local function local_test_suffix()
       local fn = maki.uv[name]
       if type(fn) == "function" then
         local ok, value = pcall(fn)
-        if ok and value then pid = value; break end
+        if ok and value then pid = tonumber(value) or pid; break end
       end
     end
   end
-  return string.format("local-%s-%d-%d", tostring(pid or tostring({})), os.time(),
-    math.random(0, 999999))
+  pid = pid or 0
+  math.randomseed(os.time() + pid)
+  return string.format("local-%d-%d-%d", pid, os.time(), math.random(0, 999999))
 end
 
 local function resolve_test_token()

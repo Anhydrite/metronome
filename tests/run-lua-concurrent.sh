@@ -7,6 +7,31 @@
 # or a shared temp directory shows up here as a false failure.
 #
 # Usage: tests/run-lua-concurrent.sh
+#
+# T0 evidence (red first). This script was written and run before the isolation
+# change, against the unmodified base tree (commit dd903df, the base of this
+# branch) with only this file copied in:
+#
+#   $ cd <base tree> && sh tests/run-lua-concurrent.sh ; echo $?
+#   PASS: concurrent run first finished green
+#   FAIL: concurrent run second did not pass
+#   --- second.log ---
+#   ...
+#   FAIL task with checkpoints created: task already exists: T-20261114-c001
+#   FAIL T-20261114-cv03: worktree created: worktree add failed [git_error]:
+#     ... fatal: not a git repository (or any parent up to mount point /)
+#   FAIL T-20261114-mg05: seed committed: git commit failed [git_error]:
+#     ... fatal: gitfile does not point to a valid repository:
+#     .../state/maki/metronome-tests/merge/wt-T-20261114-mg05/.git
+#   SUMMARY passed=3332 failed=8
+#   FAIL: at least one Lua assertion failed
+#   FAIL: two concurrent harness runs collided
+#   1
+#
+# The first instance reached `SUMMARY passed=3538 failed=0`; the second one,
+# running at the same time, found its tasks, worktrees and journals reset by
+# the first because every test wrote to the fixed metronome-tests/<name> paths.
+# Both go green once each run owns its token (the change this script proves).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

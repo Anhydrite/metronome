@@ -17,6 +17,9 @@ local cwd = maki.uv.cwd()
 -- test_token_value, so the error file and these results always land in the same
 -- <state_dir>/metronome-tests/<token>/ directory. Resolving it again here keeps
 -- this file usable on its own.
+-- Process-local suffix used when MAKI_TEST_TOKEN is absent (a test file or the
+-- harness run on its own). The pid keeps it unique; the fallback stays numeric
+-- and seed-free of odd characters, because it ends up as a directory name.
 local function local_test_suffix()
   local pid
   if type(maki.uv) == "table" then
@@ -24,12 +27,13 @@ local function local_test_suffix()
       local fn = maki.uv[name]
       if type(fn) == "function" then
         local ok, value = pcall(fn)
-        if ok and value then pid = value; break end
+        if ok and value then pid = tonumber(value) or pid; break end
       end
     end
   end
-  return string.format("local-%s-%d-%d", tostring(pid or tostring({})), os.time(),
-    math.random(0, 999999))
+  pid = pid or 0
+  math.randomseed(os.time() + pid)
+  return string.format("local-%d-%d-%d", pid, os.time(), math.random(0, 999999))
 end
 
 local function resolve_test_token()

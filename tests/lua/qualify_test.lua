@@ -31,6 +31,12 @@ return function()
   wipe(base)
   maki.fs.mkdir(base, { parents = true })
 
+  -- q.run writes each task projection to a file before the Python validator
+  -- reads it. Left to its default, that directory is state_dir/metronome-validate,
+  -- which two concurrent harness runs would share and truncate under each
+  -- other; the token base keeps it private to this run.
+  local validate_tmp = maki.fs.joinpath(base, "validate")
+
   -- A tiny repository with the traps the walker must avoid.
   local repo = maki.fs.joinpath(base, "repo")
   local function put(rel, text)
@@ -331,7 +337,7 @@ return function()
   end
 
   local runner_a, calls_a = scripted({ { text = valid_answer, cost = 0.25 } })
-  local ran_a = q.run({ intention = "add login", runner = runner_a, session_opts = session_opts, repo = repo })
+  local ran_a = q.run({ intention = "add login", tmp_dir = validate_tmp, runner = runner_a, session_opts = session_opts, repo = repo })
   eq(ran_a and ran_a.ok, true, "run succeeds on a valid first answer")
   eq(ran_a and ran_a.attempts, 1, "run records one attempt")
   eq(ran_a and ran_a.cost, 0.25, "run accumulates cost")
@@ -343,25 +349,25 @@ return function()
   eq(calls_a[1] and calls_a[1].model_spec, "test/model", "runner receives the model spec")
 
   local runner_b, calls_b = scripted({ { text = "this is not json" }, { text = valid_answer } })
-  local ran_b = q.run({ intention = "add login", runner = runner_b, session_opts = session_opts, repo = repo })
+  local ran_b = q.run({ intention = "add login", tmp_dir = validate_tmp, runner = runner_b, session_opts = session_opts, repo = repo })
   eq(ran_b and ran_b.ok, true, "run recovers from an invalid first answer")
   eq(ran_b and ran_b.attempts, 2, "run records two attempts")
   eq(calls_b[2] ~= nil and calls_b[2].prompt:find("could not be used", 1, true) ~= nil, true, "the repair prompt says the answer was unusable")
   has(calls_b[2] and calls_b[2].prompt or "", "add login", "the repair prompt carries the intention")
 
   local runner_c, calls_c = scripted({ { text = "nope" }, { text = "still nope" } })
-  local ran_c = q.run({ intention = "add login", runner = runner_c, session_opts = session_opts, repo = repo })
+  local ran_c = q.run({ intention = "add login", tmp_dir = validate_tmp, runner = runner_c, session_opts = session_opts, repo = repo })
   eq(ran_c and ran_c.ok, false, "run fails after the repair budget")
   eq(ran_c and ran_c.error ~= nil and ran_c.error:find("invalid after repair", 1, true) ~= nil, true, "the failure names the repair")
   eq(ran_c and ran_c.attempts, 2, "the failed run records both attempts")
   eq(ran_c and ran_c.raw, "still nope", "the failed run keeps the last answer")
 
   local runner_d, _ = scripted({ { ok = false, error = "upstream 500" } })
-  local ran_d = q.run({ intention = "add login", runner = runner_d, session_opts = session_opts, repo = repo })
+  local ran_d = q.run({ intention = "add login", tmp_dir = validate_tmp, runner = runner_d, session_opts = session_opts, repo = repo })
   eq(ran_d and ran_d.ok, false, "a failed runner fails the run")
   eq(ran_d and ran_d.error, "upstream 500", "the runner error is propagated")
 
-  local ran_e = q.run({ intention = "", runner = runner_a, session_opts = session_opts })
+  local ran_e = q.run({ intention = "", tmp_dir = validate_tmp, runner = runner_a, session_opts = session_opts })
   eq(ran_e and ran_e.ok, false, "an empty intention is refused")
 
   -- next_id ----------------------------------------------------------------
