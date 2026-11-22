@@ -2032,6 +2032,8 @@ auto_deploy = false
     "the recorded cause is typed review_invalid")
   eq(held_record.failure and held_record.failure.transient, true,
     "the recorded cause is transient")
+  eq(held_record.failure and held_record.failure.held, nil,
+    "the recorded failure stays inside the schema's closed key set")
   local held_result = type(rt_held.last_background) == "table"
     and type(rt_held.last_background.results) == "table"
     and rt_held.last_background.results[1] or nil

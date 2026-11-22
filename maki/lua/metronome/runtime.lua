@@ -2025,6 +2025,9 @@ function M.new(deps)
     -- persisted for the journal, the status is left untouched and nothing is
     -- cleaned up, so the task resumes from its checkpoint.
     if held_review_invalid(result) then
+      -- The persisted record stays inside the schema's closed failure key set
+      -- (schemas/task.schema.json): `set_fields` writes a raw `field` event that
+      -- the journal replays verbatim, so an extra key would poison the state.
       local held = {
         cause = "review_invalid",
         message = message:gsub("%s+", " "):sub(1, 300),
@@ -2033,7 +2036,6 @@ function M.new(deps)
         attempts = (tonumber(type(prior) == "table" and prior.attempts) or 0) + 1,
         at = os.time(),
         phase = phase,
-        held = true,
       }
       pcall(deps.state.set_fields, paths.root, task_id, { failure = held })
       log(paths, "task " .. tostring(task_id) .. " kept in "
