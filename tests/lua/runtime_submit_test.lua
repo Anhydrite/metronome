@@ -1811,4 +1811,75 @@ auto_deploy = false
   eq(epic_seen.deploy, 1, "the epic deploys after its merge")
   eq(epic_record.status, "deployed", "the epic ends deployed")
 
+  -- status: the named skip reason of the scheduler is exposed ----------------
+  --
+  -- A ready task is not necessarily dispatchable: an unknown dependency or a
+  -- dependency still in draft keeps it out of the queue forever. `status` used
+  -- to return the raw tasks, so such a task looked ready and nothing said why
+  -- it never started.
+  local status_root = mktmpdir("metronome-runtime-status")
+  local status_paths = {
+    repo = "/tmp/repo",
+    root = status_root,
+    config = maki.fs.joinpath(status_root, "config.toml"),
+  }
+  local status_tasks = {
+    T1 = { id = "T1", title = "ghost", status = "ready", files = { "a" },
+      depends_on = { "T-nope" } },
+    T2 = { id = "T2", title = "drafty", status = "ready", files = { "b" },
+      depends_on = { "T3" } },
+    T3 = { id = "T3", title = "draft dep", status = "draft", files = { "c" } },
+    T4 = { id = "T4", title = "free", status = "ready", files = { "d" } },
+  }
+  local status_rt = runtime.new({
+    config = {
+      load = function()
+        return { project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 2 } }
+      end,
+    },
+    state = {
+      load = function() return { tasks = status_tasks, events = {} } end,
+    },
+    pipeline = load_module("pipeline"),
+    paths = function() return status_paths end,
+    roles = {}, runner = {}, git = {}, qualify = {}, questions = {},
+    analyze = {}, checks = {}, converge = {}, review = {}, merge = {},
+    deploy = {}, calibrate = {}, fence = {}, mode = {}, implement = {},
+  })
+  local status_result = status_rt.status({})
+  eq(status_result.ok, true, "status reads the state")
+  eq(#status_result.waiting, 2, "the two blocked ready tasks are named")
+  eq(status_result.waiting[1].id, "T1", "waiting is sorted by id (1)")
+  eq(status_result.waiting[1].reason:find("missing dependency: T-nope", 1, true) ~= nil, true,
+    "the missing dependency is named")
+  eq(status_result.waiting[2].id, "T2", "waiting is sorted by id (2)")
+  eq(status_result.waiting[2].reason:find("waiting on T3 (draft)", 1, true) ~= nil, true,
+    "the draft dependency is named")
+  eq(status_result.tasks.T1.waiting_reason:find("missing dependency", 1, true) ~= nil, true,
+    "the blocked task carries its reason")
+  eq(status_result.tasks.T2.waiting_reason:find("waiting on T3", 1, true) ~= nil, true,
+    "the waiting task carries its reason")
+  eq(status_result.tasks.T4.waiting_reason, nil, "a dispatchable task carries no reason")
+
+  -- A config that cannot be read must not fail status: the scheduler default
+  -- applies and the reasons still come out.
+  local broken_rt = runtime.new({
+    config = {
+      load = function()
+        error("unreadable config")
+      end,
+    },
+    state = {
+      load = function() return { tasks = status_tasks, events = {} } end,
+    },
+    pipeline = load_module("pipeline"),
+    paths = function() return status_paths end,
+    roles = {}, runner = {}, git = {}, qualify = {}, questions = {},
+    analyze = {}, checks = {}, converge = {}, review = {}, merge = {},
+    deploy = {}, calibrate = {}, fence = {}, mode = {}, implement = {},
+  })
+  local broken_result = broken_rt.status({})
+  eq(broken_result.ok, true, "an invalid config does not fail status")
+  eq(#broken_result.waiting, 2, "the reasons still come out without a config")
+
 end

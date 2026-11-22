@@ -2097,7 +2097,28 @@ function M.new(deps)
       end
       return { ok = true, task = task }
     end
-    return { ok = true, tasks = loaded.tasks, events = loaded.events }
+
+    -- A ready task the scheduler would not start is otherwise invisible in the
+    -- panel: name why it waits. The cap comes from the project config; a
+    -- missing or invalid config must never fail a status read, so fall back to
+    -- the scheduler's own default.
+    local max_parallel = 2
+    local ok, cfg = pcall(deps.config.load, paths.config)
+    if ok and type(cfg) == "table" and type(cfg.project) == "table" then
+      max_parallel = tonumber(cfg.project.max_parallel) or max_parallel
+    end
+
+    local waiting = deps.pipeline.ready_reasons(loaded.tasks, { max_parallel = max_parallel })
+    if type(loaded.tasks) == "table" then
+      for _, entry in ipairs(waiting) do
+        local task = loaded.tasks[entry.id]
+        if type(task) == "table" then
+          task.waiting_reason = entry.reason
+        end
+      end
+    end
+
+    return { ok = true, tasks = loaded.tasks, events = loaded.events, waiting = waiting }
   end
 
   function runtime.answer(input, ctx)
