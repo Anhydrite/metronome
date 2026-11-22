@@ -428,6 +428,55 @@ return function()
   eq(loaded.tasks[id1] and loaded.tasks[id1].questions[1].id, "q1", "state keeps the questions")
   eq(loaded.tasks[id2] and loaded.tasks[id2].status, "ready", "state keeps the final status")
 
+  -- A dependency expressed as a batch position ("1") resolves to the real id
+  -- assigned to the task at that position, both in the record and the sheet.
+  local index_root = maki.fs.joinpath(base, "qualify-index")
+  maki.fs.mkdir(index_root, { parents = true })
+  local index_result = {
+    ok = true,
+    tasks = {
+      { title = "Alpha", intent = "a", files = { "a" }, checks = { "c" }, depends_on = {} },
+      { title = "Beta", intent = "b", files = { "b" }, checks = { "c" }, depends_on = { "1" } },
+    },
+    questions = {},
+    truncated_questions = 0,
+  }
+  local index_applied, index_err = q.apply(state, index_root, index_result, {})
+  eq(index_err, nil, "apply with an index dependency has no error")
+  local alpha_id = index_applied and index_applied.tasks[1].id
+  local beta = index_applied and index_applied.tasks[2]
+  eq(beta and beta.depends_on and beta.depends_on[1], alpha_id,
+    "an index-form depends_on resolves to the first task id")
+  local index_state = state.load(index_root)
+  eq(beta and index_state.tasks[beta.id] and index_state.tasks[beta.id].depends_on[1], alpha_id,
+    "the stored record keeps the resolved id")
+  local beta_sheet = maki.fs.read(maki.fs.joinpath(index_root, "tasks", (beta and beta.id or "") .. ".md"))
+  has(beta_sheet or "", alpha_id or "", "the sheet shows the resolved id")
+
+  -- A forward reference resolves too (task 1 depends on position 3), and an
+  -- entry that is neither an id, a position nor a title is left verbatim so
+  -- analyze.missing_dependency can still block it.
+  local fwd_root = maki.fs.joinpath(base, "qualify-forward")
+  maki.fs.mkdir(fwd_root, { parents = true })
+  local fwd_result = {
+    ok = true,
+    tasks = {
+      { title = "One", intent = "1", files = { "a" }, checks = { "c" }, depends_on = { "3", "ghost" } },
+      { title = "Two", intent = "2", files = { "b" }, checks = { "c" }, depends_on = {} },
+      { title = "Three", intent = "3", files = { "c" }, checks = { "c" }, depends_on = {} },
+    },
+    questions = {},
+    truncated_questions = 0,
+  }
+  local fwd_applied, fwd_err = q.apply(state, fwd_root, fwd_result, {})
+  eq(fwd_err, nil, "apply with a forward index dependency has no error")
+  local one = fwd_applied and fwd_applied.tasks[1]
+  local three = fwd_applied and fwd_applied.tasks[3]
+  eq(one and three and one.depends_on and one.depends_on[1], three and three.id,
+    "a forward index resolves to the id created later in the batch")
+  eq(one and one.depends_on and one.depends_on[2], "ghost",
+    "an unknown reference is left verbatim for the gate to block")
+
   local dup_result = {
     ok = true,
     tasks = { { title = "Duplicate", files = { "x" }, checks = { "y" } } },
