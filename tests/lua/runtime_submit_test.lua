@@ -1679,4 +1679,161 @@ auto_deploy = false
   eq(epic_seen.deploy, 1, "the epic deploys after its merge")
   eq(epic_record.status, "deployed", "the epic ends deployed")
 
+  -- after_questions: quarantine the blocked task, dispatch the ready ones ----
+  --
+  -- Regression: a single blocking analysis finding used to make after_questions
+  -- return { ok = false } before computing anything dispatchable. Every ready
+  -- sibling stayed parked for minutes (the silent freeze). The blocked task is
+  -- quarantined, the ready one is dispatched, and the drain reports both.
+  local q_tasks = {
+    ["T-1"] = { id = "T-1", title = "clean", status = "ready", files = { "a" }, checks = { "true" } },
+    ["T-2"] = { id = "T-2", title = "broken", status = "qualifying", files = { "b" }, checks = { "true" } },
+  }
+  local q_dispatched = {}
+  local q_ticks = 0
+  local q_gate_mode = "blocked"
+  local q_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = true },
+          deploy = { auto_deploy = false, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = { session_opts = function()
+      return { system = "", model_spec = "m", thinking = "low", tools = {} }
+    end },
+    state = {
+      load = function() return { tasks = q_tasks } end,
+      transition = function(_, id, status)
+        if q_tasks[id] then q_tasks[id].status = status end
+        return { id = id, status = status }
+      end,
+      set_fields = function(_, id, fields)
+        local task = q_tasks[id]
+        if task then
+          for key, value in pairs(fields or {}) do task[key] = value end
+        end
+        return task
+      end,
+      append = function(_, event)
+        if event.kind == "task_created" and event.task then
+          q_tasks[event.task_id] = event.task
+        end
+        return { tasks = q_tasks }
+      end,
+    },
+    implement = {
+      run = function()
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true } end },
+    merge = { run = function() return { ok = true } end },
+    git = { pr_open = function() return { number = 1, url = "https://example.test/pr/1", state = "open" } end },
+    pipeline = {
+      tick = function(opts)
+        q_ticks = q_ticks + 1
+        if q_ticks == 1 and q_tasks["T-1"] and q_tasks["T-1"].status == "ready" then
+          q_dispatched[#q_dispatched + 1] = "T-1"
+          opts.dispatch({ id = "T-1" })
+          return { ok = true, started = { "T-1" } }
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    async = true,
+    wait_turn_end = false,
+    runner = {},
+    questions = {
+      answer = function() return { applied = 1, answered = 1, tasks = {} } end,
+    },
+    analyze = {
+      gate = function()
+        if q_gate_mode == "error" then
+          return nil, "cannot load state"
+        end
+        if q_gate_mode == "repaired" then
+          return { ok = true, verdict = "ok", tasks = { "T-2" }, blocked = {}, findings = {} }
+        end
+        local finding = {
+          severity = "blocking",
+          rule = "missing_dependency",
+          message = "T-2 needs a task that does not exist",
+          tasks = { "T-2" },
+        }
+        return {
+          ok = false,
+          verdict = "blocked",
+          tasks = { "T-1" },
+          findings = { finding },
+          blocked = { { id = "T-2", findings = { finding } } },
+        }
+      end,
+    },
+    qualify = {}, deploy = {}, calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_q = runtime.new(q_deps)
+  rt_q.answer({ answers = {} }, ctx)
+  rt_q.run_pending()
+  local qres = rt_q.last_background or {}
+  eq(qres.ok, true, "a blocked sibling no longer fails the whole drain")
+  eq(type(qres.quarantined), "table", "the drain names the quarantined task")
+  eq(qres.quarantined and qres.quarantined[1], "T-2", "the blocked task is quarantined")
+  eq(#(qres.quarantined or {}), 1, "only the blocked task is quarantined")
+  eq(qres.findings and qres.findings["T-2"] and qres.findings["T-2"][1].rule,
+    "missing_dependency", "the drain reports the blocked findings by id")
+  eq(q_dispatched[1], "T-1", "the ready task is dispatched despite the blocked sibling")
+  local q_dispatch_count = 0
+  for _, id in ipairs(q_dispatched) do
+    if id == "T-2" then q_dispatch_count = q_dispatch_count + 1 end
+  end
+  eq(q_dispatch_count, 0, "a quarantined task is never handed to dispatch_one")
+  eq(type(q_tasks["T-2"].quarantine), "table",
+    "the quarantine is persisted on the task record")
+  eq(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.reason,
+    "blocking finding: missing_dependency",
+    "the quarantine reason names the blocking rule")
+  eq(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.rules[1],
+    "missing_dependency", "the quarantine keeps the sorted rule names")
+  local q_log = maki.fs.read(maki.fs.joinpath(root, "runtime.log")) or ""
+  has(q_log, "T-2 (missing_dependency)", "runtime.log names the quarantined task and its rule")
+  has(q_log, "quarantined", "runtime.log records that a quarantine happened")
+
+  -- A gate that cannot run at all must still dispatch what is already ready --
+  q_gate_mode = "error"
+  q_ticks = 0
+  q_dispatched = {}
+  q_tasks["T-1"].status = "ready"
+  q_tasks["T-2"].status = "qualifying"
+  q_tasks["T-2"].quarantine = nil
+  rt_q.answer({ answers = {} }, ctx)
+  rt_q.run_pending()
+  local qerr = rt_q.last_background or {}
+  eq(qerr.ok, true, "a gate error does not turn the drain into a silent empty return")
+  eq(q_dispatched[1], "T-1", "an already-ready task is still dispatched when the gate errors")
+  eq(qerr.quarantined and qerr.quarantined[1], "T-2",
+    "the qualifying task is quarantined when the analysis cannot run")
+  has(tostring(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.reason),
+    "analysis failed: cannot load state", "the quarantine reason names the analysis error")
+
+  -- A repaired sheet is remitted: the next drain moves it to ready and drops
+  -- the quarantine instead of keeping a stale warning forever.
+  q_gate_mode = "repaired"
+  q_ticks = 0
+  q_dispatched = {}
+  q_tasks["T-2"].status = "ready"
+  rt_q.answer({ answers = {} }, ctx)
+  rt_q.run_pending()
+  eq(q_tasks["T-2"].quarantine, nil,
+    "a task that passes the gate is no longer shown as quarantined")
+
 end

@@ -1448,12 +1448,129 @@ function M.new(deps)
       ref = "origin/" .. tostring(cfg.project.base_ref),
       git = deps.git,
     })
-    if not gate or not gate.ok then
-      return { ok = false, error = gerr or (gate and gate.verdict) or "analysis gate failed" }
-    end
 
+    -- A blocked verdict is per task now: the offending sheets stay qualifying
+    -- with their blocking findings, everything else is ready. Keep the gate
+    -- result instead of returning on `gate.ok == false` — an early return here
+    -- was the silent freeze that starved every ready sibling for minutes.
     local results = {}
     local deployed = false
+    local quarantined = {}
+    local blocked_findings = {}
+    local blocked_rules = {}
+
+    local function now_iso()
+      return os.date("!%Y-%m-%dT%H:%M:%SZ")
+    end
+
+    -- A field event cannot delete a key: a Lua nil value is an absent key and
+    -- an explicit JSON null replays as `maki.NIL`, which is truthy. Patch the
+    -- field away first (the contract), then, when the journal primitive is
+    -- available, rewrite the record without it so a repaired task no longer
+    -- shows as quarantined in the projection.
+    local function clear_quarantine(task_id)
+      pcall(deps.state.set_fields, paths.root, task_id, { quarantine = nil })
+      if type(deps.state.append) ~= "function" or type(deps.state.load) ~= "function" then
+        return
+      end
+      local loaded = deps.state.load(paths.root)
+      local current = type(loaded) == "table" and type(loaded.tasks) == "table"
+        and loaded.tasks[task_id] or nil
+      if type(current) ~= "table" or current.quarantine == nil then
+        return
+      end
+      local rewritten = {}
+      for key, value in pairs(current) do
+        if key ~= "quarantine" then
+          rewritten[key] = value
+        end
+      end
+      pcall(deps.state.append, paths.root, {
+        kind = "task_created",
+        task_id = task_id,
+        task = rewritten,
+      })
+    end
+
+    local function quarantine(task_id, reason, rules, findings)
+      quarantined[#quarantined + 1] = task_id
+      blocked_findings[task_id] = findings or {}
+      blocked_rules[task_id] = rules or {}
+      pcall(deps.state.set_fields, paths.root, task_id, {
+        quarantine = {
+          reason = reason,
+          rules = rules or {},
+          findings = findings or {},
+          since = now_iso(),
+        },
+      })
+    end
+
+    if type(gate) == "table" and type(gate.blocked) == "table" then
+      for _, entry in ipairs(gate.blocked) do
+        local id = type(entry) == "table" and entry.id or nil
+        if type(id) == "string" and id ~= "" then
+          local findings = type(entry.findings) == "table" and entry.findings or {}
+          local rules, seen = {}, {}
+          for _, finding in ipairs(findings) do
+            local rule = type(finding) == "table" and finding.rule or nil
+            if type(rule) == "string" and rule ~= "" and not seen[rule] then
+              seen[rule] = true
+              rules[#rules + 1] = rule
+            end
+          end
+          table.sort(rules)
+          local reason = rules[1]
+            and ("blocking finding: " .. rules[1]) or "blocking finding"
+          quarantine(id, reason, rules, findings)
+        end
+      end
+      -- A task the gate moved to ready passed it: it must not keep a stale
+      -- quarantine from an earlier pass.
+      for _, id in ipairs(type(gate.tasks) == "table" and gate.tasks or {}) do
+        if type(id) == "string" then
+          clear_quarantine(id)
+        end
+      end
+    elseif gate == nil then
+      -- The gate itself failed (state load, report write). Nothing can be
+      -- verified, so quarantine every task still waiting for analysis — but
+      -- still dispatch whatever is already ready.
+      local err = tostring(gerr or "analysis gate failed")
+      log(paths, "analysis gate failed: " .. err .. "; quarantining qualifying tasks")
+      local loaded = deps.state.load(paths.root)
+      local ids = {}
+      for id, task in pairs(type(loaded) == "table" and type(loaded.tasks) == "table"
+        and loaded.tasks or {}) do
+        if type(task) == "table" and task.status == "qualifying" then
+          ids[#ids + 1] = id
+        end
+      end
+      table.sort(ids)
+      for _, id in ipairs(ids) do
+        quarantine(id, "analysis failed: " .. err, {}, {})
+      end
+    end
+
+    table.sort(quarantined)
+    if #quarantined > 0 then
+      -- A freeze must leave a trace: name the ids and the rules they broke.
+      local parts = {}
+      for _, id in ipairs(quarantined) do
+        local rules = blocked_rules[id] or {}
+        if #rules > 0 then
+          parts[#parts + 1] = id .. " (" .. table.concat(rules, ", ") .. ")"
+        else
+          parts[#parts + 1] = id
+        end
+      end
+      log(paths, "quarantined " .. table.concat(parts, ", ")
+        .. "; dispatching ready tasks")
+    end
+    local quarantine_set = {}
+    for _, id in ipairs(quarantined) do
+      quarantine_set[id] = true
+    end
 
     -- `max_parallel` is the project's cap, not a hardcoded one: a queue of
     -- independent asks must not take one full pipeline each, end to end.
@@ -1512,7 +1629,13 @@ function M.new(deps)
         dispatch = dispatch_one,
       })
       if not tick.ok then
-        return { ok = false, error = tick.error, results = results }
+        return {
+          ok = false,
+          error = tick.error,
+          results = results,
+          quarantined = quarantined,
+          findings = blocked_findings,
+        }
       end
       if #tick.started == 0 then
         break
@@ -1523,7 +1646,13 @@ function M.new(deps)
     -- check and the final deploy belong to the synchronous path (the scripted
     -- e2e driver), where every task has already finished by now.
     if deps.async then
-      return { ok = true, results = results, background = true }
+      return {
+        ok = true,
+        results = results,
+        quarantined = quarantined,
+        findings = blocked_findings,
+        background = true,
+      }
     end
 
     local loaded = deps.state.load(paths.root)
@@ -1536,7 +1665,11 @@ function M.new(deps)
         if M.task_base(task, cfg) == cfg.project.base_ref then
           last = task
         end
-      elseif task.status ~= "deployed" and task.status ~= "abandoned" then
+      elseif task.status ~= "deployed" and task.status ~= "abandoned"
+        and not quarantine_set[task.id] then
+        -- A quarantined sibling is not a task that failed to finish: keeping it
+        -- pending would turn the whole submit into a failure and hide a merged
+        -- task that is ready to deploy.
         pending[#pending + 1] = task.id
       end
     end
@@ -1545,6 +1678,8 @@ function M.new(deps)
         ok = false,
         error = "tasks did not finish: " .. table.concat(pending, ", "),
         results = results,
+        quarantined = quarantined,
+        findings = blocked_findings,
       }
     end
     if last then
@@ -1567,7 +1702,13 @@ function M.new(deps)
       results[#results + 1] = deployed_result
     end
 
-    return { ok = true, results = results, deployed = deployed }
+    return {
+      ok = true,
+      results = results,
+      deployed = deployed,
+      quarantined = quarantined,
+      findings = blocked_findings,
+    }
   end
 
   -- Background scheduler -----------------------------------------------------
