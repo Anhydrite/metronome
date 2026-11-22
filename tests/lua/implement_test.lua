@@ -426,5 +426,40 @@ return function()
   eq(rcode6, 0, "the rewritten branch reached the remote")
   eq((remote_sha:gsub("%s+$", "")), local_sha, "the remote holds the rewritten commit")
 
+  -- Scenario F: the commit is already in place and the worktree is clean when
+  -- the turn's own commit runs -- exactly the state that used to be reported as
+  -- `git commit exit 1: Sur la branche main ... rien à valider` and condemned a
+  -- finished task. The turn must succeed, take HEAD as its sha and reach the
+  -- push, so the caller goes on to the checks instead of failing.
+  local id7 = "T-20261122-f001"
+  local task7 = new_task(id7, "Already committed", { "src/done.lua" }, { "make test" })
+  sheet_for(id7, "Already committed")
+  local clean_sha = nil
+  local function clean_turn_runner(args)
+    local wt = maki.fs.joinpath(worktree_root, args.task_id)
+    maki.fs.write(maki.fs.joinpath(wt, "done.lua"), "return true\n")
+    clean_sha = git.commit(wt, "feat: done")
+    return { ok = true, text = "committed by the runner" }
+  end
+  local result7 = implement.run(run_opts(task7, clean_turn_runner))
+  eq(result7.ok, true, "a clean tree after the runner's commit is a success: " .. tostring(result7.error))
+  eq(result7.no_changes, false, "a turn that really committed reports changes")
+  eq(result7.sha, clean_sha, "the sha is the head the runner left")
+  eq(type(result7.sha) == "string" and #result7.sha, 40, "the clean turn sha is full length")
+  local wt7 = maki.fs.joinpath(worktree_root, id7)
+  eq(git.head_sha(wt7), result7.sha, "the benign commit leaves HEAD untouched")
+  local rcode7, rsha7 = sh({ "git", "-C", remote, "rev-parse", "refs/heads/metronome/already-committed-f001" })
+  eq(rcode7, 0, "the clean turn reaches the push: the branch is on the remote")
+  eq((rsha7:gsub("%s+$", "")), result7.sha, "the remote holds the turn's commit")
+  local after7 = state.load(root).tasks[id7]
+  eq(after7 and after7.status, "running", "the clean turn keeps the task running")
+  local failed_note = false
+  for _, note in ipairs(after7 and after7.notes or {}) do
+    if type(note) == "string" and note:find("git commit failed", 1, true) then
+      failed_note = true
+    end
+  end
+  eq(failed_note, false, "the clean turn writes no failure note")
+
   -- The temp dir is deliberately kept: tests/run-lua.sh validates its journal.
 end

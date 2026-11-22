@@ -454,10 +454,71 @@ return function()
   sh({ "git", "checkout", "--", "src/lib.js" }, repo)
   maki.fs.rm(maki.fs.joinpath(repo, "uncommitted.js"))
 
+  -- An already-committed tree is a success, whatever the locale ------------
+  --
+  -- The benign "nothing to commit" case used to be decided by finding the
+  -- English text in git's output, so a French git turned a finished task into
+  -- `git commit exit 1: Sur la branche main ... rien à valider`. The answer now
+  -- comes from the repository state, which no locale can change.
+
+  local commit_wt = maki.fs.joinpath(base, "wt-commit")
+  local commit_branch = "metronome/T-20261122-c001"
+  local cwt, cwerr = git.worktree_add(repo, commit_wt, commit_branch, "main", { remote = "origin" })
+  eq(cwerr, nil, "commit worktree created: " .. tostring(cwerr))
+  eq(cwt, commit_wt, "commit worktree path returned")
+
+  maki.fs.write(maki.fs.joinpath(commit_wt, "done.lua"), "return true\n")
+  local done_sha, done_err = git.commit(commit_wt, "feat: already done")
+  eq(done_err, nil, "the first commit lands: " .. tostring(done_err))
+  eq(type(done_sha), "string", "the first commit returns a sha")
+  eq(#(done_sha or ""), 40, "the first commit sha is full length")
+
+  -- The commit is already in place and the tree is clean: nothing left to do.
+  local again, again_err = git.commit(commit_wt, "feat: already done")
+  eq(again, nil, "a clean tree returns no sha")
+  eq(again_err, "nothing to commit", "a clean tree reports the stable sentinel")
+  eq(git.head_sha(commit_wt), done_sha, "the benign commit leaves HEAD untouched")
+
+  -- classify() names the cause from either wording: the French output is the
+  -- one that condemned the task, and it must never read as auth or push.
+  local french = git.classify("git commit", {
+    code = 1,
+    command = "git commit -m 'feat: already done'",
+    stdout = "",
+    stderr = "Sur la branche main\nrien à valider, la copie de travail est propre\n",
+  })
+  eq(french.cause, "nothing_to_commit", "a French clean tree is classified nothing_to_commit")
+  eq(french.cause == "auth_failed" or french.cause == "push_rejected", false,
+    "a clean tree is never auth_failed or push_rejected")
+  has(french.message, "commit", "the cause says the commit is in place")
+  has(french.hint, "checks", "the remedy says to continue the checks")
+  local english = git.classify("git commit", {
+    code = 1,
+    command = "git commit -m 'feat: already done'",
+    stderr = "nothing to commit, working tree clean\n",
+  })
+  eq(english.cause, "nothing_to_commit", "the English wording gives the same cause")
+  eq(git.describe(french):find("nothing_to_commit", 1, true) ~= nil, true,
+    "the diagnostic reads as a benign cause, not as a failure")
+
+  -- A tree that really changed is still committed: the state check must not
+  -- swallow a genuine change.
+  maki.fs.write(maki.fs.joinpath(commit_wt, "extra.lua"), "return 2\n")
+  local changed_sha, changed_err = git.commit(commit_wt, "feat: real change")
+  eq(changed_err, nil, "a modified tree still commits: " .. tostring(changed_err))
+  eq(type(changed_sha), "string", "a modified tree returns a sha")
+  eq(changed_sha ~= done_sha, true, "the modified tree is a new commit")
+  local ccode, cout = sh({ "git", "-C", commit_wt, "ls-tree", "-r", "--name-only", "HEAD" })
+  eq(ccode, 0, "the commit worktree head is readable")
+  has(cout, "extra.lua", "the change is in the commit")
+
   -- Cleanup -----------------------------------------------------------------
 
   local removed, rerr = git.worktree_remove(repo, worktree, { force = true })
   eq(removed, true, "worktree removed: " .. tostring(rerr))
+
+  local removed_cm, rerr_cm = git.worktree_remove(repo, commit_wt, { force = true })
+  eq(removed_cm, true, "commit worktree removed: " .. tostring(rerr_cm))
 
   local removed_rb, rerr_rb = git.worktree_remove(repo, rebase_wt, { force = true })
   eq(removed_rb, true, "rebase worktree removed: " .. tostring(rerr_rb))
