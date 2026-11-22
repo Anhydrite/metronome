@@ -43,6 +43,29 @@ calls an endpoint, a test that asserts a file, and a doc that describes a
 contract. A dependency the scheduler cannot see runs both tasks at once and
 fails review on a file that does not exist yet.
 
+## Dependency identifiers
+
+Every entry of **depends_on** must name another task of the same batch. Name it
+in exactly one of these two ways:
+
+- by its **exact title**, copied character for character from the sheet you
+  produce; or
+- by its **1-based position** in the list you produce (`1` is the first task,
+  `2` the second, and so on).
+
+Never invent a task id. Do not guess one, and never write `T1`, `T2` or any
+`T<n>` form: that shape is not a task id. Only the pipeline assigns ids, in the
+form `T-<date>-<hex>`, and only after the sheets exist. If you were given an id
+by the pipeline — in an answer to one of your questions, or in an existing
+state — you may use it, but then copy it exactly; a single altered character
+points at nothing.
+
+A dependency you cannot name by title or by position is not a dependency you
+may make up. Do not encode it as a placeholder, an out-of-range position or an
+invented id: ask it as a question instead, and leave that dependency out until
+the answer tells you what to point at. A reference the scheduler cannot resolve
+blocks the task forever.
+
 ## Questions
 
 Ask at most the configured limit per round. Every question must be one you
