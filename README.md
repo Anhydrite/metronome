@@ -104,7 +104,7 @@ draft -> qualifying -> awaiting_answers -> qualifying
 `failed`, `stalled` and `abandoned` are reachable from the active states. Each phase is owned by a module:
 
 1. **Qualify** — `qualify.lua` turns the intention into task sheets with declared files, checks and acceptance criteria. A task that asks a question is parked in `awaiting_answers`.
-2. **Analyze** — `analyze.lua` checks the sheets against each other: duplicate titles, overlapping files without a dependency, missing or cyclic dependencies, gate coupling (a check that runs a file another task owns, which deadlocks when the owner waits on this task), empty checks. A blocking finding keeps the task in `qualifying`.
+2. **Analyze** — `analyze.lua` checks the sheets against each other: duplicate titles, missing or cyclic dependencies, gate coupling (a check that runs a file another task owns, which deadlocks when the owner waits on this task), empty checks. A blocking finding keeps the task in `qualifying`. Overlapping files and identical file sets are informative (`minor`) findings only, and cross-task rules compare only tasks cut from the same `base_ref` — two epics are never compared.
 3. **Implement** — `implement.lua` creates the worktree from the fresh base, checkpoints the starting SHA, runs the implementer, commits and pushes.
 4. **Verify** — `checks.lua` runs the declared commands in the worktree. A red check rolls back to the checkpoint and sends the task back to `running`.
 5. **Converge** — `converge.lua` compares the diff with the declared files. A missing or unexpected file gets one repair turn; the verdict is the diff, never the model's word.
@@ -113,7 +113,7 @@ draft -> qualifying -> awaiting_answers -> qualifying
 8. **Merge** — `merge.lua` rebases on the fresh base, squash-merges through `gh`, and re-runs the checks on the merged base.
 9. **Deploy** — `deploy.lua` requires a merged PR, a green checks report and an existing `deploy.md`, asks for confirmation, then runs the plan.
 
-The scheduler (`pipeline.lua`) decides what may run, never how a step runs: dependencies must be `merged` or `deployed`, two tasks that share a declared file never run together, `max_parallel` is a hard cap, and a stale task is flagged and surfaced in the panel.
+The scheduler (`pipeline.lua`) decides what may run, never how a step runs: dependencies must be `merged` or `deployed`, `max_parallel` is the hard cap, and a stale task is flagged and surfaced in the panel. Declared files never bound parallelism — two tasks that share a file run at the same time in separate worktrees, and any conflict is resolved at merge.
 
 ### Epic branches
 

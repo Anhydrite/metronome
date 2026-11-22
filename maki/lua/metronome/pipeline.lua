@@ -9,9 +9,13 @@
 -- Three rules from the plan:
 --   * dependencies: a task starts only once every `depends_on` task is merged
 --     (or deployed);
---   * file overlap: two tasks that declare a common file never run at the same
---     time, even when `max_parallel` would allow it;
---   * max_parallel: never more than the configured number of tasks in flight.
+--   * max_parallel: never more than the configured number of tasks in flight;
+--   * runs alone: a task that declares no files has an unknown blast radius,
+--     so it starts only when nothing else is in flight or selected.
+--
+-- Overlapping declared files are legal: each task works in its own branch and
+-- worktree, so two tasks may touch the same file in parallel and any conflict
+-- is resolved at merge time.
 --
 -- Stall detection is time-based, not poll-based: `stall()` compares each active
 -- task's last progress with `stall_minutes`. `mark_stalled()` turns a stalled
@@ -146,45 +150,6 @@ function M.dependencies_met(task, tasks)
   return true
 end
 
--- File overlap --------------------------------------------------------------
-
--- Two tasks overlap when they declare at least one common file.
---
--- A task that declares no files has an unknown blast radius: it could touch
--- anything, so it cannot be proven disjoint from anything and never runs
--- beside another task. That is the cost of the fast lane, which skips the
--- qualifier and therefore the file contract; naming a file in the intention
--- (or using the full qualifier) buys the parallelism back.
-function M.overlaps(a, b)
-  if type(a) ~= "table" or type(b) ~= "table" then
-    return false
-  end
-  local a_files = type(a.files) == "table" and a.files or {}
-  local b_files = type(b.files) == "table" and b.files or {}
-  if #a_files == 0 or #b_files == 0 then
-    return true
-  end
-  local files = {}
-  for _, file in ipairs(a_files) do
-    files[file] = true
-  end
-  for _, file in ipairs(b_files) do
-    if files[file] then
-      return true
-    end
-  end
-  return false
-end
-
-local function overlaps_any(task, others)
-  for _, other in ipairs(others) do
-    if M.overlaps(task, other) then
-      return true, other.id
-    end
-  end
-  return false
-end
-
 -- Scheduling ----------------------------------------------------------------
 
 -- Pick the tasks to start now. `running` is the tasks already in flight (a
@@ -207,7 +172,15 @@ function M.schedule(tasks, running, opts)
       candidates[#candidates + 1] = task
     end
   end
+  -- Declared-file candidates are considered first so the runs-alone rule holds
+  -- in both directions: an undeclared task is examined only once every task
+  -- that names its blast radius had its chance to be selected.
   table.sort(candidates, function(a, b)
+    local a_declared = type(a.files) == "table" and #a.files > 0
+    local b_declared = type(b.files) == "table" and #b.files > 0
+    if a_declared ~= b_declared then
+      return a_declared
+    end
     return a.id < b.id
   end)
 
@@ -218,18 +191,15 @@ function M.schedule(tasks, running, opts)
     elseif #in_flight + #selected >= max_parallel then
       skipped[#skipped + 1] = { id = task.id, reason = "max_parallel reached" }
     else
-      local clash, with_id = overlaps_any(task, in_flight)
-      if not clash then
-        clash, with_id = overlaps_any(task, selected)
-      end
-      if clash then
-        local reason
-        if #(type(task.files) == "table" and task.files or {}) == 0 then
-          reason = "no declared files: runs alone (name a file to run it in parallel)"
-        else
-          reason = "files overlap with " .. tostring(with_id)
-        end
-        skipped[#skipped + 1] = { id = task.id, reason = reason }
+      local files = type(task.files) == "table" and task.files or {}
+      -- A task that declares no files has an unknown blast radius: it could
+      -- touch anything, so it runs alone. It still starts on an empty
+      -- pipeline; naming a file in the intention buys the parallelism back.
+      if #files == 0 and (#in_flight + #selected > 0) then
+        skipped[#skipped + 1] = {
+          id = task.id,
+          reason = "no declared files: runs alone (name a file to run it in parallel)",
+        }
       else
         selected[#selected + 1] = task
       end

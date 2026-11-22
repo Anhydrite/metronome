@@ -1897,21 +1897,44 @@ function M.new(deps)
       return { ok = false, error = apply_err }
     end
 
-    -- The qualifier names dependencies by task title; the state stores ids.
-    -- Remap every applied task, scripted or real, so the analysis gate does not
-    -- see a title where it expects an id.
+    -- The qualifier names dependencies by id, batch position or task title;
+    -- the state stores ids. Remap every applied task, scripted or real, so
+    -- the analysis gate does not see a position or a title where it expects
+    -- an id. Unknown references stay verbatim so the gate blocks them.
+    local applied_list = applied.tasks or {}
     local ids_by_title = {}
-    for _, task in ipairs(applied.tasks or {}) do
+    local ids_by_index = {}
+    for index, task in ipairs(applied_list) do
       ids_by_title[task.title] = task.id
+      ids_by_index[tostring(index)] = task.id
     end
-    for _, task in ipairs(applied.tasks or {}) do
+    local applied_id = {}
+    for _, task in ipairs(applied_list) do
+      applied_id[task.id] = true
+    end
+    for _, task in ipairs(applied_list) do
       local depends = task.depends_on
       if type(depends) == "table" and #depends > 0 then
         local ids = {}
         for _, dep in ipairs(depends) do
-          ids[#ids + 1] = ids_by_title[dep] or dep
+          if applied_id[dep] then
+            ids[#ids + 1] = dep
+          else
+            ids[#ids + 1] = ids_by_index[dep] or ids_by_title[dep] or dep
+          end
         end
-        deps.state.set_fields(paths.root, task.id, { depends_on = ids })
+        local changed = #ids ~= #depends
+        if not changed then
+          for i, dep in ipairs(depends) do
+            if ids[i] ~= dep then
+              changed = true
+              break
+            end
+          end
+        end
+        if changed then
+          deps.state.set_fields(paths.root, task.id, { depends_on = ids })
+        end
       end
     end
 

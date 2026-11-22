@@ -981,19 +981,68 @@ function M.apply(state, root, result, opts)
   local created = {}
   local current = state.load(root)
 
+  -- Preassign every id before creating any record so a dependency expressed
+  -- as a batch position (e.g. "4") can resolve forward to a task not yet
+  -- created. The preview state accumulates the new ids so next_id keeps
+  -- counting past them.
+  local preassigned = {}
+  local preview = { tasks = {}, ids = {} }
+  for id, task in pairs(current.tasks or {}) do
+    preview.tasks[id] = task
+  end
+  for id, v in pairs(current.ids or current.tasks or {}) do
+    preview.ids[id] = v
+  end
   for i, task in ipairs(result.tasks or {}) do
     local id = task.id
     if not id and type(opts.id_factory) == "function" then
       id = opts.id_factory(i)
     end
     if not id then
-      id = M.next_id(current, opts.date)
+      id = M.next_id(preview, opts.date)
     end
     if type(id) ~= "string" or id == "" then
       return nil, string.format("task %d: cannot assign an id", i)
     end
+    preassigned[i] = id
+    preview.tasks[id] = true
+    preview.ids[id] = true
+  end
+
+  -- Resolution map for depends_on entries: a real task id stays itself, a
+  -- 1-based batch position maps to the preassigned id, a batch title maps to
+  -- that task's id. Anything else is left verbatim so the analysis gate can
+  -- block it with a clear message. Positions are filled first so they win over
+  -- a title that happens to look like one; both lose to an existing id, which
+  -- the loop below checks before consulting this map.
+  local resolve_dep = {}
+  for i, id in ipairs(preassigned) do
+    resolve_dep[tostring(i)] = id
+  end
+  local batch = result.tasks or {}
+  for i, id in ipairs(preassigned) do
+    local title = batch[i] and batch[i].title
+    if title and resolve_dep[title] == nil then
+      resolve_dep[title] = id
+    end
+  end
+
+  for i, task in ipairs(result.tasks or {}) do
+    local id = preassigned[i]
     if current.tasks[id] then
       return nil, "task already exists: " .. id
+    end
+
+    local resolved_depends
+    if #(task.depends_on or {}) > 0 then
+      resolved_depends = {}
+      for _, dep in ipairs(task.depends_on) do
+        if type(dep) == "string" and current.tasks[dep] then
+          resolved_depends[#resolved_depends + 1] = dep
+        else
+          resolved_depends[#resolved_depends + 1] = resolve_dep[dep] or dep
+        end
+      end
     end
 
     local questions = task.questions or {}
@@ -1009,8 +1058,8 @@ function M.apply(state, root, result, opts)
       checks = task.checks,
       status = "draft",
     }
-    if #(task.depends_on or {}) > 0 then
-      record.depends_on = task.depends_on
+    if resolved_depends then
+      record.depends_on = resolved_depends
     end
     if #questions > 0 then
       record.questions = questions
@@ -1051,7 +1100,7 @@ function M.apply(state, root, result, opts)
       origin = task.origin or "",
       files = task.files,
       checks = task.checks,
-      depends_on = task.depends_on or {},
+      depends_on = resolved_depends or {},
       acceptance = task.acceptance or {},
       questions = questions,
     })
