@@ -3362,16 +3362,20 @@ function M.new(deps)
       return { ok = false, error = apply_err }
     end
 
-    -- The qualifier names dependencies by id, batch position or task title;
-    -- the state stores ids. Remap every applied task, scripted or real, so
-    -- the analysis gate does not see a position or a title where it expects
-    -- an id. Unknown references stay verbatim so the gate blocks them.
+    -- The qualifier names dependencies by id, « T<n> » batch position, bare
+    -- batch position or task title; the state stores ids. Remap every applied
+    -- task, scripted or real, so the analysis gate does not see a position or
+    -- a title where it expects an id. Resolution precedence is: exact id of an
+    -- applied task, then « T<n> », then a bare index, then the title. Unknown
+    -- references stay verbatim so the gate blocks them.
     local applied_list = applied.tasks or {}
     local ids_by_title = {}
     local ids_by_index = {}
+    local ids_by_t = {}
     for index, task in ipairs(applied_list) do
       ids_by_title[task.title] = task.id
       ids_by_index[tostring(index)] = task.id
+      ids_by_t["T" .. index] = task.id
     end
     local applied_id = {}
     for _, task in ipairs(applied_list) do
@@ -3385,7 +3389,7 @@ function M.new(deps)
           if applied_id[dep] then
             ids[#ids + 1] = dep
           else
-            ids[#ids + 1] = ids_by_index[dep] or ids_by_title[dep] or dep
+            ids[#ids + 1] = ids_by_t[dep] or ids_by_index[dep] or ids_by_title[dep] or dep
           end
         end
         local changed = #ids ~= #depends
