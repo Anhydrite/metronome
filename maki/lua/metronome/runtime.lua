@@ -1308,7 +1308,16 @@ function M.new(deps)
         if type(reviewed) == "table" and reviewed.escalated then
           reason = string.format("review escalated after %s round(s)", tostring(reviewed.round or "?"))
         end
-        return { ok = false, error = reason, review = reviewed, pr = pr }
+        local failed = { ok = false, error = reason, review = reviewed, pr = pr }
+        -- Propagate the typed contract review.lua hands back: an answer that
+        -- stayed malformed after its replay is `review_invalid`/transient, and
+        -- the failure handlers must hold the task in `reviewing` rather than
+        -- condemn work whose code is committed and whose checks are green.
+        if type(reviewed) == "table" and reviewed.cause ~= nil then
+          failed.cause = reviewed.cause
+          failed.transient = reviewed.transient == true
+        end
+        return failed
       end
 
       -- The SHA the reviewer approved is the one that ships, not the first
@@ -1972,6 +1981,21 @@ function M.new(deps)
   -- a transient failure would loop forever.
   retry_attempts = {}
 
+  -- A malformed review is a format defect, not a verdict. `review.lua` already
+  -- replayed the turn once with the exact defect; when the answer is still
+  -- invalid it hands back `cause = "review_invalid", transient = true`. Marking
+  -- the task failed there would destroy work whose code is committed and whose
+  -- checks are green, so every failure handler (`dispatch_one`, `retry`,
+  -- `resume`) holds the task in its active status instead: no `failed`
+  -- transition, no PR closed, and the branch, worktree, transcript and
+  -- checkpoints stay exactly where the review found them. The task is resumed
+  -- from its checkpoint, not replayed from scratch.
+  local function held_review_invalid(result)
+    return type(result) == "table"
+      and result.cause == "review_invalid"
+      and result.transient == true
+  end
+
   -- Persist a typed failure and decide what happens next. Nothing is
   -- destroyed: the worktree, the branch, the checkpoints and the run directory
   -- stay exactly where the failure found them, and the pull request is left
@@ -1996,6 +2020,34 @@ function M.new(deps)
       or (task and task.phase)
       or "implement"
     local diagnosis = type(result) == "table" and result.diagnosis or nil
+
+    -- An invalid review never transitions the task to failed: the record is
+    -- persisted for the journal, the status is left untouched and nothing is
+    -- cleaned up, so the task resumes from its checkpoint.
+    if held_review_invalid(result) then
+      local held = {
+        cause = "review_invalid",
+        message = message:gsub("%s+", " "):sub(1, 300),
+        remedy = "the review answer stayed malformed after its replay; the task is kept in reviewing, resume it from its checkpoint.",
+        transient = true,
+        attempts = (tonumber(type(prior) == "table" and prior.attempts) or 0) + 1,
+        at = os.time(),
+        phase = phase,
+        held = true,
+      }
+      pcall(deps.state.set_fields, paths.root, task_id, { failure = held })
+      log(paths, "task " .. tostring(task_id) .. " kept in "
+        .. tostring(task and task.status or "reviewing")
+        .. " after an invalid review: " .. held.message)
+      return {
+        ok = false,
+        failure = held,
+        decision = { action = "hold", delay_secs = 0, max_attempts = 0, phase = phase },
+        retrying = false,
+        held = true,
+        reason = held.message,
+      }
+    end
 
     local ropts = recover_opts(cfg)
     ropts.phase = phase
