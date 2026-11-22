@@ -2390,7 +2390,22 @@ auto_deploy = false
           if opts.impl_ok == false then
             return { ok = false, error = opts.impl_error or "implementer crashed" }
           end
-          return { ok = true, ctx = { worktree = "/tmp/wt", branch = "metronome/epic/demo-0001" } }
+          if opts.impl_no_changes then
+            -- `run_impl` reports a benign turn that committed nothing this
+            -- way: `ok = true` with the head still on the fresh base.
+            return {
+              ok = true,
+              no_changes = true,
+              sha = opts.impl_sha or "base123",
+              ctx = { worktree = "/tmp/wt", branch = "metronome/epic/demo-0001" },
+            }
+          end
+          return {
+            ok = true,
+            -- A real repair commits: the branch head moves off the fresh base.
+            sha = opts.impl_sha or "repaired1",
+            ctx = { worktree = "/tmp/wt", branch = "metronome/epic/demo-0001" },
+          }
         end,
         read_sheet = function() return {} end,
       },
@@ -2532,28 +2547,39 @@ auto_deploy = false
     if ref == "origin/main" then saw_main = true end
   end
   eq(saw_main, true, "the repair resolves the fresh base it reconciles onto")
-  -- The push follows the reset and precedes the relaunched merge: the merge
-  -- must see the reconciled history on the remote, not the conflicting one.
-  local reset_at, first_push_after_reset, last_merge_at = nil, nil, nil
+  -- The push follows the implementer: the reset itself stays local, so a
+  -- failed or interrupted turn cannot wipe on `origin` the work the subtasks
+  -- merged. Only a branch the implementer has actually redone is pushed, and
+  -- that push precedes the relaunched merge.
+  local reset_at, impl_at, first_push_after_reset, last_merge_at = nil, nil, nil, nil
   for i, step in ipairs(epic_repair.order) do
     if step == "reset" and not reset_at then reset_at = i end
+    if step == "implement" and not impl_at then impl_at = i end
     if step == "push" and reset_at and not first_push_after_reset then
       first_push_after_reset = i
     end
     if step == "merge" then last_merge_at = i end
   end
-  eq(#epic_repair.pushes >= 1, true, "the rewritten epic branch is pushed")
+  eq(#epic_repair.pushes >= 1, true, "the redone epic branch is pushed")
   eq(reset_at ~= nil and first_push_after_reset ~= nil
     and first_push_after_reset > reset_at, true,
     "the push happens after the reset onto the fresh base")
+  eq(impl_at ~= nil and first_push_after_reset ~= nil
+    and first_push_after_reset > impl_at, true,
+    "the epic branch is not pushed before the implementer has redone it")
   eq(first_push_after_reset ~= nil and last_merge_at ~= nil
     and first_push_after_reset < last_merge_at, true,
     "the push happens before the merge is relaunched")
   eq(epic_repair.order[1], "merge", "the first merge comes before any repair")
-  eq(epic_repair.order[reset_at + 1], "push",
-    "the reset is immediately followed by its push")
-  eq(epic_repair.order[reset_at + 2], "implement",
-    "the implementer turn follows the fresh reset and its push")
+  eq(epic_repair.order[reset_at + 1], "implement",
+    "the fresh reset is immediately followed by the implementer turn")
+  eq(epic_repair.order[reset_at + 2], "push",
+    "the push follows the implementer turn, never the reset")
+  for i, step in ipairs(epic_repair.order) do
+    if step == "push" then
+      eq(i > impl_at, true, "no push happens before the implementer redoes the branch")
+    end
+  end
   eq(epic_repair.record.conflict_retries, 1, "the epic repair is counted")
   eq(epic_repair.record.status, "deployed", "the repaired epic deploys")
   eq(#epic_failed(epic_repair.events), 0,
@@ -2618,6 +2644,37 @@ auto_deploy = false
     "the escalation still names the exact command")
   eq(impl_message:find("implementer turn aborted", 1, true) ~= nil, true,
     "the escalation says why no repair happened")
+  eq(#epic_impl_failed.pushes, 0,
+    "a failed repair turn never pushes: the epic branch on origin keeps its work")
+
+  -- A turn that commits nothing is not a repair either. `run_impl` reports
+  -- `ok = true, no_changes = true` when the tree was already clean; right
+  -- after the reset the branch sits on the fresh base, so relaunching the
+  -- merge would succeed trivially and the epic would deploy without the work
+  -- its subtasks merged. The budget is untouched and the epic escalates.
+  local epic_no_op = epic_conflict_deps(2, 1, { impl_no_changes = true })
+  local rt_epic_no_op = runtime.new(epic_no_op.deps)
+  rt_epic_no_op.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_no_op.run_pending()
+  eq(epic_no_op.impl_calls(), 1, "the no-op repair turn is attempted once")
+  eq(epic_no_op.merge_calls(), 1,
+    "the merge is not relaunched when the branch was not redone")
+  eq(epic_no_op.pr_opens(), 1, "a no-op repair opens no second PR")
+  eq(epic_no_op.record.conflict_retries, nil,
+    "a turn that made no commit does not spend the budget")
+  eq(epic_no_op.record.status, "failed",
+    "an epic whose branch was not redone does not deploy")
+  eq(#epic_no_op.pushes, 0, "an unchanged epic branch is never pushed")
+  local noop_failures = epic_failed(epic_no_op.events)
+  local noop_message = tostring(noop_failures[1] and noop_failures[1].reason or "")
+  eq(noop_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the no-op escalation names the conflicting files")
+  eq(noop_message:find("base123", 1, true) ~= nil, true,
+    "the no-op escalation names the base SHA")
+  eq(noop_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the no-op escalation names the exact command")
+  eq(noop_message:find("no commit", 1, true) ~= nil, true,
+    "the no-op escalation says the branch was not redone")
 
   local epic_escalated = epic_conflict_deps(0, math.huge)
   local rt_epic_escalated = runtime.new(epic_escalated.deps)
