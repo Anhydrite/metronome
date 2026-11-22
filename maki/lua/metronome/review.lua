@@ -720,6 +720,94 @@ local function resolve_task(opts)
   return found, task_id
 end
 
+-- Stale verdicts ---------------------------------------------------------------
+
+-- The statuses a round's own verdict may still land on. `reviewing` is where a
+-- round is dispatched. `changes_requested` is the status that round's own
+-- previous verdict left behind: a retry of the same round belongs to the same
+-- turn, not to another driver. Any other status means the task has been moved
+-- on to something else (re-implemented, merged, failed) and the verdict is
+-- stale.
+local VERDICT_STATUSES = {
+  reviewing = true,
+  changes_requested = true,
+}
+
+-- Where a discarded verdict is logged. `opts.log` wins when the caller has one;
+-- otherwise the line goes to the same runtime.log the pipeline writes, so a
+-- dropped verdict is never silent.
+local function log_line(opts, message)
+  if type(opts.log) == "function" then
+    pcall(opts.log, message)
+    return
+  end
+  if is_non_empty(opts.root) then
+    pcall(fs.append, fs.joinpath(opts.root, "runtime.log"), string.format(
+      "[%s] %s\n", os.date("!%Y-%m-%dT%H:%M:%SZ"), tostring(message)
+    ))
+  end
+end
+
+-- Is this verdict still about the task as it stands?
+--
+-- A verdict belongs to the round that asked for it: the task must still be in
+-- a status that round owns (see VERDICT_STATUSES), and the worktree must still
+-- hold the commit under review. Both are re-read here, from the journal and
+-- from git, never taken from the table the turn started with — another driver
+-- may have moved the task back to `running` (or the branch forward) while this
+-- round was running. Applying such a verdict would only be refused as an
+-- illegal transition, and an internal sequencing defect is not something the
+-- task should fail for. The verdict is journaled as a note and dropped instead.
+--
+-- Returns nil when the verdict is current, or a non-failing result when it is
+-- stale. Nothing is transitioned and no round is stored either way.
+local function discard_if_stale(opts, task_id, reviewed_sha, extra)
+  local state = opts.state
+  local root = opts.root
+
+  local loaded = type(state.load) == "function" and state.load(root) or nil
+  local current = type(loaded) == "table" and type(loaded.tasks) == "table"
+    and loaded.tasks[task_id] or nil
+  local status = type(current) == "table" and is_non_empty(current.status)
+    and tostring(current.status) or "unknown"
+
+  local head = opts.git.head_sha(opts.worktree)
+  if not is_non_empty(head) then
+    head = "unknown"
+  end
+
+  if VERDICT_STATUSES[status] == true and head == tostring(reviewed_sha) then
+    return nil
+  end
+
+  local text = string.format(
+    "stale review verdict discarded: status=%s, sha=%s vs %s",
+    status, head, tostring(reviewed_sha)
+  )
+  local appended, aerr = state.append(root, {
+    kind = "note",
+    task_id = task_id,
+    text = text,
+  })
+  log_line(opts, text)
+
+  local result = {
+    ok = true, stale = true, discarded = true,
+    status = status, current_sha = head, sha = reviewed_sha,
+  }
+  if not appended then
+    result.note_error = aerr or "cannot append the stale verdict note"
+  end
+  if type(extra) == "table" then
+    for key, value in pairs(extra) do
+      if result[key] == nil then
+        result[key] = value
+      end
+    end
+  end
+  return result
+end
+
 -- The sheet is what qualification wrote. A caller may pass it directly; when
 -- it does not, it is read from tasks_dir (or root/tasks), and a missing sheet
 -- degrades to a minimal one rather than a crash.
@@ -775,6 +863,10 @@ local function review_impl(opts)
     return { ok = false, error = sherr or "cannot read HEAD" }
   end
 
+  -- A caller that dispatched this round may name the commit it means to review.
+  -- Without one, the commit the round is about is the HEAD read above.
+  local reviewed_sha = is_non_empty(opts.sha) and tostring(opts.sha) or sha
+
   local previous = type(task.review) == "table" and task.review or {}
   local round = (tonumber(previous.round) or 0) + 1
   local max_rounds = tonumber(opts.max_rounds) or tonumber(previous.max_rounds) or DEFAULT_MAX_ROUNDS
@@ -782,6 +874,16 @@ local function review_impl(opts)
     max_rounds = DEFAULT_MAX_ROUNDS
   end
   max_rounds = math.floor(max_rounds)
+
+  -- The round is about to spend a model turn (or to decide a protected path
+  -- without one). Before any of that, check that the task is still in the round
+  -- this verdict would belong to: a task another driver re-dispatched is not.
+  local stale = discard_if_stale(opts, task_id, reviewed_sha, {
+    round = round, sha = reviewed_sha,
+  })
+  if stale then
+    return stale
+  end
 
   local base = opts.base or task.base_ref or "main"
   local changed, cerr = opts.git.changed_files(worktree, base, { three_dot = true })
@@ -921,6 +1023,17 @@ local function review_impl(opts)
       error = string.format("branch moved during review: %s -> %s", sha, after_sha),
       round = round, sha = sha, run = run,
     }
+  end
+
+  -- Same guard, once more, right before the verdict is applied: the model turn
+  -- may have taken long enough for the task to be re-dispatched. A stale verdict
+  -- is dropped, not applied, so it can never be refused as an illegal
+  -- transition.
+  local stale_after = discard_if_stale(opts, task_id, reviewed_sha, {
+    round = round, sha = reviewed_sha, findings = findings, run = run,
+  })
+  if stale_after then
+    return stale_after
   end
 
   local stored, serr = M.store(opts.state, root, task_id, {
