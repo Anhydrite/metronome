@@ -15,9 +15,7 @@ return function()
   local state = load_module("state")
   local checks = load_module("checks")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "merge")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("merge")
 
   local remote = maki.fs.joinpath(base, "remote.git")
   local repo = maki.fs.joinpath(base, "repo")

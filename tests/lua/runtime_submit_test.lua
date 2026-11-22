@@ -1042,9 +1042,7 @@ return function()
   has(table.concat(auto_deleted, ","), "metronome/abandonme", "abandon deletes the dead branch")
 
   -- config: a base branch that does not exist on origin is refused ----------
-  local cfg_root = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "runtime-config")
-  maki.fs.rm(cfg_root, { recursive = true })
-  maki.fs.mkdir(cfg_root, { parents = true })
+  local cfg_root = test_base("runtime-config")
   local cfg_path = maki.fs.joinpath(cfg_root, "config.toml")
   maki.fs.write(cfg_path, [[
 [project]

@@ -16,9 +16,7 @@ return function()
   local state = load_module("state")
   local fence = load_module("fence")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "review")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("review")
 
   local repo = maki.fs.joinpath(base, "repo")
   local root = maki.fs.joinpath(base, "state")

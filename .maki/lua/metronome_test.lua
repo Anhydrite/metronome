@@ -11,7 +11,67 @@
 --     so init.lua loads this file with loadstring instead of require.
 
 local cwd = maki.uv.cwd()
-local results_path = maki.fs.joinpath(cwd, "tests", "lua-results.txt")
+
+-- Isolation token. init.lua resolves it once (MAKI_TEST_TOKEN, or a
+-- process-local suffix when the variable is absent) and passes it in as
+-- test_token_value, so the error file and these results always land in the same
+-- <state_dir>/metronome-tests/<token>/ directory. Resolving it again here keeps
+-- this file usable on its own.
+-- Process-local suffix used when MAKI_TEST_TOKEN is absent (a test file or the
+-- harness run on its own). The pid keeps it unique; the fallback stays numeric
+-- and seed-free of odd characters, because it ends up as a directory name.
+local function local_test_suffix()
+  local pid
+  if type(maki.uv) == "table" then
+    for _, name in ipairs({ "os_getpid", "getpid" }) do
+      local fn = maki.uv[name]
+      if type(fn) == "function" then
+        local ok, value = pcall(fn)
+        if ok and value then pid = tonumber(value) or pid; break end
+      end
+    end
+  end
+  pid = pid or 0
+  math.randomseed(os.time() + pid)
+  return string.format("local-%d-%d-%d", pid, os.time(), math.random(0, 999999))
+end
+
+local function resolve_test_token()
+  if type(test_token_value) == "string" and test_token_value ~= "" then
+    return test_token_value
+  end
+  -- maki.env only exposes state_dir/config_dir/logs_dir/legacy_dir, so reading
+  -- the token goes through maki.env.get when it exists, then uv.os_getenv.
+  local readers = {}
+  if type(maki.env) == "table" and type(maki.env.get) == "function" then
+    readers[#readers + 1] = maki.env.get
+  end
+  if type(maki.uv) == "table" and type(maki.uv.os_getenv) == "function" then
+    readers[#readers + 1] = maki.uv.os_getenv
+  end
+  for _, reader in ipairs(readers) do
+    local ok, value = pcall(reader, "MAKI_TEST_TOKEN")
+    if ok and type(value) == "string" and value ~= "" then
+      return value
+    end
+  end
+  return local_test_suffix()
+end
+
+local TEST_TOKEN = resolve_test_token()
+local test_dir = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", TEST_TOKEN)
+maki.fs.mkdir(test_dir, { parents = true })
+local results_path = maki.fs.joinpath(test_dir, "lua-results.txt")
+
+-- test_base(label): the directory a test file uses for its throwaway state. It
+-- lives under this run's token, so a concurrent run has its own, and it starts
+-- empty so a rerun is not polluted by the previous one.
+local function test_base(label)
+  local base = maki.fs.joinpath(test_dir, label)
+  maki.fs.rm(base, { recursive = true })
+  maki.fs.mkdir(base, { parents = true })
+  return base
+end
 
 -- maki ships a small test harness; use it as the assertion layer rather than
 -- inventing a second one. It wraps each case in pcall and reports at the end.
@@ -92,6 +152,8 @@ local function run_file(path)
     emit = emit,
     mktmpdir = helpers.mktmpdir,
     rmtree = helpers.rmtree,
+    test_base = test_base,
+    test_token = function() return TEST_TOKEN end,
   }
   setfenv(chunk, setmetatable(env, { __index = _G }))
   local okrun, body = pcall(chunk)

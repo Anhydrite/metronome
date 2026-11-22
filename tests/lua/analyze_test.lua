@@ -9,9 +9,7 @@ return function()
   local analyze = load_module("analyze")
   local state = load_module("state")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "analyze")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("analyze")
 
   local root = maki.fs.joinpath(base, "state")
 

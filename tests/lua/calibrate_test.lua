@@ -8,9 +8,7 @@
 return function()
   local c = load_module("calibrate")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "calibrate")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("calibrate")
 
   local repo = maki.fs.joinpath(base, "repo")
   local function put(rel, text)

@@ -10,8 +10,7 @@
 return function()
   local q = load_module("qualify")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "qualify-schema")
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("qualify-schema")
   local validate_tmp = maki.fs.joinpath(base, "validate-tmp")
 
   -- task_projection ---------------------------------------------------------

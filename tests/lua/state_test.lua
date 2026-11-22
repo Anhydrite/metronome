@@ -6,17 +6,7 @@ return function()
   local state = load_module("state")
 
   local function tmp_root(label)
-    local base = maki.env.state_dir()
-    local root = maki.fs.joinpath(base, "metronome-tests", label)
-    -- Start clean so a rerun is not polluted by the previous one.
-    local entries = maki.fs.dir(root)
-    if entries then
-      for _, e in ipairs(entries) do
-        maki.fs.rm(maki.fs.joinpath(root, e[1]), { recursive = true })
-      end
-    end
-    maki.fs.mkdir(root, { parents = true })
-    return root
+    return test_base(label)
   end
 
   -- Transitions -------------------------------------------------------------

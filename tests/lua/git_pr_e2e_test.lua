@@ -17,9 +17,7 @@ return function()
   local git = load_module("git")
   local state = load_module("state")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "git-pr-e2e")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("git-pr-e2e")
 
   local remote = maki.fs.joinpath(base, "remote.git")
   local repo = maki.fs.joinpath(base, "repo")
