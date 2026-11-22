@@ -303,6 +303,92 @@ return function()
     "qualify.apply receives the epic branch")
   eq(epic_opts and epic_opts.base, "main", "qualify.apply receives the project base")
 
+  -- Qualification remaps dependency batch positions to task ids ------------
+
+  local set_fields_idx = {}
+  local deps2b = {
+    config = {
+      load = function()
+        return { project = { repo = "/tmp/repo", base_ref = "main" } }
+      end,
+    },
+    roles = {
+      session_opts = function()
+        return { system = "", model_spec = "test/model", thinking = "low", tools = {} }
+      end,
+    },
+    qualify = {
+      run = function()
+        return { ok = true, tasks = {
+          { title = "Alpha", intent = "a", files = { "a" }, checks = {}, acceptance = {}, depends_on = {} },
+          { title = "Beta", intent = "b", files = { "b" }, checks = {}, acceptance = {}, depends_on = { "2" } },
+        } }
+      end,
+      next_id = function()
+        return "T-1"
+      end,
+      apply = function()
+        return { ok = true, tasks = {
+          { id = "T-1", title = "Alpha" },
+          { id = "T-2", title = "Beta", depends_on = { "2" } },
+        } }
+      end,
+    },
+    questions = {
+      round = function()
+        return nil
+      end,
+    },
+    analyze = {
+      gate = function()
+        return { ok = true }
+      end,
+    },
+    pipeline = {
+      tick = function()
+        return { ok = true, started = {} }
+      end,
+    },
+    state = {
+      load = function()
+        return { tasks = {} }
+      end,
+      set_fields = function(_, id, fields)
+        set_fields_idx[id] = fields
+        return { id = id }
+      end,
+    },
+    paths = function()
+      return paths
+    end,
+    spawn = function(fn)
+      fn()
+    end,
+    wait_turn_end = false,
+    runner = {}, checks = {}, converge = {}, review = {}, merge = {},
+    deploy = {}, calibrate = {}, fence = {}, mode = {},
+    git = {
+      branch_create = function(repo, name, from_ref)
+        return { ok = true, branch = name, created = true }
+      end,
+      push_branch = function()
+        return true
+      end,
+    },
+    implement = { slug = function(text, max)
+      local out = tostring(text):lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+      if max and #out > max then out = out:sub(1, max):gsub("%-+$", "") end
+      return out
+    end },
+  }
+  local rt2b = runtime.new(deps2b)
+  rt2b.submit({ intention = "x", fast = false }, ctx)
+  rt2b.run_pending()
+  eq(set_fields_idx["T-2"] and set_fields_idx["T-2"].depends_on
+    and set_fields_idx["T-2"].depends_on[1], "T-2",
+    "dependency batch positions are remapped to task ids")
+
+
   -- Retry re-dispatches the task -------------------------------------------
 
   local implemented = false
