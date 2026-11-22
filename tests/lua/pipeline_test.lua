@@ -1,9 +1,10 @@
 -- Tests for maki/lua/metronome/pipeline.lua (REQ-20261114-39).
 --
--- The scheduler is pure: dependencies, file overlap, max_parallel, stall
--- detection and resume are decisions over the projection. The integration
--- cases use the real state module on a throwaway root, so a resume is proven
--- to walk only legal transitions.
+-- The scheduler is pure: dependencies, max_parallel, the runs-alone rule,
+-- stall detection and resume are decisions over the projection. Declared
+-- files never serialize tasks: each task has its own worktree and conflicts
+-- resolve at merge. The integration cases use the real state module on a
+-- throwaway root, so a resume is proven to walk only legal transitions.
 
 return function()
   local pipeline = load_module("pipeline")
@@ -74,18 +75,17 @@ return function()
   eq(met, false, "a missing dependency is not met")
   eq(reason:find("missing dependency", 1, true) ~= nil, true, "the reason names the missing dependency")
 
-  -- file overlap -----------------------------------------------------------
+  -- schedule: same file is not a conflict ----------------------------------
 
-  local a = task("T-a", "ready", { files = { "src/a.lua", "README.md" } })
-  local b = task("T-b", "ready", { files = { "src/b.lua" } })
-  local c = task("T-c", "ready", { files = { "README.md" } })
-  eq(pipeline.overlaps(a, b), false, "disjoint files do not overlap")
-  eq(pipeline.overlaps(a, c), true, "a shared file overlaps")
-  -- An undeclared file set is an unknown blast radius: it overlaps everything,
-  -- so it runs alone.
-  eq(pipeline.overlaps(a, task("T-x", "ready")), true, "an undeclared file set overlaps a declared one")
-  eq(pipeline.overlaps(task("T-x", "ready"), task("T-y", "ready")), true,
-    "two undeclared file sets overlap")
+  -- Two ready tasks declaring the same file are selected together: each task
+  -- has its own branch and worktree, conflicts resolve at merge.
+  local same_file = {
+    task("T-a", "ready", { files = { "src/shared.lua" } }),
+    task("T-b", "ready", { files = { "src/shared.lua" } }),
+  }
+  local started, skipped = pipeline.schedule(same_file, {}, { max_parallel = 2 })
+  eq(#started, 2, "two tasks sharing a file are both selected")
+  eq(#skipped, 0, "sharing a file produces no skip")
 
   -- schedule: max_parallel -------------------------------------------------
 
@@ -94,7 +94,7 @@ return function()
     task("T-2", "ready", { files = { "src/2" } }),
     task("T-3", "ready", { files = { "src/3" } }),
   }
-  local started, skipped = pipeline.schedule(tasks, {}, { max_parallel = 2 })
+  started, skipped = pipeline.schedule(tasks, {}, { max_parallel = 2 })
   eq(#started, 2, "max_parallel caps the selection")
   eq(started[1].id, "T-1", "the first task starts")
   eq(started[2].id, "T-2", "the second task starts")
@@ -102,21 +102,53 @@ return function()
   eq(skipped[1].id, "T-3", "the skipped task is named")
   eq(skipped[1].reason:find("max_parallel", 1, true) ~= nil, true, "the skip reason is max_parallel")
 
-  -- schedule: file overlap with a running task -----------------------------
+  -- schedule: a running task never blocks on files -------------------------
 
   local running = { task("T-run", "running", { files = { "src/1" } }) }
-  started, skipped = pipeline.schedule(tasks, running, { max_parallel = 3 })
-  eq(#started, 2, "a running task leaves two slots")
-  eq(started[1].id, "T-2", "the overlapping task is not started")
-  eq(started[2].id, "T-3", "the disjoint task starts")
-  local overlap_reason
-  for _, item in ipairs(skipped) do
-    if item.id == "T-1" then
-      overlap_reason = item.reason
-    end
-  end
-  eq(type(overlap_reason), "string", "the overlapping task is skipped")
-  eq(overlap_reason:find("files overlap", 1, true) ~= nil, true, "the skip reason is file overlap")
+  started, skipped = pipeline.schedule(tasks, running, { max_parallel = 4 })
+  eq(#started, 3, "a running task leaves room for every ready task")
+  eq(started[1].id, "T-1", "the task sharing a file with the running one starts")
+  eq(#skipped, 0, "no task is skipped for file overlap")
+
+  -- schedule: runs-alone rule for an undeclared file set -------------------
+
+  local with_lonely = {
+    task("T-1", "ready", { files = { "src/1" } }),
+    task("T-2", "ready"),
+  }
+  started, skipped = pipeline.schedule(with_lonely, {}, { max_parallel = 2 })
+  eq(#started, 1, "a task with no declared files does not run beside another")
+  eq(started[1].id, "T-1", "the declared task is selected")
+  eq(#skipped, 1, "the undeclared task is skipped")
+  eq(skipped[1].id, "T-2", "the skipped task is named")
+  eq(skipped[1].reason:find("runs alone", 1, true) ~= nil, true,
+    "the skip reason is the runs-alone rule")
+
+  -- The runs-alone rule holds in both orderings: an undeclared task that sorts
+  -- before a declared one must not be selected alongside it.
+  started, skipped = pipeline.schedule({
+    task("T-a", "ready"),
+    task("T-b", "ready", { files = { "src/b" } }),
+  }, {}, { max_parallel = 2 })
+  eq(#started, 1, "an undeclared task listed first does not run beside a declared one")
+  eq(started[1].id, "T-b", "the declared task is selected")
+  eq(#skipped, 1, "the undeclared task is skipped")
+  eq(skipped[1].id, "T-a", "the skipped task is named")
+  eq(skipped[1].reason:find("runs alone", 1, true) ~= nil, true,
+    "the skip reason is the runs-alone rule")
+
+  started, skipped = pipeline.schedule({ task("T-solo", "ready") }, {}, { max_parallel = 2 })
+  eq(#started, 1, "a lone task with no declared files starts")
+  eq(#skipped, 0, "a lone undeclared task is not skipped")
+
+  -- The same rule holds against a task already in flight, not only against one
+  -- selected in this pass.
+  local in_flight = { task("T-run", "running", { files = { "src/1" } }) }
+  started, skipped = pipeline.schedule({ task("T-solo", "ready") }, in_flight, { max_parallel = 4 })
+  eq(#started, 0, "an undeclared task does not start beside an in-flight task")
+  eq(#skipped, 1, "the undeclared task is skipped")
+  eq(skipped[1].reason:find("runs alone", 1, true) ~= nil, true,
+    "the skip reason is the runs-alone rule")
 
   -- schedule: dependencies -------------------------------------------------
 
