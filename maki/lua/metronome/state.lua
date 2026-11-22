@@ -106,6 +106,58 @@ local function now_iso()
   return os.date("!%Y-%m-%dT%H:%M:%SZ")
 end
 
+-- The exact keys a persisted failure may carry. `recover.record` builds the
+-- diagnosis and also carries `retryable`/`remediable`, which belong to the
+-- decision it feeds, not to the task: the task schema pins the failure object
+-- to these eight fields with additionalProperties = false. Filtering here is
+-- what keeps any caller — recover, a test, the panel — from writing a journal
+-- the schema refuses.
+local FAILURE_KEYS = {
+  "cause",
+  "message",
+  "remedy",
+  "transient",
+  "attempts",
+  "at",
+  "next_retry_at",
+  "phase",
+}
+
+-- Reduce whatever the caller handed us to the documented failure shape.
+-- Returns nil when there is nothing to persist, so a bogus `failure = {}` is
+-- never mistaken for a diagnosis.
+local function normalize_failure(failure)
+  if type(failure) ~= "table" then
+    return nil
+  end
+  local out = {}
+  for _, key in ipairs(FAILURE_KEYS) do
+    local value = failure[key]
+    if value ~= nil then
+      out[key] = value
+    end
+  end
+  if next(out) == nil then
+    return nil
+  end
+  return out
+end
+
+-- Statuses that mean the pipeline got moving again after a failure. They do not
+-- forget the last cause — the cause is what makes the next failure readable and
+-- the remedy actionable — but the pending retry is over: nothing waits for a
+-- deadline any more, and the attempt budget starts again from zero.
+local RESUME_STATUSES = { running = true, verifying = true, reviewing = true, merged = true }
+
+local function settle_failure(task)
+  local failure = task.failure
+  if type(failure) ~= "table" then
+    return
+  end
+  failure.next_retry_at = nil
+  failure.attempts = 0
+end
+
 -- Paths ---------------------------------------------------------------------
 
 function M.paths(root)
@@ -193,6 +245,13 @@ function M.replay(text)
             if type(event.reason) == "string" and event.reason ~= "" then
               task.failure_reason = event.reason
             end
+            -- A failure is only rewritten by a failure event: branch, worktree,
+            -- checkpoints and run_dir are never touched here, so a task that
+            -- fails keeps every artefact a resume needs. Only `delete` drops a
+            -- task, and with it those fields.
+            if RESUME_STATUSES[event.status] then
+              settle_failure(task)
+            end
           elseif event.kind == "field" then
             for k, v in pairs(event.fields or {}) do
               task[k] = v
@@ -209,7 +268,11 @@ function M.replay(text)
   return state
 end
 
--- Append one event and refresh the projection.
+-- Append one event, or a list of events, and refresh the projection.
+--
+-- A list is written in a single append so a transition that carries both a
+-- field patch and the status move cannot land half-written between the two:
+-- either every line is in the journal, or only a torn tail that replay drops.
 --
 -- The lock is advisory: maki's sandbox has no `io` and no flock, so there is
 -- no atomic exclusive create. What actually protects the journal is its shape:
@@ -217,7 +280,16 @@ end
 -- at most the event being written, never the history before it.
 function M.append(root, event)
   local p = M.ensure(root)
-  event.at = event.at or now_iso()
+  local events = event
+  if type(events) ~= "table" or type(events[1]) ~= "table" then
+    events = { event }
+  end
+  local at = now_iso()
+  local lines = {}
+  for _, one in ipairs(events) do
+    one.at = one.at or at
+    lines[#lines + 1] = json.encode(one)
+  end
 
   local lock_ok = true
   local locked = fs.write(p.lock, tostring(os.time()))
@@ -225,8 +297,7 @@ function M.append(root, event)
     lock_ok = false
   end
 
-  local line = json.encode(event)
-  local ok, err = fs.append(p.journal, line .. "\n")
+  local ok, err = fs.append(p.journal, table.concat(lines, "\n") .. "\n")
   if not ok then
     if lock_ok then
       fs.rm(p.lock)
@@ -510,6 +581,7 @@ function M.archived(root)
 end
 
 function M.transition(root, task_id, to, extra)
+  extra = type(extra) == "table" and extra or {}
   local state = M.load(root)
   local task = state.tasks[task_id]
   if not task then
@@ -526,16 +598,38 @@ function M.transition(root, task_id, to, extra)
       task.status, to, task_id, task.status, hint
     )
   end
-  local event = {
+
+  local events = {}
+  if extra.failure ~= nil then
+    if type(extra.failure) ~= "table" then
+      return nil, "failure must be a table for " .. task_id
+    end
+    local failure = normalize_failure(extra.failure)
+    if not failure then
+      return nil, "failure is empty for " .. task_id
+    end
+    -- The typed diagnosis travels with the status move, so the failure the
+    -- panel shows and the failure a resume acts on are the same record, written
+    -- once. It goes in a field event because the journal's status event has no
+    -- slot for a structured payload; both events land in one append, so a
+    -- reader never sees the move without its diagnosis.
+    events[#events + 1] = {
+      kind = "field",
+      task_id = task_id,
+      fields = { failure = failure },
+    }
+  end
+  -- A failure without a reason is a dead end for the user: persist it so
+  -- the journal, the projection and the panel all carry it.
+  events[#events + 1] = {
     kind = "status",
     task_id = task_id,
     status = to,
-    phase = extra and extra.phase or nil,
-    -- A failure without a reason is a dead end for the user: persist it so
-    -- the journal, the projection and the panel all carry it.
-    reason = extra and extra.reason or nil,
+    phase = extra.phase or nil,
+    reason = extra.reason or nil,
   }
-  local new_state, err = M.append(root, event)
+
+  local new_state, err = M.append(root, events)
   if not new_state then
     return nil, err
   end
@@ -556,6 +650,43 @@ function M.set_fields(root, task_id, fields)
     return nil, err
   end
   return new_state.tasks[task_id]
+end
+
+-- Resume helpers --------------------------------------------------------------
+
+-- The typed failure a task carries, or nil. Never raises: an old projection
+-- with no failure, or a bare string where a diagnosis should be, reads as nil
+-- so a caller can branch on "is there something to act on?".
+function M.failure_of(task)
+  if type(task) ~= "table" then
+    return nil
+  end
+  local failure = task.failure
+  if type(failure) ~= "table" or next(failure) == nil then
+    return nil
+  end
+  return failure
+end
+
+-- The last checkpoint written before an implementation turn, or nil. That sha
+-- is the stable state a retry resumes from, which is why it must survive the
+-- failure that interrupted the turn.
+function M.checkpoint_of(task)
+  if type(task) ~= "table" then
+    return nil
+  end
+  local checkpoints = task.checkpoints
+  if type(checkpoints) ~= "table" then
+    return nil
+  end
+  local last = checkpoints[#checkpoints]
+  if type(last) == "table" then
+    last = last.sha
+  end
+  if type(last) ~= "string" or last == "" then
+    return nil
+  end
+  return last
 end
 
 return M
