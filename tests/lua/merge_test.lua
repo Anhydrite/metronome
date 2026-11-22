@@ -451,6 +451,92 @@ return function()
   eq(res6 and res6.rebase and res6.rebase.skipped, true, "run skipped the rebase")
   eq(state.load(root).tasks[id6].status, "merged", "task merged without a rebase")
 
+  -- run: a rebase conflict is a repairable result, not a failure -------------
+
+  -- A rebase conflict used to write `failed` before the runtime could decide:
+  -- the task never went back to implement, so the same commit was replayed on
+  -- the same lines and the same conflict came back. The conflict must now be
+  -- returned whole, the status left alone, and the escalation must name the
+  -- files, the base (with its SHA), the command and the faulty commit.
+  local wt8, id8 = seed_branch()
+  local task8 = seed_task(id8, wt8)
+  maki.fs.write(maki.fs.joinpath(wt8, "README.md"), "# branch edit for conflict\n")
+  local csha8, cserr8 = git.commit(wt8, "feat: branch edit for conflict")
+  eq(cserr8, nil, "conflict branch commit: " .. tostring(cserr8))
+  eq(type(csha8), "string", "conflict branch commit returns a sha")
+
+  local conflict_main_sha = advance_main("README.md", "# main edit for conflict\n")
+
+  maki.fs.rm(failfile)
+  maki.fs.write(log, "")
+
+  local res8 = merge.run({
+    task = task8,
+    repo = repo,
+    worktree = wt8,
+    root = root,
+    git = git,
+    state = state,
+    gh = gh,
+    checks = checks,
+    commands = { "true" },
+    pr = 42,
+    base = "main",
+    remote = "origin",
+  })
+  eq(res8 and res8.ok, false, "a conflicting rebase is not ok")
+  eq(res8 and res8.conflict, true, "a conflicting rebase is flagged as a conflict")
+  eq(type(res8 and res8.conflict_files), "string", "conflict_files is a joined string")
+  has(res8 and res8.conflict_files, "README.md", "conflict_files names the file")
+  eq(type(res8 and res8.conflict_hunks), "table", "conflict_hunks is returned")
+  eq(res8 and res8.conflict_hunks and res8.conflict_hunks[1]
+    and res8.conflict_hunks[1].file, "README.md", "the first hunk names its file")
+  has(res8 and res8.conflict_hunks and res8.conflict_hunks[1]
+    and res8.conflict_hunks[1].text or "", "<<<<<<<", "the hunk keeps the conflict markers")
+  eq(type(res8 and res8.conflict_commit), "string", "conflict_commit is returned")
+  eq(res8 and res8.upstream, "origin/main", "the conflict names the upstream base")
+  eq(res8 and res8.rebase_command, "git rebase origin/main", "the conflict names the exact command")
+  eq(res8 and res8.base, "main", "the conflict names the base")
+  eq(res8 and res8.base_sha, conflict_main_sha, "the conflict carries the base SHA")
+  eq(type(res8 and res8.escalation), "string", "an escalation message is produced")
+  has(res8 and res8.escalation, "README.md", "the escalation names the files")
+  has(res8 and res8.escalation, "origin/main", "the escalation names the base")
+  has(res8 and res8.escalation, "git rebase origin/main", "the escalation names the command")
+  has(res8 and res8.escalation, conflict_main_sha, "the escalation names the base SHA")
+  has(res8 and res8.escalation, res8 and res8.conflict_commit or "", "the escalation names the commit")
+
+  -- No `failed` write for a repairable conflict: the task stays in merge so the
+  -- runtime can send it back to implement with the files in hand.
+  local after8 = state.load(root).tasks[id8]
+  eq(after8 and after8.status, "merging", "a conflicting rebase leaves the status merging")
+  local failed_note8, conflict_note8 = false, false
+  for _, note in ipairs(after8 and after8.notes or {}) do
+    if type(note) == "string" then
+      if note:find("merge failed", 1, true) then failed_note8 = true end
+      if note:find("merge conflict", 1, true) then conflict_note8 = true end
+    end
+  end
+  eq(failed_note8, false, "a repairable conflict writes no failure note")
+  eq(conflict_note8, true, "the conflict is journaled as a note")
+  eq(read_log(), "", "a conflicting rebase does not touch the PR")
+
+  -- escalation: names what a human needs --------------------------------------
+
+  local esc = merge.escalation({
+    conflict = { "docs/configuration.md", "src/app.lua" },
+    upstream = "origin/main",
+    rebase_command = "git rebase origin/main",
+    base_sha = "0123456789abcdef0123456789abcdef01234567",
+    conflict_commit = "59738f2aa1b2c3d4e5f60718293a4b5c6d7e8f90",
+  })
+  has(esc, "docs/configuration.md", "escalation names the first file")
+  has(esc, "src/app.lua", "escalation names the second file")
+  has(esc, "origin/main", "escalation names the base")
+  has(esc, "git rebase origin/main", "escalation names the command")
+  has(esc, "0123456789abcdef0123456789abcdef01234567", "escalation names the base SHA")
+  has(esc, "59738f2aa1b2c3d4e5f60718293a4b5c6d7e8f90", "escalation names the faulty commit")
+  eq(esc:find("rebase failed", 1, true), nil, "escalation is not the bare rebase-failed text")
+
   -- run: refusals -------------------------------------------------------------
 
   local no_pr = merge.run({

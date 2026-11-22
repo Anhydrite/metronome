@@ -113,11 +113,97 @@ function M.rebase(opts)
   local sha, rerr, info = git.rebase(opts.worktree, upstream)
   if not sha then
     -- A conflict is not a generic failure: the caller can repair it by moving
-    -- the branch back to the fresh base and redoing the work there.
-    return nil, rerr, { conflict = info and info.conflict or nil }
+    -- the branch back to the fresh base and redoing the work there. Every
+    -- detail git gave (files, hunks, the commit it could not replay) is handed
+    -- back untouched; what git did not say stays nil rather than invented.
+    info = type(info) == "table" and info or {}
+    return nil, rerr, {
+      conflict = info.conflict,
+      hunks = info.hunks,
+      commit = info.commit,
+      upstream = is_non_empty(info.upstream) and info.upstream or upstream,
+      command = is_non_empty(info.command) and info.command or ("git rebase " .. upstream),
+    }
   end
 
   return { ok = true, base = upstream, sha = sha }
+end
+
+-- Conflict escalation --------------------------------------------------------
+
+-- Reading state.jsonl is not free and the conflict hunks can be long: keep a
+-- bounded amount per file so a journal note stays readable and a note written
+-- on every repair cannot inflate the journal without limit.
+local MAX_HUNK_LINES_PER_FILE = 80
+
+-- Cap the hunks per file, marking the truncation instead of silently dropping
+-- lines: the implementer must know the excerpt is partial.
+local function cap_hunks(hunks)
+  if type(hunks) ~= "table" then
+    return nil
+  end
+  local out = {}
+  local used = {}
+  local truncated = {}
+  for _, hunk in ipairs(hunks) do
+    if type(hunk) == "table" then
+      local file = is_non_empty(hunk.file) and hunk.file or "unknown"
+      local count = used[file] or 0
+      local kept = {}
+      local cut = false
+      for line in (tostring(hunk.text or "") .. "\n"):gmatch("(.-)\n") do
+        if count >= MAX_HUNK_LINES_PER_FILE then
+          cut = true
+          break
+        end
+        kept[#kept + 1] = line
+        count = count + 1
+      end
+      used[file] = count
+      local text = table.concat(kept, "\n")
+      if cut and not truncated[file] then
+        text = text .. "\n... (conflict hunks truncated at "
+          .. MAX_HUNK_LINES_PER_FILE .. " lines)"
+        truncated[file] = true
+      end
+      out[#out + 1] = { file = file, start = hunk.start, text = text }
+    end
+  end
+  return #out > 0 and out or nil
+end
+
+-- A conflict beyond the repair bound must reach a human with the means to act
+-- on it: the files, the base (with the actual SHA), the exact command and the
+-- commit that could not be replayed. A bare "rebase failed" leaves the reader
+-- to reconstruct all of that from git's raw output.
+function M.escalation(result)
+  result = type(result) == "table" and result or {}
+
+  local files = result.conflict_files
+  if not is_non_empty(files) and type(result.conflict) == "table" then
+    files = table.concat(result.conflict, ", ")
+  end
+  if not is_non_empty(files) then
+    files = "unknown"
+  end
+
+  local upstream = is_non_empty(result.upstream) and result.upstream or "origin/main"
+  local command = is_non_empty(result.rebase_command) and result.rebase_command
+    or ("git rebase " .. upstream)
+  local base = upstream
+  if is_non_empty(result.base_sha) then
+    base = string.format("%s (%s)", upstream, result.base_sha)
+  end
+
+  local parts = {
+    string.format("rebase conflict on %s cannot be repaired automatically", base),
+    "files: " .. files,
+    "command: `" .. command .. "`",
+  }
+  if is_non_empty(result.conflict_commit) then
+    parts[#parts + 1] = "commit: " .. result.conflict_commit
+  end
+  return table.concat(parts, "; ")
 end
 
 -- Merge the PR ---------------------------------------------------------------
@@ -388,13 +474,72 @@ local function run_impl(opts)
   })
   if not rebase then
     local conflict = rinfo and rinfo.conflict or nil
+    local repairable = type(conflict) == "table" and #conflict > 0
+
+    -- A rebase conflict is a repairable result, not a failure: the branch can
+    -- be moved back to the fresh base and the work redone there. Writing
+    -- `failed` here would decide the task's fate before the runtime can, and
+    -- the repair details would arrive too late to be acted on. The status is
+    -- left untouched (`merging`) and the full conflict is returned.
+    if repairable then
+      local upstream = is_non_empty(rinfo.upstream) and rinfo.upstream
+        or (remote .. "/" .. base)
+      local base_sha = nil
+      if type(git.rev_parse) == "function" then
+        base_sha = git.rev_parse(worktree, upstream)
+      end
+      local details = {
+        conflict = true,
+        conflict_files = table.concat(conflict, ", "),
+        conflict_hunks = cap_hunks(rinfo.hunks),
+        conflict_commit = is_non_empty(rinfo.commit) and rinfo.commit or nil,
+        base = base,
+        base_sha = is_non_empty(base_sha) and base_sha or nil,
+        upstream = upstream,
+        rebase_command = is_non_empty(rinfo.command) and rinfo.command
+          or ("git rebase " .. upstream),
+      }
+      details.escalation = M.escalation(details)
+
+      -- Journal the conflict (files, hunks, base, command) without touching
+      -- the status: the repair re-enters implement on the fresh base.
+      if type(state.append) == "function" then
+        local lines = { "merge conflict (repairable): " .. details.escalation }
+        for _, hunk in ipairs(details.conflict_hunks or {}) do
+          lines[#lines + 1] = string.format("--- %s:%s\n%s",
+            tostring(hunk.file), tostring(hunk.start), tostring(hunk.text))
+        end
+        pcall(state.append, root, {
+          kind = "note",
+          task_id = id,
+          text = table.concat(lines, "\n"),
+        })
+      end
+
+      return {
+        ok = false,
+        error = rerr,
+        rebase = rebase,
+        conflict = true,
+        conflict_files = details.conflict_files,
+        conflict_hunks = details.conflict_hunks,
+        conflict_commit = details.conflict_commit,
+        base = details.base,
+        base_sha = details.base_sha,
+        upstream = details.upstream,
+        rebase_command = details.rebase_command,
+        escalation = details.escalation,
+      }
+    end
+
+    -- Anything else (no worktree, a dead remote, a failed fetch) is not
+    -- repairable by redoing the work: it stays a real failure.
     fail_task(state, root, id, rerr)
     return {
       ok = false,
       error = rerr,
       rebase = rebase,
       conflict = conflict,
-      conflict_files = conflict and table.concat(conflict, ", ") or nil,
     }
   end
 
