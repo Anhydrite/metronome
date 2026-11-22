@@ -3852,6 +3852,26 @@ function M.new(deps)
       return tostring(a.id) < tostring(b.id)
     end)
     return { ok = true, tasks = tasks, events = loaded.events, quarantined = quarantined }
+
+    -- A ready task the scheduler would not start is otherwise invisible in the
+    -- panel: name why it waits, next to the quarantine summary.
+    local waiting = {}
+    if deps.pipeline and type(deps.pipeline.ready_reasons) == "function" then
+      local called, reasons = pcall(deps.pipeline.ready_reasons, loaded.tasks, {
+        max_parallel = max_parallel,
+      })
+      if called and type(reasons) == "table" then
+        waiting = reasons
+        for _, entry in ipairs(waiting) do
+          local view = tasks[entry.id]
+          if type(view) == "table" then
+            view.waiting_reason = entry.reason
+          end
+        end
+      end
+    end
+    return { ok = true, tasks = tasks, events = loaded.events, quarantined = quarantined,
+      waiting = waiting }
   end
 
   function runtime.answer(input, ctx)
