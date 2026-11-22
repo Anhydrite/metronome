@@ -201,7 +201,7 @@ one `/metronome` dispatcher: `/metronome submit <intention>` parses `submit`
 and forwards the rest to the pipeline. Arguments are normalised before any
 work starts, so a missing task id is refused in the input bar, not mid-run.
 
-- `/metronome init` — ask the config questions (repo, base branch, checks, model and thinking per role, merge/deploy policy), then bind the project. `--defaults` accepts every default; `key=value` answers explicitly.
+- `/metronome init` — ask the config questions (repo, base branch, checks, model and thinking per role, merge/deploy policy), run the mandatory preflight, then bind the project. `--defaults` accepts every default; `key=value` answers explicitly. The binding is refused when the preflight fails: relay the reported check, command and remedy verbatim instead of retrying blindly or claiming success.
 - `/metronome submit <intention>` — create an `intent` and start qualification.
 - `/metronome status [id]` — show task state, or one task in detail.
 - `/metronome answer` — open the pending question queue.
@@ -212,7 +212,7 @@ work starts, so a missing task id is refused in the input bar, not mid-run.
 - `/metronome stop <id>` — stop an in-flight task and park it as abandoned.
 - `/metronome delete <id>` — remove a task from the panel and status.
 - `/metronome archive` — list the snapshots kept for deleted tasks.
-- `/metronome config [key=value ...]` — show `config.toml`, or update it in place (merged with the current config).
+- `/metronome config [key=value ...]` — show `config.toml`, or update it in place (merged with the current config). An update runs the same preflight as `init` and is refused when it fails: relay the reported check, command and remedy verbatim instead of retrying blindly or claiming success.
 - `/metronome panel` — open or close the live panel.
 - `/metronome resume` — restart tasks interrupted by a `/reload`.
 - `/metronome feedback <id>` — rate a review's findings (👍/👎) to calibrate the reviewer.
