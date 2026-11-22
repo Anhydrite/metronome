@@ -330,6 +330,171 @@ return function()
   state.release_deploy(root, "deployer-roundtrip")
   eq(state.deploy_pending(root).base, "feedface", "roundtrip root has a pending base")
 
+  -- Typed failure: the diagnosis a resume needs -------------------------------
+
+  -- A failed task is only recoverable if the reason, the remedy and the
+  -- artefacts it was working on all survive. The typed failure is the record
+  -- recover.record produces, persisted next to failure_reason in the same
+  -- transition, and read back from the journal — not from a cache — so a
+  -- restarted workflow can decide whether to retry and from where.
+  state.create(root, { id = "T-20261122-c001", title = "typed failure" })
+  state.transition(root, "T-20261122-c001", "qualifying")
+  state.transition(root, "T-20261122-c001", "ready")
+  state.transition(root, "T-20261122-c001", "running")
+  state.set_fields(root, "T-20261122-c001", {
+    branch = "metronome/T-20261122-c001",
+    worktree = "/tmp/wt/T-20261122-c001",
+    checkpoints = { "1111111", "2222222" },
+  })
+
+  local failure = {
+    cause = "git_identity",
+    message = "git commit exit 1: please tell me who you are",
+    remedy = "git config user.email you@example.com",
+    transient = true,
+    attempts = 1,
+    at = "2026-11-22T10:00:00Z",
+    next_retry_at = "2026-11-22T10:00:30Z",
+    phase = "implement",
+    -- recover.record also carries these: they belong to the decision it feeds,
+    -- not to the task, and the task schema forbids them.
+    retryable = true,
+    remediable = true,
+  }
+  local typed, typed_err = state.transition(root, "T-20261122-c001", "failed", {
+    reason = "git commit exit 1: please tell me who you are",
+    failure = failure,
+  })
+  eq(typed_err, nil, "a failed transition with a typed failure has no error: " .. tostring(typed_err))
+  eq(typed and typed.status, "failed", "the task moved to failed")
+  eq(type(typed and typed.failure), "table", "the failure is projected on the transition result")
+  eq(typed and typed.failure_reason ~= nil, true, "the reason is written next to the failure")
+  local typed_failure = state.failure_of(typed)
+  eq(typed_failure ~= nil, true, "failure_of reads the failure back")
+  eq(typed_failure and typed_failure.cause, "git_identity", "failure_of keeps the cause")
+  eq(typed_failure and typed_failure.retryable, nil, "a key outside the failure contract is dropped")
+
+  -- The diagnosis must live in the journal, not only in the projection: a
+  -- crashed projection is rebuilt, and the retry decision is still possible.
+  maki.fs.rm(state.paths(root).projection)
+  local after_failure = state.load(root)
+  local failed_task = after_failure.tasks["T-20261122-c001"]
+  eq(failed_task and failed_task.status, "failed", "the failed status replays from the journal")
+  local replayed_failure = state.failure_of(failed_task)
+  eq(replayed_failure ~= nil, true, "the typed failure replays from the journal")
+  for _, key in ipairs({ "cause", "message", "remedy", "transient", "attempts", "at", "next_retry_at", "phase" }) do
+    eq(replayed_failure and replayed_failure[key], failure[key],
+      "failure." .. key .. " survives the journal unchanged")
+  end
+
+  -- A failure must never cost the artefacts a resume starts from.
+  eq(failed_task.branch, "metronome/T-20261122-c001", "a failure keeps the branch")
+  eq(failed_task.worktree, "/tmp/wt/T-20261122-c001", "a failure keeps the worktree")
+  eq(#(failed_task.checkpoints or {}), 2, "a failure keeps every checkpoint")
+  eq(failed_task.checkpoints and failed_task.checkpoints[1], "1111111", "a failure keeps the first checkpoint")
+  eq(state.checkpoint_of(failed_task), "2222222", "checkpoint_of returns the last checkpoint")
+
+  -- run_dir is the transcript of the interrupted turn. It is not part of the
+  -- task schema yet, so this case gets its own root: the roundtrip journal that
+  -- tests/run-lua.sh validates has to stay schema-legal.
+  local resume_root = tmp_root("failure-resume")
+  state.create(resume_root, { id = "T-20261122-r001", title = "resume me" })
+  state.transition(resume_root, "T-20261122-r001", "qualifying")
+  state.transition(resume_root, "T-20261122-r001", "ready")
+  state.transition(resume_root, "T-20261122-r001", "running")
+  state.set_fields(resume_root, "T-20261122-r001", {
+    branch = "metronome/T-20261122-r001",
+    worktree = "/tmp/wt/T-20261122-r001",
+    checkpoints = { "abcdef0", "abcdef1" },
+    run_dir = "/tmp/runs/T-20261122-r001/implement/1",
+  })
+  local resume_failed, resume_err = state.transition(resume_root, "T-20261122-r001", "failed", {
+    reason = "git commit exit 1: Sur la branche main",
+    failure = {
+      cause = "git_identity",
+      message = "git commit exit 1: Sur la branche main",
+      remedy = "set user.email in the sandbox",
+      transient = true,
+      attempts = 2,
+      at = "2026-11-22T11:00:00Z",
+      next_retry_at = "2026-11-22T11:01:00Z",
+      phase = "implement",
+    },
+  })
+  eq(resume_err, nil, "the failed transition on the resume root has no error: " .. tostring(resume_err))
+  eq(resume_failed and resume_failed.status, "failed", "the resume-root task failed")
+  local resume_task = state.load(resume_root).tasks["T-20261122-r001"]
+  eq(resume_task.branch, "metronome/T-20261122-r001", "a failure keeps the branch on the resume root")
+  eq(resume_task.worktree, "/tmp/wt/T-20261122-r001", "a failure keeps the worktree on the resume root")
+  eq(#(resume_task.checkpoints or {}), 2, "a failure keeps every checkpoint on the resume root")
+  eq(resume_task.run_dir, "/tmp/runs/T-20261122-r001/implement/1", "a failure keeps the run dir")
+  eq(state.checkpoint_of(resume_task), "abcdef1", "checkpoint_of points a resume at the last stable sha")
+  eq((state.failure_of(resume_task) or {}).attempts, 2, "the attempt count is kept for the backoff")
+
+  -- Only delete makes those fields disappear.
+  eq(state.delete(resume_root, "T-20261122-r001"), true, "delete is the one path that drops a task")
+  eq(state.load(resume_root).tasks["T-20261122-r001"], nil, "and it takes the artefacts with it")
+
+  -- A resume does not forget the cause, but the pending retry is over: nothing
+  -- waits for a deadline and the attempt budget starts again from zero.
+  local resumed = state.transition(root, "T-20261122-c001", "running")
+  eq(resumed and resumed.status, "running", "a failed task can be resumed")
+  local resumed_failure = state.failure_of(resumed)
+  eq(resumed_failure ~= nil, true, "the resume keeps the failure record")
+  eq(resumed_failure and resumed_failure.cause, "git_identity", "the resume keeps the last cause")
+  eq(resumed_failure and resumed_failure.message, failure.message, "the resume keeps the last message")
+  eq(resumed_failure and resumed_failure.remedy, failure.remedy, "the resume keeps the remedy")
+  eq(resumed_failure and resumed_failure.attempts, 0, "the resume resets attempts")
+  eq(resumed_failure and resumed_failure.next_retry_at, nil, "the resume clears next_retry_at")
+
+  -- The same must hold after a replay, not just in the returned projection.
+  maki.fs.rm(state.paths(root).projection)
+  local resumed_task = state.load(root).tasks["T-20261122-c001"]
+  eq(resumed_task and resumed_task.status, "running", "the resumed status replays from the journal")
+  eq((state.failure_of(resumed_task) or {}).attempts, 0, "the replay resets attempts too")
+  eq((state.failure_of(resumed_task) or {}).next_retry_at, nil, "the replay clears next_retry_at too")
+  eq((state.failure_of(resumed_task) or {}).cause, "git_identity", "the replay keeps the cause")
+  eq(state.checkpoint_of(resumed_task), "2222222", "the resume keeps its checkpoints")
+
+  -- A malformed failure is refused with an explanation, never written blind.
+  local not_table, not_table_err = state.transition(root, "T-20261122-c001", "failed", { failure = "boom" })
+  eq(not_table, nil, "a non-table failure is refused")
+  eq(not_table_err ~= nil and not_table_err:find("failure must be a table", 1, true) ~= nil, true,
+    "the refusal explains what the failure must be")
+  local empty_failure, empty_err = state.transition(root, "T-20261122-c001", "failed", { failure = {} })
+  eq(empty_failure, nil, "an empty failure is refused")
+  eq(empty_err ~= nil and empty_err:find("failure is empty", 1, true) ~= nil, true,
+    "the refusal explains that an empty failure carries nothing")
+
+  -- The read helpers never raise: a caller that asks about a task with no
+  -- diagnosis or no checkpoint gets nil, not an error.
+  eq(state.failure_of(nil), nil, "failure_of(nil) is nil")
+  eq(state.checkpoint_of(nil), nil, "checkpoint_of(nil) is nil")
+  eq(state.failure_of({}), nil, "failure_of on a task without a failure is nil")
+  eq(state.checkpoint_of({}), nil, "checkpoint_of on a task without checkpoints is nil")
+  eq(state.failure_of({ failure = {} }), nil, "an empty failure reads as nil")
+  eq(state.checkpoint_of({ checkpoints = {} }), nil, "an empty checkpoint list reads as nil")
+  eq(state.checkpoint_of({ failure = { cause = "unknown" } }), nil,
+    "a task with a failure but no checkpoints still reads nil for the checkpoint")
+
+  -- The schema accepts the new field, and refuses an unknown one inside it.
+  local qualify = load_module("qualify")
+  local validate_tmp = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "state-validate")
+  local schema_ok, schema_err = qualify.validate_projection(after_failure.tasks["T-20261122-c001"], {
+    tmp_dir = validate_tmp,
+  })
+  eq(schema_ok, true, "the schema accepts a task with a typed failure: " .. tostring(schema_err))
+  local bad_shape = {
+    id = "T-20261122-c002",
+    title = "bad failure",
+    status = "failed",
+    failure = { cause = "unknown", not_a_failure_key = true },
+  }
+  local bad_shape_ok, bad_shape_err = qualify.validate_projection(bad_shape, { tmp_dir = validate_tmp })
+  eq(bad_shape_ok, nil, "the schema refuses an unknown key inside failure")
+  eq(bad_shape_err ~= nil and bad_shape_err:find("failure", 1, true) ~= nil, true,
+    "the refusal names the failure object")
+
   -- An empty root is not an error.
   local empty_root = tmp_root("empty")
   local empty = state.load(empty_root)
