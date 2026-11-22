@@ -1692,6 +1692,8 @@ auto_deploy = false
   local q_dispatched = {}
   local q_ticks = 0
   local q_gate_mode = "blocked"
+  local q_appends = 0
+  local q_load_fails = false
   local q_deps = {
     config = {
       load = function()
@@ -1707,22 +1709,35 @@ auto_deploy = false
       return { system = "", model_spec = "m", thinking = "low", tools = {} }
     end },
     state = {
-      load = function() return { tasks = q_tasks } end,
+      load = function()
+        if q_load_fails then
+          error("state.json: cannot load state")
+        end
+        return { tasks = q_tasks }
+      end,
       transition = function(_, id, status)
         if q_tasks[id] then q_tasks[id].status = status end
         return { id = id, status = status }
       end,
+      -- Mirror state.lua's replay: a maki.NIL value in a patch clears the key,
+      -- a plain value sets it. `{ quarantine = nil }` would be an empty patch.
       set_fields = function(_, id, fields)
         local task = q_tasks[id]
         if task then
-          for key, value in pairs(fields or {}) do task[key] = value end
+          for key, value in pairs(fields or {}) do
+            if value == maki.NIL then
+              task[key] = nil
+            else
+              task[key] = value
+            end
+          end
         end
         return task
       end,
-      append = function(_, event)
-        if event.kind == "task_created" and event.task then
-          q_tasks[event.task_id] = event.task
-        end
+      -- The old clear rewrote the whole record with a fresh task_created; a
+      -- targeted field patch must never need that.
+      append = function()
+        q_appends = q_appends + 1
         return { tasks = q_tasks }
       end,
     },
@@ -1775,7 +1790,11 @@ auto_deploy = false
           verdict = "blocked",
           tasks = { "T-1" },
           findings = { finding },
-          blocked = { { id = "T-2", findings = { finding } } },
+          -- A repeated id must not be counted, logged or returned twice.
+          blocked = {
+            { id = "T-2", findings = { finding } },
+            { id = "T-2", findings = { finding } },
+          },
         }
       end,
     },
@@ -1788,7 +1807,7 @@ auto_deploy = false
   eq(qres.ok, true, "a blocked sibling no longer fails the whole drain")
   eq(type(qres.quarantined), "table", "the drain names the quarantined task")
   eq(qres.quarantined and qres.quarantined[1], "T-2", "the blocked task is quarantined")
-  eq(#(qres.quarantined or {}), 1, "only the blocked task is quarantined")
+  eq(#(qres.quarantined or {}), 1, "a repeated blocked id is quarantined once")
   eq(qres.findings and qres.findings["T-2"] and qres.findings["T-2"][1].rule,
     "missing_dependency", "the drain reports the blocked findings by id")
   eq(q_dispatched[1], "T-1", "the ready task is dispatched despite the blocked sibling")
@@ -1804,9 +1823,22 @@ auto_deploy = false
     "the quarantine reason names the blocking rule")
   eq(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.rules[1],
     "missing_dependency", "the quarantine keeps the sorted rule names")
+  eq(type(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.since), "string",
+    "the quarantine records when it started")
+  local q_since = q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.since
   local q_log = maki.fs.read(maki.fs.joinpath(root, "runtime.log")) or ""
   has(q_log, "T-2 (missing_dependency)", "runtime.log names the quarantined task and its rule")
   has(q_log, "quarantined", "runtime.log records that a quarantine happened")
+
+  -- A second blocked pass keeps the first-seen timestamp and logs it again.
+  q_ticks = 0
+  q_dispatched = {}
+  q_tasks["T-2"].quarantine.since = "2026-11-22T17:36:54Z"
+  rt_q.answer({ answers = {} }, ctx)
+  rt_q.run_pending()
+  eq(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.since,
+    "2026-11-22T17:36:54Z",
+    "a task blocked across passes keeps the quarantine timestamp of the first pass")
 
   -- A gate that cannot run at all must still dispatch what is already ready --
   q_gate_mode = "error"
@@ -1824,16 +1856,250 @@ auto_deploy = false
     "the qualifying task is quarantined when the analysis cannot run")
   has(tostring(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.reason),
     "analysis failed: cannot load state", "the quarantine reason names the analysis error")
+  eq(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.rules, nil,
+    "an empty rules list is omitted, not persisted as an empty object")
+  eq(q_tasks["T-2"].quarantine and q_tasks["T-2"].quarantine.findings, nil,
+    "empty findings are omitted, not persisted as an empty object")
+
+  -- A state load that raises under the failed gate must not abort the drain:
+  -- analyze.gate returns nil exactly when its own load failed, so the drain's
+  -- own read can raise too.
+  q_load_fails = true
+  q_ticks = 0
+  q_dispatched = {}
+  q_tasks["T-1"].status = "ready"
+  rt_q.answer({ answers = {} }, ctx)
+  rt_q.run_pending()
+  local qraised = rt_q.last_background or {}
+  eq(qraised.ok, true, "a raising state load after the gate error still returns ok")
+  eq(q_dispatched[1], "T-1", "the ready task is dispatched even when the state load raises")
+  q_load_fails = false
 
   -- A repaired sheet is remitted: the next drain moves it to ready and drops
   -- the quarantine instead of keeping a stale warning forever.
   q_gate_mode = "repaired"
   q_ticks = 0
   q_dispatched = {}
+  q_appends = 0
   q_tasks["T-2"].status = "ready"
   rt_q.answer({ answers = {} }, ctx)
   rt_q.run_pending()
   eq(q_tasks["T-2"].quarantine, nil,
     "a task that passes the gate is no longer shown as quarantined")
+  eq(q_appends, 0,
+    "clearing a quarantine patches the field instead of rewriting the record")
+
+  -- Synchronous drain: a quarantined sibling must not count as a task that
+  -- failed to finish, and the merged sibling must still deploy.
+  local s_tasks = {
+    ["T-1"] = { id = "T-1", title = "merged", status = "merged", files = { "a" }, checks = { "true" } },
+    ["T-2"] = { id = "T-2", title = "broken", status = "qualifying", files = { "b" }, checks = { "true" } },
+  }
+  local s_deploys = {}
+  local s_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = true },
+          deploy = { auto_deploy = false, plan_file = "deploy.md" },
+        }
+      end,
+    },
+    roles = { session_opts = function()
+      return { system = "", model_spec = "m", thinking = "low", tools = {} }
+    end },
+    state = {
+      load = function() return { tasks = s_tasks } end,
+      transition = function() return true end,
+      set_fields = function(_, id, fields)
+        local task = s_tasks[id]
+        if task then
+          for key, value in pairs(fields or {}) do
+            if value == maki.NIL then
+              task[key] = nil
+            else
+              task[key] = value
+            end
+          end
+        end
+        return task
+      end,
+    },
+    pipeline = {
+      -- Nothing is ready to start: the merged task is past the scheduler and
+      -- the other one is blocked, so the drain goes straight to the tail.
+      tick = function() return { ok = true, started = {} } end,
+    },
+    analyze = {
+      gate = function()
+        local finding = { severity = "blocking", rule = "missing_dependency" }
+        return {
+          ok = false,
+          verdict = "blocked",
+          tasks = {},
+          findings = { finding },
+          blocked = { { id = "T-2", findings = { finding } } },
+        }
+      end,
+    },
+    deploy = {
+      run = function(opts)
+        s_deploys[#s_deploys + 1] = opts.task
+        return { ok = true, task = opts.task }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    async = false,
+    wait_turn_end = false,
+    runner = {},
+    questions = { answer = function() return { applied = 1, answered = 1, tasks = {} } end },
+    implement = {}, checks = {}, converge = {}, review = {}, merge = {}, git = {},
+    qualify = {}, calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_s = runtime.new(s_deps)
+  rt_s.answer({ answers = {} }, ctx)
+  rt_s.run_pending()
+  local sres = rt_s.last_background or {}
+  eq(sres.ok, true,
+    "a quarantined sibling does not turn the synchronous drain into a failure")
+  eq(sres.quarantined and sres.quarantined[1], "T-2",
+    "the synchronous drain names the quarantined task")
+  eq(s_deploys[1], "T-1", "a merged task still deploys next to a quarantined sibling")
+  eq(sres.deployed, true, "the synchronous drain reports the deploy")
+  has(tostring(s_tasks["T-2"].quarantine and s_tasks["T-2"].quarantine.reason),
+    "missing_dependency", "the synchronous drain persists the quarantine too")
+
+  -- The quarantine the drain persists must survive a real journal replay and
+  -- satisfy schemas/task.schema.json, including the "analysis failed" case
+  -- where there are no rules and no findings at all.
+  local qstate = load_module("state")
+  local qroot2 = mktmpdir("metronome-runtime-submit-quarantine")
+  local qpaths2 = {
+    repo = "/tmp/repo",
+    root = qroot2,
+    tasks = maki.fs.joinpath(qroot2, "tasks"),
+    worktrees = maki.fs.joinpath(qroot2, "worktrees"),
+    runs = maki.fs.joinpath(qroot2, "runs"),
+    prompts = maki.fs.joinpath(qroot2, "prompts"),
+    config = maki.fs.joinpath(qroot2, "config.toml"),
+  }
+  maki.fs.write(qpaths2.config, "[project]\nrepo = \"/tmp/repo\"\n")
+  qstate.create(qroot2, {
+    id = "T-20261122-0001", title = "clean", status = "ready",
+    files = { "a" }, checks = { "true" },
+  })
+  qstate.create(qroot2, {
+    id = "T-20261122-0002", title = "broken", status = "qualifying",
+    files = { "b" }, checks = { "true" },
+  })
+
+  local r_gate_mode = "blocked"
+  local r_ticks = 0
+  local r_deps = {
+    config = q_deps.config,
+    roles = q_deps.roles,
+    state = qstate,
+    pipeline = {
+      tick = function()
+        r_ticks = r_ticks + 1
+        return { ok = true, started = {} }
+      end,
+    },
+    analyze = {
+      gate = function()
+        if r_gate_mode == "error" then
+          return nil, "cannot load state"
+        end
+        if r_gate_mode == "repaired" then
+          return { ok = true, verdict = "ok", tasks = { "T-20261122-0002" },
+            blocked = {}, findings = {} }
+        end
+        local finding = {
+          severity = "blocking", rule = "missing_dependency",
+          message = "T-20261122-0002 needs a task that does not exist",
+          tasks = { "T-20261122-0002" },
+        }
+        return {
+          ok = false,
+          verdict = "blocked",
+          tasks = { "T-20261122-0001" },
+          findings = { finding },
+          blocked = { { id = "T-20261122-0002", findings = { finding } } },
+        }
+      end,
+    },
+    paths = function() return qpaths2 end,
+    spawn = function(fn) fn() end,
+    async = true,
+    wait_turn_end = false,
+    runner = {},
+    questions = { answer = function() return { applied = 1, answered = 1, tasks = {} } end },
+    implement = {}, checks = {}, converge = {}, review = {}, merge = {}, git = {},
+    deploy = {}, qualify = {}, calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_r = runtime.new(r_deps)
+  local schema_src = maki.fs.read(maki.fs.joinpath(maki.uv.cwd(), "schemas", "task.schema.json"))
+  local schema = maki.json.decode(schema_src)
+  local validator = maki.json.schema_validator(schema)
+  local function projection_of(root_dir, id)
+    local text = maki.fs.read(maki.fs.joinpath(root_dir, "state.json"))
+    local decoded = maki.json.decode(text)
+    return decoded and decoded.tasks and decoded.tasks[id] or nil
+  end
+
+  rt_r.answer({ answers = {} }, ctx)
+  rt_r.run_pending()
+  local rres = rt_r.last_background or {}
+  eq(rres.ok, true, "the journal-backed drain reports ok")
+  eq(rres.quarantined and rres.quarantined[1], "T-20261122-0002",
+    "the journal-backed drain names the blocked task")
+  local r_task = projection_of(qroot2, "T-20261122-0002")
+  eq(type(r_task and r_task.quarantine), "table",
+    "the projection carries the quarantine after a real journal write")
+  eq(r_task and r_task.quarantine and r_task.quarantine.rules
+    and r_task.quarantine.rules[1], "missing_dependency",
+    "the projection keeps the blocking rule as an array")
+  eq(validator:validate(r_task), nil,
+    "the persisted quarantine satisfies schemas/task.schema.json")
+  local r_ready = projection_of(qroot2, "T-20261122-0001")
+  eq(validator:validate(r_ready), nil,
+    "the ready sibling still satisfies schemas/task.schema.json")
+  has(maki.fs.read(maki.fs.joinpath(qroot2, "runtime.log")) or "",
+    "T-20261122-0002 (missing_dependency)",
+    "the journal-backed drain logs the quarantine")
+
+  -- No rules and no findings is the shape a failed analysis persists: both
+  -- keys must be absent, because `{}` is an object and the schema says array.
+  r_gate_mode = "error"
+  r_ticks = 0
+  rt_r.answer({ answers = {} }, ctx)
+  rt_r.run_pending()
+  local r_err_task = projection_of(qroot2, "T-20261122-0002")
+  eq(type(r_err_task and r_err_task.quarantine), "table",
+    "a failed analysis still persists a quarantine")
+  eq(r_err_task and r_err_task.quarantine and r_err_task.quarantine.rules, nil,
+    "the failed-analysis quarantine omits the empty rules list")
+  eq(r_err_task and r_err_task.quarantine and r_err_task.quarantine.findings, nil,
+    "the failed-analysis quarantine omits the empty findings list")
+  eq(validator:validate(r_err_task), nil,
+    "the failed-analysis quarantine is schema-legal once replayed")
+  eq(r_ticks > 0, true, "the drain still ticks the scheduler after a gate error")
+
+  -- A repaired task: the next pass clears the field through the journal, and
+  -- replay drops the null patch so the key is gone, not null.
+  r_gate_mode = "repaired"
+  r_ticks = 0
+  rt_r.answer({ answers = {} }, ctx)
+  rt_r.run_pending()
+  local r_fixed = projection_of(qroot2, "T-20261122-0002")
+  eq(r_fixed and r_fixed.quarantine, nil,
+    "a repaired task loses its quarantine through a real journal replay")
+  eq(r_fixed and r_fixed.status, "qualifying",
+    "the repaired task stays qualifying until the gate moves it to ready")
+  eq(validator:validate(r_fixed), nil,
+    "the repaired task still satisfies schemas/task.schema.json")
 
 end
