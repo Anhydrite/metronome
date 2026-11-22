@@ -2326,6 +2326,76 @@ auto_deploy = false
   eq(async_ticks >= 2,
     true, "a completed retry job re-drains the scheduler instead of stopping the workflow")
 
+  -- metronome_status exposes the resume state for every task ----------------
+  -- A failed task must be readable and resumable from the status tool alone:
+  -- its checkpoint, its typed last error and the action a human (or the
+  -- scheduler) takes next.
+  local function check_status_view()
+    local status_checkpoints = load_module("state")
+  local status_record = {
+    id = "T1", status = "failed", title = "resume me",
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+    checkpoints = { { sha = "abc123" }, { sha = "def456" } },
+    failure = { cause = "git_identity", message = "empty ident name",
+      remedy = "set git user.email and user.name", transient = true,
+      attempts = 2, at = 10, next_retry_at = 70 },
+  }
+  local legacy_record = {
+    id = "T2", status = "failed", title = "old journal",
+    failure_reason = "git commit exit 1: Sur la branche main",
+  }
+  local status_deps = {
+    config = { load = function() return { project = { repo = "/tmp/repo" } } end },
+    recover = recover_mod,
+    state = {
+      load = function()
+        return { tasks = { T1 = status_record, T2 = legacy_record } }
+      end,
+      checkpoint_of = function(t) return status_checkpoints.checkpoint_of(t) end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    roles = deps.roles,
+    implement = deps.implement or {},
+    qualify = {}, analyze = {}, pipeline = {}, runner = {}, git = {},
+    checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
+    calibrate = {}, fence = {}, mode = {}, questions = {},
+  }
+  local rt_status = runtime.new(status_deps)
+  local listed = rt_status.status({})
+  eq(listed and listed.ok, true, "metronome_status lists the tasks")
+  local view = listed.tasks and listed.tasks.T1
+  eq(view and view.checkpoint, "def456", "status exposes the last checkpoint")
+  eq(view and view.branch, "metronome/t1", "status exposes the branch")
+  eq(view and view.worktree, "/tmp/wt-t1", "status exposes the worktree")
+  eq(view and view.last_error and view.last_error.cause, "git_identity",
+    "status exposes the typed last error")
+  eq(view and view.retry_action and view.retry_action.action, "auto_retry",
+    "status exposes the resume action")
+  eq(view and view.retry_action and view.retry_action.attempts, 2,
+    "the resume action carries the attempt count")
+  eq(view and view.retry_action and view.retry_action.max_attempts, 3,
+    "the resume action carries the attempt bound")
+  eq(view and view.retry_action and view.retry_action.tool, "metronome_retry",
+    "the resume action names the tool")
+  eq(view and view.status, "failed", "the raw status field is still there")
+  eq(view and view.failure and view.failure.cause, "git_identity",
+    "the raw failure object is still there")
+  local legacy_view = listed.tasks and listed.tasks.T2
+  eq(legacy_view and legacy_view.last_error ~= nil, true,
+    "a legacy failure_reason still reads as a typed last error")
+  eq(legacy_view and legacy_view.retry_action and legacy_view.retry_action.action, "manual",
+    "a legacy failure is a manual resume")
+  local detailed = rt_status.status({ id = "T1" })
+  eq(detailed and detailed.task and detailed.task.checkpoint, "def456",
+    "the by-id detail exposes the checkpoint too")
+  eq(detailed and detailed.task and detailed.task.retry_action
+    and detailed.task.retry_action.action, "auto_retry",
+    "the by-id detail exposes the resume action too")
+  end
+  check_status_view()
+
   maki.session.notify = saved_notify
   maki.session.prompt = saved_prompt
 

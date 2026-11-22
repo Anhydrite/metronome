@@ -146,9 +146,54 @@ function M.short_id(id)
   return "T-…" .. tail
 end
 
+-- The retry bound the panel assumes when the task carries no `retry_action`
+-- projection (a raw state task, not a `metronome_status` view). It mirrors
+-- recover.DEFAULTS.max_attempts; the panel stays pure and does not require the
+-- policy module.
+local DEFAULT_MAX_ATTEMPTS = 3
+
+-- A failure row must name the cause and what will happen next, not only repeat
+-- the status: "git_identity · reprise auto 2/3" tells the user the scheduler
+-- resumes alone, "auth · metronome_retry" tells them to act.
+local function failure_detail(task)
+  local failure = type(task.failure) == "table" and task.failure or nil
+  local last = type(task.last_error) == "table" and task.last_error or nil
+  local retry = type(task.retry_action) == "table" and task.retry_action or nil
+  local cause, attempts, max
+  if failure or last then
+    cause = (failure and failure.cause) or (last and last.cause) or "unknown"
+    attempts = (failure and tonumber(failure.attempts))
+      or (retry and tonumber(retry.attempts)) or 0
+    max = (retry and tonumber(retry.max_attempts)) or DEFAULT_MAX_ATTEMPTS
+  elseif type(task.failure_reason) == "string" and task.failure_reason ~= "" then
+    -- A journal written before `task.failure` existed only has a free-text
+    -- reason: there is no typed cause and no attempt accounting to show.
+    cause = tostring(task.status or "failed")
+    attempts = 0
+    max = DEFAULT_MAX_ATTEMPTS
+  else
+    return nil
+  end
+  local action = retry and retry.action or nil
+  if action == nil and failure then
+    -- The panel usually gets the raw task, not the status projection: replay
+    -- the policy's rule (transient and under the bound resumes alone).
+    if failure.transient == true and attempts < max then
+      action = "auto_retry"
+    else
+      action = "human"
+    end
+  end
+  if action == "auto_retry" or action == "auto" then
+    return string.format("%s · reprise auto %d/%d", cause, attempts, max)
+  end
+  return tostring(cause) .. " · metronome_retry"
+end
+
 -- The detail column: what the task is doing, in the fewest words that still
--- distinguish a blocked task from a running one.
-function M.detail(task, bucket)
+-- distinguish a blocked task from a running one. `max` bounds the column, so a
+-- typed cause and its action are cut cleanly instead of pushing the row.
+function M.detail(task, bucket, max)
   bucket = bucket or M.bucket(task)
   if bucket == "questions" then
     local pending = #M.pending_questions(task)
@@ -158,6 +203,10 @@ function M.detail(task, bucket)
     return "awaiting answers"
   end
   if bucket == "failures" then
+    local line = failure_detail(task)
+    if line then
+      return M.fit(line, tonumber(max) or 40)
+    end
     return tostring(task.status or "failed")
   end
   if bucket == "review" then
@@ -460,7 +509,7 @@ function M.rows(tasks, opts)
         phase = task.phase,
         bucket = bucket,
         urgency = RANK[bucket] or RANK.progress,
-        detail = M.detail(task, bucket),
+        detail = M.detail(task, bucket, opts.detail_max),
         role = M.role_for(task),
         spinner = M.spinner(frame),
         active = not TERMINAL[task.status],

@@ -2580,20 +2580,222 @@ function M.new(deps)
     return result
   end
 
+  -- The last stable sha a retry resumes from. The state module is the
+  -- authority; the local copy only keeps `metronome_status` readable for a
+  -- caller that injects a minimal state seam.
+  local function status_checkpoint(task)
+    if type(deps.state) == "table" and type(deps.state.checkpoint_of) == "function" then
+      local ok, sha = pcall(deps.state.checkpoint_of, task)
+      if ok and type(sha) == "string" and sha ~= "" then
+        return sha
+      end
+    end
+    local checkpoints = type(task) == "table" and task.checkpoints or nil
+    local last = type(checkpoints) == "table" and checkpoints[#checkpoints] or nil
+    if type(last) == "table" then
+      last = last.sha
+    end
+    if type(last) == "string" and last ~= "" then
+      return last
+    end
+    return nil
+  end
+
+  -- The transcript is the evidence a human reads after a failure: the run
+  -- directory the runner wrote, or the newest `runs/<id>/<phase>/<attempt>`.
+  -- Neither is guaranteed to exist (a task failed before its first turn), so a
+  -- missing tree is nil, never an error.
+  local function status_transcript(paths, task)
+    local run_dir = type(task) == "table" and task.run_dir or nil
+    if type(run_dir) == "string" and run_dir ~= "" then
+      return run_dir
+    end
+    local base = fs.joinpath(paths.runs, tostring(task.id or ""))
+    local phases = fs.dir(base)
+    if not phases then
+      return nil
+    end
+    local best, best_attempt, best_phase
+    for _, phase in ipairs(phases) do
+      local name = phase.name or phase[1]
+      local kind = phase.kind or phase[2]
+      if type(name) == "string" and kind == "directory" and name:sub(1, 1) ~= "." then
+        local attempts = fs.dir(fs.joinpath(base, name))
+        for _, attempt in ipairs(attempts or {}) do
+          local aname = attempt.name or attempt[1]
+          local akind = attempt.kind or attempt[2]
+          local n = tonumber(aname)
+          if akind == "directory" and n ~= nil then
+            if best_attempt == nil or n > best_attempt
+              or (n == best_attempt and name > (best_phase or "")) then
+              best = fs.joinpath(base, name, aname)
+              best_attempt = n
+              best_phase = name
+            end
+          end
+        end
+      end
+    end
+    return best
+  end
+
+  -- The typed last error: the structured `failure` when the task carries one,
+  -- otherwise the legacy `failure_reason` string that older journals wrote.
+  -- Mapping the string through the classifier keeps the cause and the remedy
+  -- readable, but the action stays `manual`: a legacy journal has no attempt
+  -- accounting, so only a human can decide to resume it.
+  local function status_last_error(task)
+    local failure = type(task) == "table" and task.failure or nil
+    if type(failure) == "table" and (failure.cause ~= nil or failure.message ~= nil) then
+      return {
+        cause = failure.cause or "unknown",
+        message = failure.message,
+        remedy = failure.remedy,
+        transient = failure.transient == true,
+        at = failure.at,
+      }, failure
+    end
+    local reason = type(task) == "table" and task.failure_reason or nil
+    if is_non_empty(reason) then
+      local recover = recover_module()
+      local diagnosis
+      if recover and type(recover.classify) == "function" then
+        local ok, classified = pcall(recover.classify, reason)
+        if ok and type(classified) == "table" then
+          diagnosis = classified
+        end
+      end
+      return {
+        cause = (diagnosis and diagnosis.cause) or "unknown",
+        message = one_line(reason, 300),
+        remedy = (diagnosis and diagnosis.remedy)
+          or "inspect the transcript and the worktree, then retry with metronome_retry.",
+        transient = diagnosis and diagnosis.transient == true or false,
+        at = type(task) == "table" and task.failed_at or nil,
+      }, nil
+    end
+    return nil, nil
+  end
+
+  -- The retry bounds the project configured, without loading the whole config
+  -- path: `status` must stay a read-only projection and never rewrite prompts.
+  local function status_recover_opts(paths)
+    if type(deps.config) == "table" and type(deps.config.load) == "function" then
+      local ok, cfg = pcall(deps.config.load, paths.config)
+      if ok and type(cfg) == "table" then
+        return recover_opts(cfg)
+      end
+    end
+    return recover_opts(nil)
+  end
+
+  local RETRY_TOOL = "metronome_retry"
+
+  -- The bound the status reports when the project config left it at the
+  -- policy's default. Step sheets are read by a human, so the number must be
+  -- the one the scheduler would really use.
+  local function retry_bound(opts)
+    local configured = tonumber(type(opts) == "table" and opts.max_attempts)
+    if configured then
+      return configured
+    end
+    local recover = recover_module()
+    return tonumber(recover and recover.DEFAULTS and recover.DEFAULTS.max_attempts) or 3
+  end
+
+  -- What a user can do next, in the vocabulary the panel and the agent share.
+  -- `action` is the policy's own (`auto_retry`, `human`, `none`); a legacy
+  -- journal without a structured failure yields `manual`.
+  local function status_retry_action(task, opts)
+    local last, failure = status_last_error(task)
+    if not last then
+      return { action = "none", attempts = 0, max_attempts = retry_bound(opts), tool = RETRY_TOOL }
+    end
+    if not failure then
+      return {
+        action = "manual",
+        attempts = 0,
+        max_attempts = retry_bound(opts),
+        next_retry_at = nil,
+        tool = RETRY_TOOL,
+      }
+    end
+    local recover = recover_module()
+    local decision
+    if recover and type(recover.decide) == "function" then
+      local ok, decided = pcall(recover.decide, failure, opts)
+      if ok and type(decided) == "table" then
+        decision = decided
+      end
+    end
+    local action = decision and decision.action
+      or (failure.transient and "auto_retry" or "human")
+    -- `auto_retry = false` is the project saying a transient cause still needs
+    -- a human; report that, not a retry the scheduler will not perform.
+    if action == "auto_retry" and opts.auto_retry == false then
+      action = "human"
+    end
+    return {
+      action = action,
+      attempts = tonumber(failure.attempts) or 0,
+      max_attempts = (decision and tonumber(decision.max_attempts))
+        or retry_bound(opts),
+      next_retry_at = failure.next_retry_at,
+      cause = failure.cause,
+      tool = RETRY_TOOL,
+    }
+  end
+
+  -- A normalised view of one task for the status tools. The raw fields are
+  -- copied untouched, so an existing caller keeps reading them; the enriched
+  -- fields are what the panel and the agent need to resume the task.
+  local function status_view(paths, task, opts)
+    local view = {}
+    for key, value in pairs(task) do
+      view[key] = value
+    end
+    view.checkpoint = status_checkpoint(task)
+    view.branch = type(task.branch) == "string" and task.branch ~= "" and task.branch or nil
+    view.worktree = (type(task.worktree) == "string" and task.worktree ~= "" and task.worktree)
+      or fs.joinpath(paths.worktrees, tostring(task.id or ""))
+    view.transcript = status_transcript(paths, task)
+    local last_error = status_last_error(task)
+    view.last_error = last_error
+    local retry = status_retry_action(task, opts)
+    view.retry_action = retry
+    -- Both spellings are exposed: the documented projection reads
+    -- `retry_action`, older notes called the block `retry_actions`.
+    local retry_alias = {}
+    for key, value in pairs(retry) do
+      retry_alias[key] = value
+    end
+    view.retry_actions = retry_alias
+    return view
+  end
+
   function runtime.status(input)
     local paths = p()
     local loaded, err = deps.state.load(paths.root)
     if not loaded then
       return { ok = false, error = err or "cannot load state" }
     end
+    local opts = status_recover_opts(paths)
     if is_non_empty(input and input.id) then
       local task = loaded.tasks and loaded.tasks[input.id]
       if not task then
         return { ok = false, error = "unknown task: " .. input.id }
       end
-      return { ok = true, task = task }
+      return { ok = true, task = status_view(paths, task, opts) }
     end
-    return { ok = true, tasks = loaded.tasks, events = loaded.events }
+    local tasks = {}
+    for id, task in pairs(loaded.tasks or {}) do
+      if type(task) == "table" then
+        tasks[id] = status_view(paths, task, opts)
+      else
+        tasks[id] = task
+      end
+    end
+    return { ok = true, tasks = tasks, events = loaded.events }
   end
 
   function runtime.answer(input, ctx)
