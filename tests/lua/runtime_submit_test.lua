@@ -1046,19 +1046,10 @@ return function()
           merge_calls = merge_calls + 1
           if merge_calls <= conflicts then
             local conflict = (payload_fn or conflict_payload)()
-            -- Emulate the dependency's contract: `merge.run` journals the
-            -- repairable conflict once. The runtime must not write a second
-            -- note for the same conflict.
-            deps.state.append(paths.root, {
-              kind = "note",
-              task_id = "T1",
-              text = "merge conflict (repairable): files: docs/configuration.md"
-                .. "; will be redone on the fresh base"
-                .. "; command: `git rebase origin/main`; commit: 59738f2\n"
-                .. "--- docs/configuration.md:12\n"
-                .. (conflict.conflict_hunks and conflict.conflict_hunks[1]
-                  and conflict.conflict_hunks[1].text or ""),
-            })
+            -- `merge.run` returns the conflict and the repairable wording but
+            -- does not journal it: only the runtime, once it has committed to
+            -- the repair, announces it. The note count assertions below prove
+            -- the runtime journals it exactly once per conflict.
             return conflict
           end
           record.status = "merged"
@@ -1358,14 +1349,59 @@ return function()
       and case.impl_conflicts[1].files[1], "docs/configuration.md",
       shape.name .. ": the repair turn receives the conflicting file")
     eq(case.pr_opens(), 1, shape.name .. ": the repair reuses the open PR")
-    -- (e) Coherence: merge.lua journals "will be redone on the fresh base"
-    -- exactly when the runtime repairs. A note announcing a repair can never
-    -- coexist with a `failed` on the same turn under the bound.
+    -- (e) Coherence: no party announces "will be redone on the fresh base"
+    -- until the runtime has committed to the repair. merge.run only returns the
+    -- wording; the runtime journals it exactly once, when the reset has
+    -- actually happened, so a "will be redone" note can never coexist with a
+    -- `failed` on the same turn under the bound.
     local repairable_notes = repair_notes(case.events, "will be redone on the fresh base")
-    eq(#repairable_notes, 1, shape.name .. ": merge journals the repair once")
+    eq(#repairable_notes, 1, shape.name .. ": the runtime journals the repair once")
     eq(#failed_transitions(case.events), 0,
       shape.name .. ": a 'will be redone' note never coexists with a failed task")
   end
+
+  -- (e) Under the bound but unable to repair, nothing announces a repair: if
+  -- the fresh base cannot be materialised (`reset_hard` missing or refusing),
+  -- the turn never claims "will be redone" and does not fail without a message
+  -- — the escalation names the files and the command instead.
+  local no_reset_payload = conflict_payload()
+  no_reset_payload.error = nil
+  local no_reset = conflict_deps(2, math.huge, nil, function() return no_reset_payload end)
+  no_reset.deps.git.reset_hard = nil
+  local rt_no_reset = runtime.new(no_reset.deps)
+  rt_no_reset.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_no_reset.run_pending()
+  eq(#repair_notes(no_reset.events, "will be redone on the fresh base"), 0,
+    "no 'will be redone' note is written when the repair cannot be committed")
+  local no_reset_failures = failed_transitions(no_reset.events)
+  eq(#no_reset_failures, 1, "an unrepairable conflict still ends the turn once")
+  local no_reset_message = tostring(no_reset_failures[1] and no_reset_failures[1].reason or "")
+  eq(no_reset_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the unrepairable conflict names the files")
+  eq(no_reset_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the unrepairable conflict names the exact command")
+  eq(no_reset_message:find("no error details", 1, true), nil,
+    "the unrepairable conflict is never 'no error details'")
+  eq(no_reset.impl_conflicts and #no_reset.impl_conflicts, 0,
+    "no implementer turn is announced for a repair that did not happen")
+
+  local reset_refused = conflict_deps(2, math.huge, nil, function()
+    return no_reset_payload
+  end)
+  reset_refused.deps.git.reset_hard = function() return nil, "reset refused" end
+  local rt_reset_refused = runtime.new(reset_refused.deps)
+  rt_reset_refused.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_reset_refused.run_pending()
+  eq(#repair_notes(reset_refused.events, "will be redone on the fresh base"), 0,
+    "a refused reset writes no 'will be redone' note")
+  eq(#failed_transitions(reset_refused.events), 1,
+    "a refused reset escalates with the conflict facts, once")
+  local refused_message = tostring(failed_transitions(reset_refused.events)[1]
+    and failed_transitions(reset_refused.events)[1].reason or "")
+  eq(refused_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the refused-reset escalation names the files")
+  eq(refused_message:find("no error details", 1, true), nil,
+    "the refused-reset escalation is never 'no error details'")
 
   -- (d)/(f) Beyond the bound, the escalation names the files, the base with its
   -- SHA and the exact command, and a result carrying conflict files never

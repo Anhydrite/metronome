@@ -515,7 +515,9 @@ return function()
   has(res8 and res8.escalation, res8 and res8.conflict_commit or "", "the escalation names the commit")
 
   -- No `failed` write for a repairable conflict: the task stays in merge so the
-  -- runtime can send it back to implement with the files in hand.
+  -- runtime can send it back to implement with the files in hand. merge.lua
+  -- does not journal the repairable note either: it returns the wording for the
+  -- runtime, which journals it only once the repair is committed.
   local after8 = state.load(root).tasks[id8]
   eq(after8 and after8.status, "merging", "a conflicting rebase leaves the status merging")
   local failed_note8, conflict_note8, unrepaired_note8 = false, false, false
@@ -529,7 +531,10 @@ return function()
     end
   end
   eq(failed_note8, false, "a repairable conflict writes no failure note")
-  eq(conflict_note8, true, "the conflict is journaled as a note")
+  eq(conflict_note8, false,
+    "merge.lua does not announce a repair the runtime has not committed to")
+  has(res8 and res8.repair_note, "will be redone on the fresh base",
+    "the repairable wording is returned to the runtime")
   eq(unrepaired_note8, false,
     "a repairable conflict is not journaled as unrepairable")
   eq(read_log(), "", "a conflicting rebase does not touch the PR")
@@ -538,10 +543,13 @@ return function()
   --
   -- `merge.rebase` can report the same conflict three ways: `conflict = true`
   -- (the classifier only knew it conflicted), `conflict` as the list of files,
-  -- or `conflict_files` alone. The repair must not depend on a single field: a
-  -- turn merge.lua journals as repairable can never be turned into `failed`
-  -- here, so all three shapes return the conflict whole, leave the status
-  -- merging and journal the repairable note.
+  -- or `conflict_files` alone. The repair must not depend on a single field, so
+  -- all three shapes return the conflict whole and leave the status merging.
+  -- merge.lua does not journal the "will be redone" note: it cannot know
+  -- whether the caller will be able to repair (the fresh base may not resolve),
+  -- and a note announcing a repair must never coexist with a `failed` on the
+  -- same turn. It returns the wording and the runtime journals it once the
+  -- repair is committed.
   local shapes = {
     {
       name = "conflict = true",
@@ -617,10 +625,18 @@ return function()
         if note:find("merge failed", 1, true) then failed_note = true end
       end
     end
-    eq(repairable_note, true,
-      shape.name .. ": the conflict is journaled as repairable")
+    eq(repairable_note, false,
+      shape.name .. ": merge.lua does not announce a repair it cannot perform")
     eq(failed_note, false,
       shape.name .. ": a repairable conflict writes no failure note")
+    -- The repairable wording is handed back for the runtime to journal once it
+    -- has committed to the repair, with the same facts the escalation names.
+    has(tostring(sres and sres.repair_note or ""), "will be redone on the fresh base",
+      shape.name .. ": the repairable note is returned to the runtime")
+    has(tostring(sres and sres.repair_note or ""), "README.md",
+      shape.name .. ": the repairable note names the file")
+    has(tostring(sres and sres.repair_note or ""), "git rebase origin/main",
+      shape.name .. ": the repairable note names the exact command")
   end
 
   -- escalation: names what a human needs --------------------------------------

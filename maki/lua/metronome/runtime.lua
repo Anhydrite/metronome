@@ -1111,8 +1111,6 @@ function M.new(deps)
             conflict_retried = true,
             conflict_retries = repairs,
           })
-          journal_conflict(state, paths.root, task_id, details,
-            "rebase conflict (repairable): " .. conflict_note(details))
           local impl = deps.implement.run({
             task = task,
             repo = paths.repo,
@@ -1133,11 +1131,16 @@ function M.new(deps)
           })
           if impl and impl.ok then
             -- The PR is the same PR: the repaired branch is pushed onto it, so
-            -- no second PR is opened.
+            -- no second PR is opened. The repairable note is written only now:
+            -- the implementer has actually redone the branch, so a "will be
+            -- redone" note can never be followed by a `failed` on the same
+            -- turn.
             if type(deps.git.push) == "function" then
               pcall(deps.git.push, impl.ctx and impl.ctx.worktree or worktree,
                 branch, { remote = "origin", force = true })
             end
+            journal_conflict(state, paths.root, task_id, details,
+              "merge conflict (repairable): " .. conflict_note(details))
             log(paths, "epic " .. task_id .. " conflicted on "
               .. (#details.files > 0 and table.concat(details.files, ", ") or "unknown")
               .. "; the implementer redid the branch and the merge is retried")
@@ -1169,7 +1172,9 @@ function M.new(deps)
             task_id = task_id,
             epic = true,
             conflict = true,
-            conflict_files = details.conflict_files,
+            -- `conflict_details` exposes the file names under `files`: derive
+            -- the caller-facing field from it, never from a key it lacks.
+            conflict_files = (#details.files > 0) and details.files or nil,
           }
         end
       end
@@ -1788,15 +1793,19 @@ function M.new(deps)
           -- `merging` has no edge back to `running`: the repair is a
           -- continuation of the turn, not a failure, so status, phase and
           -- counter are written together. A reload then resumes in implement
-          -- with the conflict already journalled. The note itself is written
-          -- once, by `merge.run` (the repairable branch it returns from), so
-          -- the runtime does not duplicate it: one conflict, one note.
+          -- with the conflict already journalled. The note is written here, not
+          -- by `merge.run`: the runtime only announces a repair it has
+          -- committed to (the branch is back on the fresh base), so a
+          -- "will be redone" note can never coexist with a failure on the same
+          -- turn — one conflict, one note, and only when it is true.
           pcall(state.set_fields, paths.root, task_id, {
             status = "running",
             phase = "implement",
             conflict_retried = true,
             conflict_retries = repairs,
           })
+          journal_conflict(state, paths.root, task_id, details,
+            "merge conflict (repairable): " .. (merged.repair_note or conflict_note(details)))
           -- The branch is back on the fresh base: the PR is the same PR, so the
           -- push leases it and no second PR is opened.
           if type(deps.git.push) == "function" then
@@ -1818,6 +1827,10 @@ function M.new(deps)
             diagnosis = conflict_diagnosis(message),
             phase = "merge",
             task_id = task_id,
+            conflict = true,
+            -- The escalation is a conflict failure: carry its files so a caller
+            -- reading the result does not have to parse the message.
+            conflict_files = (#details.files > 0) and details.files or nil,
           }
         end
         -- A failure must always say why: `recover` turns a blank error into

@@ -666,23 +666,14 @@ local function run_impl(opts)
       -- command and the faulty commit instead of git's raw "rebase failed".
       details.escalation = M.escalation(details)
 
-      -- Journal the conflict (files, hunks, base, command) without touching
-      -- the status: the repair re-enters implement on the fresh base. The note
-      -- says the conflict is being repaired, not that it cannot be.
-      if type(state.append) == "function" then
-        local lines = { "merge conflict (repairable): " .. repair_note(details) }
-        for _, hunk in ipairs(details.conflict_hunks or {}) do
-          lines[#lines + 1] = string.format("--- %s:%s\n%s",
-            tostring(hunk.file), tostring(hunk.start), tostring(hunk.text))
-        end
-        pcall(state.append, root, {
-          kind = "note",
-          task_id = id,
-          text = table.concat(lines, "\n"),
-        })
-      end
-
+      -- The repairable wording is returned, not journaled here. `merge.lua`
+      -- cannot know whether the caller will actually be able to repair (the
+      -- fresh base may not resolve, the worktree may be gone): announcing "will
+      -- be redone" before the repair is committed lets the note coexist with a
+      -- `failed` on the same turn. The runtime journals this note once it has
+      -- committed to the repair, with the hunks attached.
       return {
+        repair_note = repair_note(details),
         ok = false,
         error = details.escalation,
         rebase = rebase,
