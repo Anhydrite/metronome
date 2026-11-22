@@ -124,20 +124,41 @@ local function candidates(text)
   return out
 end
 
+-- A JSON `null` decodes to a userdata sentinel, which would make the error read
+-- "got userdata". "got null" is what a model (and a human) can act on.
+local function value_type(value)
+  local kind = type(value)
+  if kind == "userdata" then
+    return "null"
+  end
+  return kind
+end
+
 -- Normalise one finding to the five keys schemas/task.schema.json knows about.
+-- The contract is deliberately tolerant: a bare string is a message (minor), an
+-- unknown severity falls back to major. What is never guessed is the message:
+-- a finding without one is refused, because a review with no claim is noise.
 -- Unknown keys are dropped rather than refused: a model that adds a helpful
 -- `file` or `suggestion` is not wrong, it is just verbose. A wrong value in a
 -- known key is an error, because silently coercing it would store a lie.
 local function normalize_finding(raw, index)
+  if type(raw) == "string" then
+    if not is_non_empty(raw) then
+      return nil, string.format("finding %d: message must be a non-empty string", index)
+    end
+    return { severity = "minor", message = raw }
+  end
+
   if type(raw) ~= "table" then
-    return nil, string.format("finding %d: not an object", index)
+    return nil, string.format(
+      "finding %d: expected an object with severity and message (got %s)",
+      index, value_type(raw)
+    )
   end
 
   local severity = raw.severity
   if type(severity) ~= "string" or not SEVERITIES[severity] then
-    return nil, string.format(
-      "finding %d: severity must be one of blocking, major, minor, nit", index
-    )
+    severity = "major"
   end
 
   local message = raw.message
@@ -741,6 +762,53 @@ local function read_sheet(task, root, opts)
   return "# Task " .. id .. "\n\n- Title: " .. tostring(task.title or "") .. "\n"
 end
 
+-- The raw answer of an invalid attempt is evidence: without it, a review that
+-- failed on a format error is indistinguishable from one that returned nothing.
+-- The runner records its own run_dir; when a caller's runner does not, fall back
+-- to the same layout the runner would have used under the state root.
+local function raw_review_dir(opts, task_id, attempt, run)
+  local dir = type(run) == "table" and run.run_dir or nil
+  if type(dir) == "string" and dir ~= "" then
+    return dir
+  end
+  if is_non_empty(opts.state_root) then
+    return fs.joinpath(opts.state_root, "runs", tostring(task_id), "review", tostring(attempt))
+  end
+  return nil
+end
+
+local function write_raw_review(opts, task_id, attempt, run)
+  local dir = raw_review_dir(opts, task_id, attempt, run)
+  if not dir then
+    return nil
+  end
+  local name = "review-raw-" .. tostring(attempt) .. ".txt"
+  local path = fs.joinpath(dir, name)
+  pcall(function()
+    fs.mkdir(dir, { parents = true })
+    local text = type(run) == "table" and run.text or ""
+    fs.write(path, type(text) == "string" and text or tostring(text))
+  end)
+  return path
+end
+
+-- The replay keeps the same SHA and round; only the prompt changes, and it
+-- names the exact defect so the model can fix the format rather than guess.
+local function correction_prompt(prompt, parse_error)
+  return table.concat({
+    prompt,
+    "",
+    "## Correction",
+    "",
+    "Your previous answer was not a valid review: " .. tostring(parse_error),
+    "",
+    "Return ONLY valid JSON, with no prose and no code fences, in this shape:",
+    '{"findings":[{"severity":"blocking|major|minor|nit","message":"..."}]}',
+    "Every finding must be an object with a non-empty message string.",
+    "",
+  }, "\n")
+end
+
 local function review_impl(opts)
   local ok, err = check_module("git", opts.git, { "head_sha", "changed_files", "run" })
   if not ok then
@@ -872,24 +940,28 @@ local function review_impl(opts)
   end
 
   local session_opts = type(opts.session_opts) == "table" and opts.session_opts or {}
-  local called, run = pcall(opts.runner, {
-    role = "reviewer",
-    task_id = task_id,
-    phase = "review",
-    prompt = prompt,
-    system = session_opts.system,
-    model_spec = session_opts.model_spec,
-    thinking = session_opts.thinking,
-    tools = session_opts.tools,
-    state_root = opts.state_root,
-    ctx = opts.ctx,
-  })
-  if not called then
-    run = { ok = false, error = tostring(run) }
-  elseif type(run) ~= "table" then
-    run = { ok = false, error = "runner returned no result" }
+  local function call_runner(turn_prompt)
+    local called, result = pcall(opts.runner, {
+      role = "reviewer",
+      task_id = task_id,
+      phase = "review",
+      prompt = turn_prompt,
+      system = session_opts.system,
+      model_spec = session_opts.model_spec,
+      thinking = session_opts.thinking,
+      tools = session_opts.tools,
+      state_root = opts.state_root,
+      ctx = opts.ctx,
+    })
+    if not called then
+      result = { ok = false, error = tostring(result) }
+    elseif type(result) ~= "table" then
+      result = { ok = false, error = "runner returned no result" }
+    end
+    return result
   end
 
+  local run = call_runner(prompt)
   if not run.ok then
     return {
       ok = false, error = run.error or "runner failed",
@@ -899,10 +971,35 @@ local function review_impl(opts)
 
   local findings, perr = M.parse_findings(run.text)
   if not findings then
-    return {
-      ok = false, error = "review output invalid: " .. tostring(perr),
-      round = round, sha = sha, run = run,
-    }
+    -- A malformed review is a format problem, not a verdict: give the model
+    -- one replay with the exact defect before letting the task fail. The same
+    -- SHA and round are kept: nothing moved, so the answer can be repaired.
+    write_raw_review(opts, task_id, 1, run)
+
+    local retry_run = call_runner(correction_prompt(prompt, perr))
+    if not retry_run.ok then
+      return {
+        ok = false, error = retry_run.error or "runner failed",
+        round = round, sha = sha, run = retry_run,
+      }
+    end
+
+    local retry_findings, retry_err = M.parse_findings(retry_run.text)
+    if not retry_findings then
+      write_raw_review(opts, task_id, 2, retry_run)
+      -- Typed and transient: the checkpoint, branch and transcript stay put,
+      -- so recovery can resume the task instead of declaring it failed.
+      return {
+        ok = false,
+        cause = "review_invalid",
+        transient = true,
+        error = "review_invalid: " .. tostring(retry_err),
+        round = round, sha = sha, run = retry_run,
+      }
+    end
+
+    run = retry_run
+    findings = retry_findings
   end
 
   -- The branch may have moved while the model was reading. A review of a
