@@ -918,6 +918,17 @@ function M.new(deps)
     return { ok = true, task_id = task_id, pr = pr, merged = merged, epic = true }
   end
 
+  -- Typed-failure helpers, defined below the drain they are shared with.
+  -- `run_task` already diagnoses the failures it can name (a fetch that never
+  -- started), so the locals have to exist before it is defined.
+  local recover_module
+  local recover_opts
+  local describe_failure
+  local typed_failure
+  local fetch_diagnosis
+  local later
+  local retry_attempts
+
   local function run_task(opts, task_id, paths, cfg, runner, session)
     local state = deps.state
     local loaded = state.load(paths.root)
@@ -978,7 +989,10 @@ function M.new(deps)
       -- The base can move while the implementer works (another task merges).
       -- Rebase onto the fresh origin/base before the checks and the converge
       -- diff, so the diff is measured against the base the PR will merge into.
-      -- A conflict sends the task back to implementation on the new base.
+      -- The rebase fetches, so a fix merged into master or into the epic branch
+      -- is seen by a task already in flight. A conflict sends the task back to
+      -- implementation on the new base.
+      local diff_base = "origin/" .. base
       if deps.merge and type(deps.merge.rebase) == "function" then
         local rebased, rebase_err, rebase_diag = deps.merge.rebase({
           repo = paths.repo,
@@ -1025,10 +1039,25 @@ function M.new(deps)
             return nil, {
               ok = false,
               conflict = true,
+              phase = "implement",
               error = "rebase onto fresh base conflicted: " .. tostring(rebase_err),
             }
           end
-          return nil, { ok = false, error = "rebase before checks failed: " .. tostring(rebase_err) }
+          -- The rebase never started: it is the fetch that failed. A remote or
+          -- credential problem is transient whatever git printed, so the task
+          -- is retried instead of being condemned by a generic string.
+          return nil, {
+            ok = false,
+            phase = "verify",
+            error = "cannot refresh the base before the checks: " .. tostring(rebase_err),
+            diagnosis = fetch_diagnosis(rebase_err),
+          }
+        end
+        -- The rebase just fetched the remote and reports the exact ref it
+        -- rebased onto: that fresh base is what the convergence diff must be
+        -- read against, not the ref resolved before the fetch.
+        if type(rebased) == "table" and is_non_empty(rebased.base) then
+          diff_base = rebased.base
         end
         -- A rebase rewrites the branch, so the remote still holds the old
         -- commits: push the rewritten branch now, or the PR and the SHA the
@@ -1040,7 +1069,12 @@ function M.new(deps)
             force = true,
           })
           if not pushed then
-            return nil, { ok = false, error = "push after rebase failed: " .. tostring(push_err) }
+            return nil, {
+              ok = false,
+              phase = "verify",
+              error = "push after rebase failed: " .. tostring(push_err),
+              diagnosis = fetch_diagnosis(push_err),
+            }
           end
         end
       end
@@ -1053,14 +1087,18 @@ function M.new(deps)
         rollback = false,
       })
       if not verified or not verified.ok then
-        return nil, { ok = false, error = (verified and verified.error) or "checks failed", impl = impl }
+        return nil, {
+          ok = false,
+          phase = "verify",
+          error = (verified and verified.error) or "checks failed",
+          impl = impl,
+        }
       end
       deps.checks.write_report(paths.root, task_id, verified, {})
 
       -- The worktree is cut from origin/<base>, so the diff must be read
-      -- against the same ref. The local base branch is not advanced by a
-      -- GitHub merge.
-      local diff_base = "origin/" .. base
+      -- against the same ref, refreshed by the rebase above. The local base
+      -- branch is not advanced by a GitHub merge.
       local sheet = deps.implement.read_sheet(paths.root, task, { tasks_dir = paths.tasks })
       local converged = deps.converge.run({
         task = task,
@@ -1078,6 +1116,8 @@ function M.new(deps)
       if not converged.ok then
         return nil, converged
       end
+      -- The review and the merge read their diff against the same fresh base.
+      impl.diff_base = diff_base
       return impl
     end
 
@@ -1096,7 +1136,7 @@ function M.new(deps)
 
     local worktree = impl.ctx.worktree
     local checks = task.checks or cfg.checks.default
-    local diff_base = "origin/" .. base
+    local diff_base = impl.diff_base or ("origin/" .. base)
 
     state.transition(paths.root, task_id, "verifying", { phase = "verify" })
     state.transition(paths.root, task_id, "reviewing", { phase = "review" })
@@ -1405,9 +1445,141 @@ function M.new(deps)
     return fn()
   end
 
+  -- Run `fn` after `ms` milliseconds, off the caller's turn. The host seam is
+  -- `deps.defer` (tests), then `maki.defer_fn`; nil means no timer is available
+  -- and the caller falls back to an immediate, still bounded, action.
+  later = function(fn, ms)
+    local defer = type(deps.defer) == "function" and deps.defer
+      or (type(maki.defer_fn) == "function" and maki.defer_fn)
+      or nil
+    if not defer then
+      return nil
+    end
+    local ok, handle = pcall(defer, fn, ms)
+    if not ok then
+      return nil
+    end
+    return handle or true
+  end
+
+  -- The typed failure policy: classify, record and decide. `deps.recover` is
+  -- the seam; the module is loaded once when the wiring leaves it out, so a
+  -- caller that only injects the pipeline modules still gets typed failures.
+  local cached_recover
+  recover_module = function()
+    if type(deps.recover) == "table" then
+      return deps.recover
+    end
+    if cached_recover ~= nil then
+      return cached_recover or nil
+    end
+    local ok, mod = pcall(require, "metronome.recover")
+    if ok and type(mod) == "table" then
+      cached_recover = mod
+      return mod
+    end
+    cached_recover = false
+    return nil
+  end
+
+  -- The retry bounds for this project: the optional `[recover]` section first,
+  -- recover's defaults otherwise. `auto_retry = false` keeps the escalation to
+  -- a human even for a transient cause, for a project that does not want the
+  -- scheduler spending a budget on a durably broken environment.
+  recover_opts = function(cfg)
+    local section = type(cfg) == "table" and type(cfg.recover) == "table" and cfg.recover or nil
+    local out = {}
+    if section then
+      out.max_attempts = tonumber(section.max_attempts)
+      out.backoff_base_secs = tonumber(section.backoff_base_secs)
+      out.backoff_max_secs = tonumber(section.backoff_max_secs)
+      out.factor = tonumber(section.factor)
+      out.auto_retry = section.auto_retry ~= false
+    else
+      out.auto_retry = true
+    end
+    return out
+  end
+
+  -- One line that names the cause, the remedy and what happens next, so a log
+  -- line or a notification is actionable without reading the transcript.
+  describe_failure = function(failure, decision)
+    failure = type(failure) == "table" and failure or {}
+    decision = type(decision) == "table" and decision or {}
+    local action
+    if decision.action == "auto_retry" then
+      action = string.format("automatic retry in %ds", tonumber(decision.delay_secs) or 0)
+    elseif decision.action == "none" then
+      action = "redo the step, nothing was lost"
+    else
+      action = "human intervention required"
+    end
+    return string.format("%s: %s — remedy: %s — %s (attempt %s/%s)",
+      tostring(failure.cause or "unknown"),
+      tostring(failure.message or "(no message)"),
+      tostring(failure.remedy or "inspect the transcript"),
+      action,
+      tostring(failure.attempts or 0),
+      tostring(decision.max_attempts or "?"))
+  end
+
+  -- A step may hand back its own diagnosis: a fetch failure is a network or
+  -- credentials problem whatever git printed, and a red gate is a code problem.
+  -- That diagnosis wins over the textual classification, while the record keeps
+  -- the attempt accounting and the backoff deadline the policy computed.
+  typed_failure = function(failure, diagnosis, opts)
+    if type(failure) ~= "table" or type(diagnosis) ~= "table" then
+      return failure
+    end
+    failure.cause = diagnosis.cause or failure.cause
+    failure.message = diagnosis.message or failure.message
+    failure.remedy = diagnosis.remedy or failure.remedy
+    failure.transient = diagnosis.transient == true
+    failure.retryable = diagnosis.retryable == true
+    failure.remediable = diagnosis.remediable ~= false
+    local recover = recover_module()
+    local at = tonumber(failure.at) or os.time()
+    if failure.transient then
+      local backoff = recover and type(recover.backoff_secs) == "function"
+        and recover.backoff_secs(failure.attempts, opts) or 0
+      failure.next_retry_at = at + backoff
+    else
+      -- A permanent cause schedules nothing: only a human can unblock it.
+      failure.next_retry_at = at
+    end
+    return failure
+  end
+
+  -- A rebase that fails before it starts is a fetch failure. Whatever git
+  -- printed, the cause is the remote or the credentials, which a retry or a
+  -- login can fix: classify it, and fall back to `network`/transient rather
+  -- than a generic permanent string.
+  fetch_diagnosis = function(err)
+    local recover = recover_module()
+    local diagnosis = recover and type(recover.classify) == "function"
+      and recover.classify(err) or nil
+    if type(diagnosis) == "table" then
+      local cause = diagnosis.cause
+      if cause == "network" or cause == "auth" or cause == "timeout"
+        or cause == "killed" or cause == "quota" or cause == "session_dead"
+        or cause == "binary_missing" then
+        return diagnosis
+      end
+    end
+    return {
+      cause = "network",
+      message = "cannot fetch the base from origin: " .. tostring(err or "no output"),
+      remedy = "check the network, the remote and the credentials (gh auth status), then retry.",
+      transient = true,
+      retryable = true,
+      remediable = true,
+    }
+  end
+
   -- A task that will not be merged must not leave an open PR behind: the list
   -- fills with pull requests nobody will ever look at. The branch stays, so a
-  -- retry can still resume from its checkpoints.
+  -- retry can still resume from its checkpoints. A transient failure never
+  -- reaches this: the branch and the PR are what its retry resumes from.
   local function close_open_pr(paths, task_id)
     local loaded = deps.state.load(paths.root)
     local task = loaded and loaded.tasks and loaded.tasks[task_id]
@@ -1435,6 +1607,12 @@ function M.new(deps)
   -- One handle per task in flight. Stopping a task means cancelling its spawn,
   -- not only moving its status: the session it opened has to die too.
   local task_handles = {}
+
+  -- Filled in with the drain helpers below. A task dispatched by the scheduler
+  -- runs through exactly the same failure policy as a retry or a resume, so the
+  -- scheduler only needs the runner here, not a second copy of the policy.
+  local run_and_handle
+  local schedule_retry
 
   -- The part of a run that follows qualification: the analysis gate, the
   -- scheduler loop and the optional deploy. `submit` reaches it after applying
@@ -1467,21 +1645,14 @@ function M.new(deps)
     -- by `async.join` lives in the drain's scope, and maki kills the live jobs
     -- of a scope when it ends: the sessions died mid-review. A spawn outlives
     -- the drain, and a finished task re-triggers the drain to refill the slots.
+    --
+    -- No task ever runs on the scheduler's turn: `dispatch_one` only spawns.
+    -- That is what makes the drain unblockable — a slow, stuck or crashing task
+    -- leaves the loop free to start the next one.
     local function dispatch_one(task)
-      local fn = function()
-        local result = run_task(opts, task.id, paths, cfg, runner, session)
-        if type(result) == "table" and result.conflict then
-          -- The branch is back on the fresh base: redo the work once.
-          result = run_task(opts, task.id, paths, cfg, runner, session)
-        end
+      local handle = spawn(function()
+        local result = run_and_handle(opts, paths, cfg, runner, session, task.id)
         results[#results + 1] = result
-        if not result.ok then
-          local reason = tostring(result.error or "task failed")
-          log(paths, "task " .. task.id .. " failed: " .. reason)
-          pcall(deps.state.transition, paths.root, task.id, "failed", { reason = reason })
-          close_open_pr(paths, task.id)
-          notify_failure(opts.ctx, task.id, reason)
-        end
         -- A slot just freed: another ready task may start now. Only in the
         -- async path, where the drain returned long ago; setting the flag in
         -- the synchronous path would make its drain loop forever.
@@ -1491,14 +1662,10 @@ function M.new(deps)
             pcall(runtime.run_pending)
           end)
         end
-      end
-      if deps.async then
-        task_handles[task.id] = spawn(function()
-          fn()
-          task_handles[task.id] = nil
-        end)
-      else
-        fn()
+        task_handles[task.id] = nil
+      end)
+      if handle ~= nil then
+        task_handles[task.id] = handle
       end
     end
 
@@ -1660,7 +1827,7 @@ function M.new(deps)
       return false
     end
     local text = string.format(
-      "Metronome: task %s failed: %s. Call metronome_status for the detail, then metronome_retry to restart it.",
+      "Metronome: task %s failed: %s. The worktree, branch, checkpoints and transcript are intact. Call metronome_status for the detail, then metronome_retry (or /reload) to resume it.",
       tostring(task_id), tostring(reason or "unknown error"))
     if maki.session and type(maki.session.notify) == "function" then
       local ok, sent = pcall(maki.session.notify, text, { session = sid, wake = true })
@@ -1696,6 +1863,195 @@ function M.new(deps)
     end
   end
 
+  -- Failure policy -----------------------------------------------------------
+
+  -- Attempts already spent on each task's current failure streak. The journal
+  -- zeroes `failure.attempts` when a task moves back to `running` (a human
+  -- retry must get a fresh budget), so an automatic retry has to remember its
+  -- own count across that move: without it the bound would never be reached and
+  -- a transient failure would loop forever.
+  retry_attempts = {}
+
+  -- Persist a typed failure and decide what happens next. Nothing is
+  -- destroyed: the worktree, the branch, the checkpoints and the run directory
+  -- stay exactly where the failure found them, and the pull request is left
+  -- open so a retry resumes the same work instead of redoing it from scratch.
+  --
+  -- A transient cause is retried without waking a human: `schedule_retry`
+  -- enqueues a spawn after the policy's backoff, bounded by `max_attempts`.
+  -- Only a cause a retry cannot fix (auth, an unknown cause, a conflict, red
+  -- checks, an exhausted budget) escalates, with a text that names both the
+  -- cause and the remedy.
+  local function handle_failure(opts, paths, cfg, runner, session, task_id, err, result)
+    local recover = recover_module()
+    local loaded = deps.state.load(paths.root)
+    local task = loaded and loaded.tasks and loaded.tasks[task_id]
+    local prior = task and task.failure
+    local message = tostring(err or "")
+    if message == "" then
+      message = "task failed without an error message"
+    end
+    local phase = (type(result) == "table" and result.phase)
+      or (type(prior) == "table" and prior.phase)
+      or (task and task.phase)
+      or "implement"
+    local diagnosis = type(result) == "table" and result.diagnosis or nil
+
+    local ropts = recover_opts(cfg)
+    ropts.phase = phase
+    ropts.now = type(opts) == "table" and tonumber(opts.now) or nil
+
+    -- Count the attempt from the streak, not from the task: the `running`
+    -- transition on the way in has just zeroed the persisted counter.
+    local streak = retry_attempts[task_id]
+    if streak == nil then
+      streak = tonumber(type(prior) == "table" and prior.attempts) or 0
+    end
+    local attempt_prior = { attempts = streak, phase = phase }
+
+    local failure
+    local decision
+    if recover and type(recover.record) == "function" then
+      failure = recover.record(message, attempt_prior, ropts)
+      failure = typed_failure(failure, diagnosis, ropts)
+      if type(recover.decide) == "function" then
+        decision = recover.decide(failure, ropts)
+      end
+    end
+    if type(failure) ~= "table" then
+      -- Without the policy module the task still gets a readable record, so the
+      -- journal and the panel never lose the reason it stopped.
+      failure = {
+        cause = "unknown",
+        message = message:gsub("%s+", " "):sub(1, 300),
+        remedy = "inspect the transcript and the worktree, then retry.",
+        transient = false,
+        attempts = streak + 1,
+        at = os.time(),
+        phase = phase,
+      }
+    end
+    if type(decision) ~= "table" then
+      decision = { action = "human", delay_secs = 0, max_attempts = 1, phase = phase }
+    end
+    local reason = describe_failure(failure, decision)
+
+    pcall(deps.state.set_fields, paths.root, task_id, { failure = failure })
+    if type(deps.state.transition) == "function" then
+      local moved, merr = deps.state.transition(paths.root, task_id, "failed", {
+        reason = reason,
+        failure = failure,
+        phase = phase,
+      })
+      if not moved then
+        log(paths, "cannot mark task " .. tostring(task_id) .. " failed: " .. tostring(merr))
+      end
+    end
+    log(paths, "task " .. tostring(task_id) .. " failed: " .. reason)
+
+    -- `none` is a benign cause ("nothing to commit"): redo the step, bounded
+    -- like any other, instead of waking a human for a tree that is already at
+    -- the requested state.
+    local retry = decision.action == "auto_retry"
+    if decision.action == "none" then
+      local attempts = tonumber(failure.attempts) or 0
+      local cap = tonumber(decision.max_attempts) or 1
+      retry = attempts < cap
+      if retry then
+        decision.delay_secs = 0
+      end
+    end
+
+    if retry and ropts.auto_retry ~= false and type(schedule_retry) == "function" then
+      schedule_retry(opts, paths, cfg, runner, session, task_id, failure, decision)
+      return { ok = false, failure = failure, decision = decision, retrying = true, reason = reason }
+    end
+    notify_failure(type(opts) == "table" and opts.ctx or nil, task_id, reason)
+    return { ok = false, failure = failure, decision = decision, retrying = false, reason = reason }
+  end
+
+  -- Enqueue one bounded re-dispatch of a task that failed transiently. The
+  -- backoff comes from the policy; the retry itself is a plain scheduler job,
+  -- so `run_pending` spawns it like any other dispatch and never blocks on it.
+  schedule_retry = function(opts, paths, cfg, runner, session, task_id, failure, decision)
+    local delay = tonumber(decision.delay_secs) or 0
+    local phase = (type(failure) == "table" and failure.phase)
+      or (type(decision) == "table" and decision.phase)
+      or "implement"
+    -- Remember the attempt across the `running` move that settles the journal.
+    local attempt = tonumber(type(failure) == "table" and failure.attempts) or 1
+    retry_attempts[task_id] = attempt
+    local cause = tostring(type(failure) == "table" and failure.cause or "transient")
+    local function job()
+      -- The legal `failed -> running` edge is the resume: it also settles the
+      -- attempt deadline so the next failure counts from this attempt.
+      local moved, merr = deps.state.transition(paths.root, task_id, "running", { phase = phase })
+      if not moved then
+        log(paths, "automatic retry of " .. tostring(task_id) .. " refused: " .. tostring(merr))
+        return nil
+      end
+      log(paths, string.format("task %s: automatic retry (attempt %s/%s) after a %s failure",
+        tostring(task_id), tostring(attempt),
+        tostring(type(decision) == "table" and decision.max_attempts or "?"), cause))
+      return run_and_handle(opts, paths, cfg, runner, session, task_id)
+    end
+
+    local function enqueue()
+      scheduler_extra[#scheduler_extra + 1] = job
+      schedule_job(opts, paths, cfg, runner, session)
+      return true
+    end
+
+    if delay > 0 then
+      local armed = later(enqueue, delay * 1000)
+      if armed then
+        log(paths, string.format("task %s: retry scheduled in %ds", tostring(task_id), delay))
+        return true
+      end
+    end
+    return enqueue()
+  end
+
+  -- One dispatch of one task with the failure policy attached. Every entry
+  -- point — the scheduler, a human retry, a resume after reload, an automatic
+  -- retry — goes through here, so a failure is always typed, always persisted
+  -- and always either retried or escalated.
+  run_and_handle = function(opts, paths, cfg, runner, session, task_id)
+    local ok, result = pcall(run_task, opts, task_id, paths, cfg, runner, session)
+    if not ok then
+      -- A crash is a failure like any other: nothing raised here reaches the
+      -- drain, and the task keeps the artefacts a retry resumes from.
+      local failed = { ok = false, error = tostring(result) }
+      runtime.last_background = failed
+      handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed)
+      return failed
+    end
+    if type(result) == "table" and result.conflict then
+      -- The branch is back on the fresh base: redo the work once.
+      log(paths, "task " .. tostring(task_id) .. " conflicted with the fresh base; redoing it")
+      local again_ok, again = pcall(run_task, opts, task_id, paths, cfg, runner, session)
+      ok, result = again_ok, again
+      if not ok then
+        local failed = { ok = false, error = tostring(result) }
+        runtime.last_background = failed
+        handle_failure(opts, paths, cfg, runner, session, task_id, failed.error, failed)
+        return failed
+      end
+    end
+    if type(result) ~= "table" then
+      result = { ok = false, error = tostring(result) }
+    end
+    runtime.last_background = result
+    if result.ok then
+      -- The streak is over: the next failure, if any, starts from attempt one.
+      retry_attempts[task_id] = nil
+      return result
+    end
+    local err = result.error or result.reason or result
+    handle_failure(opts, paths, cfg, runner, session, task_id, err, result)
+    return result
+  end
+
   function runtime.has_pending()
     return (scheduler_dirty or #scheduler_extra > 0) and not scheduler_running
   end
@@ -1709,8 +2065,11 @@ function M.new(deps)
     local ok, err = pcall(function()
       while #scheduler_extra > 0 or scheduler_dirty do
         while #scheduler_extra > 0 do
-          local fn = table.remove(scheduler_extra, 1)
-          fn()
+          local job = table.remove(scheduler_extra, 1)
+          -- A retry or a resume is a run_task like any other: it runs in its
+          -- own spawn, so a queue of them can never hold the drain. The loop
+          -- keeps draining while the tasks are still in flight.
+          spawn(job)
         end
         if scheduler_dirty then
           scheduler_dirty = false
@@ -2134,6 +2493,20 @@ function M.new(deps)
     if not moved then
       return { ok = false, error = err }
     end
+    -- A human retry is a fresh start: the attempt budget starts again from
+    -- zero, so the automatic policy can act on the next failure instead of
+    -- seeing a budget the user just reset as already spent.
+    retry_attempts[input.id] = nil
+    local prior = type(task.failure) == "table" and task.failure or nil
+    if prior and type(deps.state.set_fields) == "function" then
+      local reset = {}
+      for key, value in pairs(prior) do
+        reset[key] = value
+      end
+      reset.attempts = 0
+      reset.next_retry_at = nil
+      pcall(deps.state.set_fields, paths.root, input.id, { failure = reset })
+    end
 
     -- A retry is a restart, not just a status move: re-dispatch the task from
     -- its last checkpoint so the user does not have to submit it again.
@@ -2150,22 +2523,11 @@ function M.new(deps)
     pcall(function()
       maki.log.info("metronome retry bg in=" .. type(opts.ctx) .. " out=" .. type(bg.ctx))
     end)
+    -- Queued, not run: `run_pending` spawns the job, so even a retry that hangs
+    -- cannot hold the drain. The failure policy is the same one the scheduler
+    -- uses, so a retry that fails again is typed and, when transient, retried.
     scheduler_extra[#scheduler_extra + 1] = function()
-      local ok, result = pcall(run_task, bg, input.id, paths, cfg, runner, session)
-      if not ok then
-        log(paths, "retry error: " .. tostring(result))
-        pcall(deps.state.transition, paths.root, input.id, "failed", {
-          reason = tostring(result),
-        })
-        notify_failure(bg.ctx, input.id, tostring(result))
-        return
-      end
-      if not result.ok then
-        local reason = tostring(result.error or "task failed")
-        pcall(deps.state.transition, paths.root, input.id, "failed", { reason = reason })
-        notify_failure(bg.ctx, input.id, reason)
-      end
-      runtime.last_background = result
+      return run_and_handle(bg, paths, cfg, runner, session, input.id)
     end
     schedule_job(bg, paths, cfg, runner, session)
     return { ok = true, background = true, task = moved }
@@ -2527,21 +2889,19 @@ function M.new(deps)
     end
 
     -- Walk each interrupted task back to `running` through legal transitions,
-    -- then re-dispatch it from its last checkpoint. Without the dispatch the
-    -- task only changes status and nothing drives it.
+    -- then re-dispatch it from its last checkpoint. `pipeline.resume` also
+    -- selects the `failed` tasks that are still retryable, so a `/reload`
+    -- restarts a transient failure instead of leaving it parked. Without the
+    -- dispatch the task only changes status and nothing drives it.
     local resumed, err = deps.pipeline.resume(deps.state, paths.root, {
       apply = true,
+      -- The same policy and bounds the drain uses, so a resume never retries
+      -- past the budget the project set.
+      recover = recover_module(),
+      max_attempts = recover_opts(cfg).max_attempts,
       dispatch = function(task)
         scheduler_extra[#scheduler_extra + 1] = function()
-          local ok, result = pcall(run_task, opts, task.id, paths, cfg, runner, session)
-          if not ok or not (type(result) == "table" and result.ok) then
-            local reason = (not ok and tostring(result))
-              or (type(result) == "table" and result.error)
-              or "resume failed"
-            pcall(deps.state.transition, paths.root, task.id, "failed", { reason = tostring(reason) })
-            notify_failure(opts.ctx, task.id, reason)
-          end
-          runtime.last_background = result
+          return run_and_handle(opts, paths, cfg, runner, session, task.id)
         end
       end,
     })
@@ -2556,12 +2916,25 @@ function M.new(deps)
   end
 
   function runtime.feedback(input)
-    local paths = p()
+    local paths = project_paths()
     local result, err = deps.calibrate.feedback(paths.root, input)
     if not result then
       return { ok = false, error = err }
     end
-    return { ok = true, result = result }
+    -- The feedback is ingested: drive the tasks it concerns now, instead of
+    -- waiting for a new submission. A workflow must never stay stopped after a
+    -- human did something.
+    local cfg, cerr = load_config(nil)
+    if not cfg then
+      return { ok = false, error = cerr, result = result }
+    end
+    local opts = { ctx = background_ctx(nil) }
+    local runner, session, _, perr = prepare(opts, cfg, paths)
+    if not runner then
+      return { ok = false, error = perr, result = result }
+    end
+    schedule_job(opts, paths, cfg, runner, session)
+    return { ok = true, result = result, background = true }
   end
 
   -- Natural-language routing mode. `input.value` is "on" or "off"; without a
