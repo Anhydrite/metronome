@@ -470,6 +470,16 @@ local function run_impl(opts)
   local sheet = read_sheet(task, root, opts)
   local prompt = M.prompt(task, plan, checks_text, sheet, opts)
 
+  -- Capture the pending base before the runner runs. A merge can land during
+  -- the deploy and move the flag forward; only the base we ship here may be
+  -- cleared afterwards.
+  local pending_before
+  if type(state.deploy_pending) == "function" then
+    pending_before = state.deploy_pending(root)
+  end
+  local pending_base = type(pending_before) == "table" and is_non_empty(pending_before.base)
+    and pending_before.base or nil
+
   local run
   local script = opts.script == true and M.plan_script(plan) or nil
   if script then
@@ -525,10 +535,16 @@ local function run_impl(opts)
     pcall(state.append, root, { kind = "note", task_id = id, text = "deployed" })
   end
 
-  -- A successful deploy drains the base it shipped. Leaving the flag set would
-  -- report work pending forever and let a later drainer re-deploy an old base.
-  if type(state.clear_deploy_pending) == "function" then
-    pcall(state.clear_deploy_pending, root)
+  -- A successful deploy drains the base it shipped — but only if the flag
+  -- still holds that same base. A merge that landed during the run already
+  -- moved the flag to a newer base; clearing it here would lose the follow-up.
+  if pending_base and type(state.clear_deploy_pending) == "function" then
+    local current = type(state.deploy_pending) == "function"
+      and state.deploy_pending(root) or nil
+    local current_base = type(current) == "table" and current.base or nil
+    if current_base == pending_base then
+      pcall(state.clear_deploy_pending, root)
+    end
   end
 
   local log = M.write_log(root, id, {
