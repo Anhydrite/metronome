@@ -2032,8 +2032,24 @@ auto_deploy = false
     "the recorded cause is typed review_invalid")
   eq(held_record.failure and held_record.failure.transient, true,
     "the recorded cause is transient")
-  eq(held_record.failure and held_record.failure.held, nil,
-    "the recorded failure stays inside the schema's closed key set")
+  -- `set_fields` writes a raw `field` event that the journal replays verbatim,
+  -- so every key of the persisted failure must belong to the schema's closed
+  -- set (schemas/task.schema.json). A stray key such as `held` would poison the
+  -- replayed projection and fail tools/validate-state.py.
+  do
+    local allowed = {
+      cause = true, message = true, remedy = true, transient = true,
+      attempts = true, at = true, next_retry_at = true, phase = true,
+    }
+    local stray = {}
+    for key in pairs(held_record.failure or {}) do
+      if not allowed[key] then
+        stray[#stray + 1] = tostring(key)
+      end
+    end
+    eq(#stray, 0, "the recorded failure stays inside the schema's closed key set: "
+      .. table.concat(stray, ","))
+  end
   local held_result = type(rt_held.last_background) == "table"
     and type(rt_held.last_background.results) == "table"
     and rt_held.last_background.results[1] or nil
