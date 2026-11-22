@@ -96,7 +96,7 @@ A task is done when these commands exit 0, not when a model says so. A red check
 | --- | --- | --- |
 | `git-identity` | `user.name` and `user.email` are set and non-empty in `project.repo`. | `git config --global user.name` and `git config --global user.email`. |
 | `git-test-commit` | A probe commit passes in a throwaway worktree cut from `project.base_ref`; the worktree is removed on both paths. | Fix the identity, a blocking pre-commit hook or the repository permissions. |
-| `checks-executable` | The first word of every declared check resolves on `PATH` with its dependencies, so `npm test` fails here rather than at exit 127 mid-task when `node`/`npm` are absent. | Install the missing program, or fix the declared command. |
+| `checks-executable` | The program word of every declared check resolves on `PATH`. It proves the program word resolves only: the rest of the command and its runtime dependencies are not resolved, so `npm test` passes this check with `npm` on `PATH` even when `node` is absent or `package.json` declares no `test` script. | Install the missing program, or fix the declared command. |
 | `origin-base` | `project.repo` has an `origin`, and that `origin` has `project.base_ref`. | `git remote add origin <url>`, then push the base branch. |
 | `toolchain` | `python3` imports `jsonschema`, which `scripts/validate.sh` needs. | `python3 -m pip install jsonschema`. |
 
