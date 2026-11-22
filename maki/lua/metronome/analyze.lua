@@ -314,16 +314,25 @@ function M.analyze(tasks, opts)
     local group_key = ""
     if is_non_empty(task.base_ref) then
       group_key = trim(task.base_ref)
-    elseif type(opts.base_ref) == "string" and opts.base_ref ~= "" then
-      group_key = opts.base_ref
+    elseif is_non_empty(opts.base_ref) then
+      -- Trim it like the per-task base_ref, or a padded batch base_ref would
+      -- split a group that should be one.
+      group_key = trim(opts.base_ref)
     end
     groups[i] = group_key
   end
 
   local group_indexes = {}
+  local group_order = {}
   for i = 1, #ids do
     local key = groups[i]
-    group_indexes[key] = group_indexes[key] or {}
+    if not group_indexes[key] then
+      group_indexes[key] = {}
+      -- Remember the key the first time it appears so the groups can be
+      -- walked in task-index order: `pairs` order is not reproducible and the
+      -- findings must land in a stable order in the report.
+      group_order[#group_order + 1] = key
+    end
     local group = group_indexes[key]
     group[#group + 1] = i
   end
@@ -450,7 +459,8 @@ function M.analyze(tasks, opts)
   -- dependency_cycle: a loop among two or more tasks of the same base
   -- branch. A cycle across groups would be an artifact: those tasks are
   -- never scheduled together.
-  for _, indexes in pairs(group_indexes) do
+  for _, group_key in ipairs(group_order) do
+    local indexes = group_indexes[group_key]
     local group_ids = {}
     local group_set = {}
     for k, i in ipairs(indexes) do

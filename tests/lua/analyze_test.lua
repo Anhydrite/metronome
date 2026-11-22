@@ -150,15 +150,33 @@ return function()
   -- analyze: inter-task rules are scoped by base_ref -----------------------
 
   -- Two tasks cut from different base branches are never concurrent: same
-  -- title, same files and checks that name each other's files must not be
-  -- compared at all.
+  -- title, partially overlapping files and checks that name each other's
+  -- files must not be compared at all. The file sets are deliberately not
+  -- identical (so file_overlap can fire on the shared file) and each check
+  -- names a file only the other task owns (so undeclared_file_dependency and
+  -- undeclared_gate_dependency can fire): any rule that forgets its
+  -- same-group guard fails this block.
   local other_epics = analyze.analyze({
-    { id = "T-20261122-a001", title = "Shared title", files = { "src/shared.lua" },
-      checks = { "node src/other.js" }, depends_on = {}, base_ref = "metronome/epic/a" },
-    { id = "T-20261122-b001", title = "  shared   TITLE.  ", files = { "src/shared.lua" },
-      checks = { "node src/shared.js" }, depends_on = {}, base_ref = "metronome/epic/b" },
+    { id = "T-20261122-a001", title = "Shared title",
+      files = { "src/shared.lua", "src/only_a.lua" },
+      checks = { "node src/only_b.lua" }, depends_on = {},
+      base_ref = "metronome/epic/a" },
+    { id = "T-20261122-b001", title = "  shared   TITLE.  ",
+      files = { "src/shared.lua", "src/only_b.lua" },
+      checks = { "node src/only_a.lua" }, depends_on = {},
+      base_ref = "metronome/epic/b" },
   })
   eq(other_epics.ok, true, "tasks of different epics are ok")
+  eq(count_rule(other_epics, "duplicate_title"), 0,
+    "duplicate_title never crosses base_ref groups")
+  eq(count_rule(other_epics, "duplicate_files"), 0,
+    "duplicate_files never crosses base_ref groups")
+  eq(count_rule(other_epics, "file_overlap"), 0,
+    "file_overlap never crosses base_ref groups")
+  eq(count_rule(other_epics, "undeclared_file_dependency"), 0,
+    "undeclared_file_dependency never crosses base_ref groups")
+  eq(count_rule(other_epics, "undeclared_gate_dependency"), 0,
+    "undeclared_gate_dependency never crosses base_ref groups")
   eq(#other_epics.findings, 0, "tasks of different base_refs are never compared")
 
   -- A shared base_ref via opts groups the whole batch: a real duplicate is
@@ -193,6 +211,34 @@ return function()
   eq(find_rule(cross_epic_cycle, "dependency_cycle"), nil,
     "a cycle spanning two base_ref groups is not reported")
   eq(cross_epic_cycle.ok, true, "cross-group edges do not block")
+
+  -- Two cycles in two groups: the findings are emitted per group in
+  -- task-index order, so the report is reproducible (pairs order is not).
+  local two_cycles = analyze.analyze({
+    { id = "T-20261122-a008", title = "A first", files = { "src/a1.lua" },
+      checks = { "make test" }, depends_on = { "T-20261122-a009" },
+      base_ref = "metronome/epic/a" },
+    { id = "T-20261122-b008", title = "B first", files = { "src/b1.lua" },
+      checks = { "make test" }, depends_on = { "T-20261122-b009" },
+      base_ref = "metronome/epic/b" },
+    { id = "T-20261122-a009", title = "A second", files = { "src/a2.lua" },
+      checks = { "make test" }, depends_on = { "T-20261122-a008" },
+      base_ref = "metronome/epic/a" },
+    { id = "T-20261122-b009", title = "B second", files = { "src/b2.lua" },
+      checks = { "make test" }, depends_on = { "T-20261122-b008" },
+      base_ref = "metronome/epic/b" },
+  })
+  local cycles = {}
+  for _, finding in ipairs(two_cycles.findings) do
+    if finding.rule == "dependency_cycle" then
+      cycles[#cycles + 1] = finding
+    end
+  end
+  eq(#cycles, 2, "each group reports its own cycle")
+  eq(cycles[1] and cycles[1].tasks[1], "T-20261122-a008",
+    "groups are walked in task-index order (first group first)")
+  eq(cycles[2] and cycles[2].tasks[1], "T-20261122-b008",
+    "groups are walked in task-index order (second group second)")
 
   -- Per-task rules still run on every task, whatever its group.
   local per_task_groups = analyze.analyze({
