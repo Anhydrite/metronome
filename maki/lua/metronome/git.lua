@@ -10,6 +10,12 @@
 
 local M = {}
 
+-- The stable, locale-independent sentinel a caller branches on when a commit
+-- found nothing left to record. It is a value this module owns, never a
+-- substring of git's output: git answers in the user's language ("rien à
+-- valider, la copie de travail est propre") as readily as in English.
+local NOTHING_TO_COMMIT = "nothing to commit"
+
 -- git's messages are parsed, not just shown: classify() matches English
 -- strings ("nothing to commit", "a branch named", "already registered",
 -- "non-fast-forward", ...). A child that inherits the user's locale would
@@ -18,6 +24,10 @@ local M = {}
 -- environment, so the argv is prefixed with `env LC_ALL=C LANG=C`: the locale
 -- is pinned for the child while every inherited variable (HOME, PATH, GIT_*)
 -- survives untouched.
+--
+-- Pinning is a belt, not the answer: a benign outcome that a pipeline must act
+-- on (an empty commit) is decided from the repository state, never from the
+-- message -- see commit().
 local LOCALE_PREFIX = { "env", "LC_ALL=C", "LANG=C" }
 
 local function with_c_locale(args)
@@ -151,6 +161,23 @@ function M.classify(what, result)
       cause = "auth_failed"
       message = "git could not authenticate with the remote"
       hint = "check the credentials or SSH key for this remote"
+    end
+  elseif what == "git commit" then
+    -- A commit that found nothing to record is benign, not a failure: the
+    -- pipeline's turn already committed. commit() decides that from the repo
+    -- state, so this branch only runs when a caller classifies a commit
+    -- failure directly; it recognises both wordings, plus an explicit
+    -- sentinel/state marker, rather than mistaking them for an auth or a
+    -- catch-all failure.
+    if result.sentinel == NOTHING_TO_COMMIT
+      or result.state == "clean"
+      or has("nothing to commit")
+      or has("nothing added to commit")
+      or has("rien à valider")
+      or has("rien a valider") then
+      cause = "nothing_to_commit"
+      message = "le commit est déjà en place"
+      hint = "aucun correctif : continuer les checks"
     end
   elseif what == "gh pr merge" then
     -- `gh pr merge` fails in four ways the pipeline can act on: the PR was
@@ -466,9 +493,20 @@ function M.commit(worktree, message)
     return nil, cerr
   end
   if not committed.ok then
-    -- An empty commit is a normal outcome for a no-op task, not a crash.
-    if committed.stdout:find("nothing to commit", 1, true) or committed.stderr:find("nothing to commit", 1, true) then
-      return nil, "nothing to commit"
+    -- An empty commit is a normal outcome for a no-op task, not a crash. Ask
+    -- the repository rather than git's prose: after the `add -A` above, a clean
+    -- `status --porcelain` and a resolvable HEAD mean the work is already
+    -- committed. The answer is therefore the same whatever language the
+    -- failure message was printed in ("nothing to commit" or "rien à valider,
+    -- la copie de travail est propre"), and a message that merely looks benign
+    -- on a real dirty tree is still an error.
+    local status, serr = run({ "git", "-C", worktree, "status", "--porcelain" })
+    if not status then
+      return nil, serr
+    end
+    local clean = status.ok and (status.stdout:gsub("%s+$", "")) == ""
+    if clean and M.head_sha(worktree) then
+      return nil, NOTHING_TO_COMMIT
     end
     return fail("git commit", committed)
   end
