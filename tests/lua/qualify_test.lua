@@ -8,7 +8,7 @@ return function()
   local q = load_module("qualify")
   local state = load_module("state")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "qualify")
+  local base = test_base("qualify")
 
   -- Remove only what we must: a previous run must not pollute this one.
   local function wipe(path)

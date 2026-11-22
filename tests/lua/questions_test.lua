@@ -9,7 +9,7 @@ return function()
   local questions = load_module("questions")
   local state = load_module("state")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "questions")
+  local base = test_base("questions")
 
   -- Remove only what we must: a previous run must not pollute this one. The
   -- base itself is kept, because run-lua.sh validates the journal left in it.

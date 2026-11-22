@@ -105,6 +105,7 @@ An intention that qualifies into more than one task does not merge those tasks i
 ## Testing
 
 - Lua unit and integration tests run inside maki's own host through `tests/run-lua.sh`; they use real git against throwaway repositories and real journals validated by `tools/validate-state.py`.
+- Each invocation owns a unique token (`MAKI_TEST_TOKEN`, inherited when set, otherwise timestamp + pid + randomness) and keeps every temporary path — harness results, harness error file and the ten validated journals — under `<state_dir>/metronome-tests/<token>/`; the Lua tests obtain their base directory through the harness `test_base()` helper, which resolves the same token. The token directory and its results file are removed at the end of the run, success or failure, after the journals are validated, so several runs can execute in parallel in the same checkout. `tests/run-lua-concurrent.sh` proves it by running two `tests/run-lua.sh` instances at once and requiring two PASS.
 - `tests/validate.sh` proves the schemas, prompts and config cannot drift.
 - `scripts/e2e.sh` drives the whole lifecycle on a disposable repository with a bare remote and a fake `gh`, and judges the remote and the journal, not a summary.
 - `scripts/e2e-shop.sh` builds a fake e-commerce project, splits it into products, accounts and orders tasks, fails the orders check once to prove the rollback-and-retry loop, deploys, and validates the delivered server over HTTP.

@@ -7,9 +7,7 @@
 return function()
   local nm = load_module("no_mistakes")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "no-mistakes")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("no-mistakes")
   local scripts = maki.fs.joinpath(base, "bin")
   maki.fs.mkdir(scripts, { parents = true })
   local log = maki.fs.joinpath(base, "nm.log")

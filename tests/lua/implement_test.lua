@@ -20,9 +20,7 @@ return function()
   eq(implement.assert_task_branch("master", "main"), nil, "master is refused too")
   eq(implement.assert_task_branch(nil, "main"), nil, "a missing branch is refused")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "implement")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_base("implement")
 
   local remote = maki.fs.joinpath(base, "remote.git")
   local repo = maki.fs.joinpath(base, "repo")
