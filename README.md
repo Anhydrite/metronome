@@ -45,13 +45,25 @@ The installer copies `maki/lua/` into `$MAKI_CONFIG_DIR` (default `$XDG_CONFIG_H
 
 `/metronome init` creates the project state, copies `config.toml` and the prompts, and asks for the model specs. `/metronome submit` starts qualification.
 
+### Mandatory preflight
+
+`/metronome init` runs a mandatory preflight before it binds the project, and refuses the binding when it fails. The preflight runs the five verifications in one pass and reports every failure, not just the first:
+
+1. **git identity** — `user.name` and `user.email` are set and non-empty in the repository.
+2. **Test commit** — a probe commit passes in a throwaway worktree cut from the base branch, so a blocked commit (identity, pre-commit hook, permissions) surfaces here instead of in the first task.
+3. **Executable declared checks** — the program word of every command in `[checks]` resolves on `PATH`, so a check naming a missing program fails here rather than at exit 127 mid-task. The preflight proves the program word resolves; it does not resolve the rest of the command or its runtime dependencies (a `npm` present while `node` is absent still passes this check).
+4. **Origin base branch** — the repository has an `origin`, and that `origin` has the declared base branch.
+5. **Locale and toolchain** — every git and check child runs under `LC_ALL=C`, and `python3` imports `jsonschema` for `scripts/validate.sh`.
+
+A failed verification refuses the binding with a message that names the check, the exact command that failed and the fix; nothing is written, and there is never a silent success. `/metronome config` runs the same preflight before it rewrites `config.toml`.
+
 ## Commands
 
 All commands are subcommands of one `/metronome` dispatcher.
 
 | Command | What it does |
 | --- | --- |
-| `/metronome init` | Ask the config questions, then bind the project (state, config, prompts). Use `--defaults` to accept every default, or `key=value` to answer. |
+| `/metronome init` | Ask the config questions, run the mandatory preflight, then bind the project (state, config, prompts). Use `--defaults` to accept every default, or `key=value` to answer. |
 | `/metronome submit <intention>` | Qualify an intention into tasks. `fast` / `full` / `auto` set the complexity. |
 | `/metronome status [id]` | Show every task, or one task in detail. |
 | `/metronome answer` | Open the pending question round. |

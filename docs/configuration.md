@@ -88,6 +88,22 @@ thinking = "medium"
 
 A task is done when these commands exit 0, not when a model says so. A red check rolls the worktree back to its last checkpoint.
 
+## Preflight
+
+`/metronome init` and `/metronome config` verify the environment before they write anything: a project bound with a missing checker, no git identity or a base branch absent from `origin` would otherwise only fail on the first task, far from the command that created it. The preflight runs five mandatory checks in one pass — git identity, a test commit, the declared checks, the `origin` base branch and the toolchain — so a single refusal lists every problem:
+
+| Check | What it proves | Remedy it names |
+| --- | --- | --- |
+| `git-identity` | `user.name` and `user.email` are set and non-empty in `project.repo`. | `git config --global user.name` and `git config --global user.email`. |
+| `git-test-commit` | A probe commit passes in a throwaway worktree cut from `project.base_ref`; the worktree is removed on both paths. | Fix the identity, a blocking pre-commit hook or the repository permissions. |
+| `checks-executable` | The program word of every declared check resolves on `PATH`. It proves the program word resolves only: the rest of the command and its runtime dependencies are not resolved, so `npm test` passes this check with `npm` on `PATH` even when `node` is absent or `package.json` declares no `test` script. | Install the missing program, or fix the declared command. |
+| `origin-base` | `project.repo` has an `origin`, and that `origin` has `project.base_ref`. | `git remote add origin <url>`, then push the base branch. |
+| `toolchain` | `python3` imports `jsonschema`, which `scripts/validate.sh` needs. | `python3 -m pip install jsonschema`. |
+
+Every child process runs under `LC_ALL=C` (and `LANG=C`), so git and the declared checks produce the same locale-independent diagnostics on every machine.
+
+A failure refuses the binding: `init` writes no state, `config` leaves `config.toml` untouched, and the refusal is a message naming the check id, the exact command that failed and the remedy. There is no silent success: a runtime built without the preflight wired refuses to bind explicitly instead of declaring the project ready, and `/metronome config` runs the same five checks before it rewrites `config.toml`.
+
 ## `[review]`
 
 | Key | Type | Default | Meaning |

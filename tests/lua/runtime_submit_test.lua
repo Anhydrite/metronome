@@ -1085,6 +1085,12 @@ auto_deploy = false
     paths = function()
       return { root = cfg_root, config = cfg_path, repo = "/tmp/repo" }
     end,
+    -- A green preflight: this case pins the origin/base-branch guard, which
+    -- must still fire before any preflight refusal.
+    preflight = {
+      run = function() return { ok = true, checks = {}, failures = {} } end,
+      format = function() return "" end,
+    },
     spawn = function(fn) fn() end,
     wait_turn_end = false,
     runner = {}, qualify = {}, questions = {}, analyze = {}, implement = {},
