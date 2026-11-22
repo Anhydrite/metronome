@@ -534,6 +534,95 @@ return function()
     "a repairable conflict is not journaled as unrepairable")
   eq(read_log(), "", "a conflicting rebase does not touch the PR")
 
+  -- run: every shape of a repairable conflict -------------------------------
+  --
+  -- `merge.rebase` can report the same conflict three ways: `conflict = true`
+  -- (the classifier only knew it conflicted), `conflict` as the list of files,
+  -- or `conflict_files` alone. The repair must not depend on a single field: a
+  -- turn merge.lua journals as repairable can never be turned into `failed`
+  -- here, so all three shapes return the conflict whole, leave the status
+  -- merging and journal the repairable note.
+  local shapes = {
+    {
+      name = "conflict = true",
+      info = {
+        conflict = true,
+        hunks = {
+          { file = "README.md", start = 1,
+            text = "<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> 59738f2" },
+        },
+        commit = "59738f2",
+      },
+    },
+    {
+      name = "conflict as a file list",
+      info = { conflict = { "README.md", "shop.lua" } },
+    },
+    {
+      name = "conflict_files alone",
+      info = { conflict_files = "README.md, shop.lua" },
+    },
+  }
+  local shape_seq = 0
+  for _, shape in ipairs(shapes) do
+    shape_seq = shape_seq + 1
+    local sid = string.format("T-20261114-mgs%d", shape_seq)
+    local stask = seed_task(sid, wt8)
+    local rebase_calls = 0
+    local stub = {
+      fetch = function() return true end,
+      rebase = function()
+        rebase_calls = rebase_calls + 1
+        return nil, "rebase failed (conflicts: README.md)", shape.info
+      end,
+      rev_parse = function() return "sha-shape" end,
+    }
+    maki.fs.write(log, "")
+    local sres = merge.run({
+      task = stask,
+      repo = repo,
+      worktree = wt8,
+      root = root,
+      git = stub,
+      state = state,
+      gh = gh,
+      checks = checks,
+      commands = { "true" },
+      pr = 42,
+      base = "main",
+      remote = "origin",
+    })
+    eq(rebase_calls, 1, shape.name .. ": the merge rebases once")
+    eq(sres and sres.ok, false, shape.name .. ": a conflict is not ok")
+    eq(sres and sres.conflict, true, shape.name .. ": the result is flagged repairable")
+    eq(type(sres and sres.conflict_file_list), "table",
+      shape.name .. ": the file list is returned to the repair")
+    has(tostring(sres and sres.conflict_files or ""), "README.md",
+      shape.name .. ": conflict_files names the file")
+    has(tostring(sres and sres.error or ""), "README.md",
+      shape.name .. ": the error names the file")
+    has(tostring(sres and sres.error or ""), "git rebase origin/main",
+      shape.name .. ": the error names the exact command")
+    has(tostring(sres and sres.escalation or ""), "README.md",
+      shape.name .. ": the escalation names the file")
+    local safter = state.load(root).tasks[sid]
+    eq(safter and safter.status, "merging",
+      shape.name .. ": a repairable conflict leaves the status merging")
+    local repairable_note, failed_note = false, false
+    for _, note in ipairs(safter and safter.notes or {}) do
+      if type(note) == "string" then
+        if note:find("will be redone on the fresh base", 1, true) then
+          repairable_note = true
+        end
+        if note:find("merge failed", 1, true) then failed_note = true end
+      end
+    end
+    eq(repairable_note, true,
+      shape.name .. ": the conflict is journaled as repairable")
+    eq(failed_note, false,
+      shape.name .. ": a repairable conflict writes no failure note")
+  end
+
   -- escalation: names what a human needs --------------------------------------
 
   local esc = merge.escalation({
@@ -550,6 +639,32 @@ return function()
   has(esc, "0123456789abcdef0123456789abcdef01234567", "escalation names the base SHA")
   has(esc, "59738f2aa1b2c3d4e5f60718293a4b5c6d7e8f90", "escalation names the faulty commit")
   eq(esc:find("rebase failed", 1, true), nil, "escalation is not the bare rebase-failed text")
+
+  -- The escalation names the files whatever shape carried them: a bare
+  -- `conflict = true` reads them from the hunks, and `conflict_files` alone is
+  -- accepted as well, so an escalation can never say "unknown" when git named
+  -- the files.
+  local esc_flag = merge.escalation({
+    conflict = true,
+    hunks = { { file = "docs/runbook.md", start = 4, text = "<<<<<<< HEAD" } },
+    upstream = "origin/main",
+    rebase_command = "git rebase origin/main",
+    base_sha = "0123456789abcdef0123456789abcdef01234567",
+  })
+  has(esc_flag, "docs/runbook.md",
+    "escalation reads the files from the hunks when conflict is a flag")
+  has(esc_flag, "origin/main", "the flag escalation names the base")
+  has(esc_flag, "git rebase origin/main", "the flag escalation names the command")
+
+  local esc_files = merge.escalation({
+    conflict_files = { "src/app.lua", "src/db.lua" },
+    upstream = "origin/main",
+    rebase_command = "git rebase origin/main",
+  })
+  has(esc_files, "src/app.lua", "conflict_files alone names the first file")
+  has(esc_files, "src/db.lua", "conflict_files alone names the second file")
+  has(esc_files, "origin/main", "conflict_files alone names the base")
+  has(esc_files, "git rebase origin/main", "conflict_files alone names the command")
 
   -- run: refusals -------------------------------------------------------------
 
