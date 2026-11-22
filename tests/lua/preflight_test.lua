@@ -149,7 +149,7 @@ return function()
   has(email_failure.remedy, "git config --global user.name", "identity remedy names both commands")
   eq(#no_email.failures, 1, "only the identity fail is reported")
 
-  local no_binary, _ = run(rules_with({ match = "command -v frobnicate", code = 1 }), {
+  local no_binary, no_binary_calls = run(rules_with({ match = "frobnicate", code = 1 }), {
     checks = { "frobnicate --flag" },
   })
   eq(no_binary.ok, false, "missing binary is not ok")
@@ -157,6 +157,20 @@ return function()
   eq(binary_failure.command, "frobnicate --flag", "binary failure names the whole declared check")
   has(binary_failure.remedy, "frobnicate", "binary remedy names the missing binary")
   has(binary_failure.detail, "PATH", "binary detail says the program is not on PATH")
+
+  -- The head of a check is passed as an argv element, never spliced into the
+  -- probe script: a program name cannot inject shell into preflight.
+  local head_as_arg = false
+  for _, item in ipairs(no_binary_calls) do
+    if item.args[#item.args] == "frobnicate" then
+      for _, arg in ipairs(item.args) do
+        local spliced = arg:find("frobnicate", 1, true) ~= nil and arg ~= "frobnicate"
+        eq(spliced, false, "the head is not spliced into the probe script")
+      end
+      head_as_arg = true
+    end
+  end
+  eq(head_as_arg, true, "the check head is passed as a separate probe argument")
 
   local no_base, _ = run(rules_with({ match = "ls-remote --heads origin", code = 0, stdout = "" }))
   eq(no_base.ok, false, "missing base ref is not ok")
@@ -206,7 +220,7 @@ return function()
     { match = "config --get user.name", code = 1 },
     { match = "config --get user.email", code = 1 },
     { match = " commit -m", code = 1, stderr = "fatal: cannot commit" },
-    { match = "command -v frobnicate", code = 1 },
+    { match = "frobnicate", code = 1 },
     { match = "ls-remote --heads origin", code = 128, stderr = "fatal: 'origin' does not appear to be a git repository" },
     { match = "import jsonschema", code = 1, stderr = "ModuleNotFoundError: No module named 'jsonschema'" },
   }

@@ -239,6 +239,19 @@ local function check_test_commit(ctx)
   -- The body is protected so the cleanup below runs even if a filesystem call
   -- raises: the worktree must never survive a failed preflight.
   local ok_body, body_err = pcall(function()
+    -- `git worktree add` creates only the final path component: its parent (the
+    -- preflight scratch directory under the state dir) must exist first, exactly
+    -- as merge.lua creates the worktree root before git touches it. Without this
+    -- the add fails with "could not create directory of ..." on every machine.
+    local parent = worktree:match("^(.*)/[^/]+$")
+    if parent then
+      local made, mkerr = fs.mkdir(parent, { parents = true })
+      if not made then
+        problems[#problems + 1] = "cannot create the worktree parent directory: " .. tostring(mkerr)
+        return
+      end
+    end
+
     local added = call(ctx, { "git", "-C", repo, "worktree", "add", "--detach", worktree, base_ref }, repo)
     if added.code ~= 0 then
       problems[#problems + 1] = "git worktree add failed (exit " .. tostring(added.code) .. "): "
@@ -247,6 +260,9 @@ local function check_test_commit(ctx)
     end
 
     local probe = fs.joinpath(worktree, M.PROBE_FILE)
+    -- A real `git worktree add` creates the final directory itself; this only
+    -- makes the injected-exec tests (which never touch git) able to write the
+    -- probe, and is a no-op on a path git already created.
     fs.mkdir(worktree, { parents = true })
     local wrote, werr = fs.write(probe, "metronome preflight probe\n")
     if not wrote then
@@ -363,7 +379,10 @@ local function check_checks_executable(ctx)
         mark_failed(entry, problem.detail, problem.remedy)
         failures[#failures + 1] = problem
       else
-        local probe = call(ctx, { "sh", "-c", "command -v " .. head }, ctx.repo)
+        -- The head is passed as `$1`, never spliced into the script: a check
+        -- whose program name contains shell metacharacters cannot inject into
+        -- the probe, it is only ever looked up on PATH.
+        local probe = call(ctx, { "sh", "-c", 'command -v "$1"', "sh", head }, ctx.repo)
         if probe.code ~= 0 then
           local problem = failure(
             "checks-executable",
@@ -491,13 +510,20 @@ local function check_toolchain(ctx)
   return entry
 end
 
-local CHECKS = {
-  { "git-identity", check_identity },
-  { "git-test-commit", check_test_commit },
-  { "checks-executable", check_checks_executable },
-  { "origin-base", check_origin_base },
-  { "toolchain", check_toolchain },
+local CHECK_FNS = {
+  ["git-identity"] = check_identity,
+  ["git-test-commit"] = check_test_commit,
+  ["checks-executable"] = check_checks_executable,
+  ["origin-base"] = check_origin_base,
+  ["toolchain"] = check_toolchain,
 }
+
+-- CHECKS is derived from M.IDS, the single source of truth for the five
+-- mandatory ids and their order: one list to change, no drift between them.
+local CHECKS = {}
+for _, id in ipairs(M.IDS) do
+  CHECKS[#CHECKS + 1] = { id, CHECK_FNS[id] }
+end
 
 -- Run a check in isolation: a check that raises is a red check with its id, so
 -- the other four still run and the refusal still lists everything.
