@@ -1679,4 +1679,654 @@ auto_deploy = false
   eq(epic_seen.deploy, 1, "the epic deploys after its merge")
   eq(epic_record.status, "deployed", "the epic ends deployed")
 
+  -- Failure policy and unblockable drain ------------------------------------
+  --
+  -- A failed task and a stopped workflow are the worst outcomes: every failure
+  -- is typed, persisted on the task (worktree, branch, checkpoints and
+  -- transcript untouched), retried automatically when the cause is transient,
+  -- and escalated only when a retry cannot help. No task ever runs on the
+  -- scheduler's turn: the drain must return while the tasks are in flight.
+
+  -- The typed failure policy the production wiring injects.
+  local recover_mod = load_module("recover")
+
+  -- A stub state that behaves like the journal for one task: a status move
+  -- keeps every artefact, a failure field event replaces the diagnosis, and a
+  -- move back to `running` resets the attempt budget.
+  local function mem_state(record)
+    return {
+      load = function()
+        return { tasks = { [record.id] = record } }
+      end,
+      transition = function(_, id, status, extra)
+        extra = extra or {}
+        if type(extra.failure) == "table" then
+          record.failure = extra.failure
+        end
+        if extra.reason then
+          record.failure_reason = extra.reason
+        end
+        if extra.phase then
+          record.phase = extra.phase
+        end
+        record.status = status
+        if status == "running" and type(record.failure) == "table" then
+          record.failure.attempts = 0
+          record.failure.next_retry_at = nil
+        end
+        return { id = id, status = status }
+      end,
+      set_fields = function(_, id, fields)
+        for key, value in pairs(fields or {}) do
+          record[key] = value
+        end
+        return record
+      end,
+    }
+  end
+
+  -- Capture the human-facing notifications without touching the real chat:
+  -- maki.session is a table, so the two entry points can be swapped and put
+  -- back. A transient failure must produce none until the budget is spent.
+  local notified = {}
+  local saved_notify = maki.session.notify
+  local saved_prompt = maki.session.prompt
+  maki.session.notify = function(text)
+    notified[#notified + 1] = tostring(text)
+    return true
+  end
+  maki.session.prompt = function(text)
+    notified[#notified + 1] = tostring(text)
+    return true
+  end
+
+  -- A transient failure: typed diagnosis, deferred bounded retry, no wake-up.
+  local deferred = {}
+  local transient_record = {
+    id = "T1", status = "ready", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1", run_dir = "/tmp/runs/T1",
+    checkpoints = { "c1", "c2" },
+    pr = { number = 3, url = "u", state = "open" },
+  }
+  local transient_impl = 0
+  local transient_tick_opts = nil
+  local transient_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 1 },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+          recover = { max_attempts = 2, backoff_base_secs = 30 },
+        }
+      end,
+    },
+    roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+    recover = recover_mod,
+    state = mem_state(transient_record),
+    implement = {
+      run = function()
+        transient_impl = transient_impl + 1
+        return { ok = false, error = "fatal: unable to access 'https://github.com/x/y': could not resolve host: github.com" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() return { ok = true } end },
+    review = { review = function() return { ok = true, approved = true } end },
+    git = {
+      pr_open = function() return { number = 1, url = "u", state = "open" } end,
+      pr_close = function() error("a retryable failure must not close the PR") end,
+    },
+    merge = { run = function() return { ok = true } end },
+    deploy = { run = function() return { ok = true } end },
+    pipeline = {
+      tick = function(opts)
+        transient_tick_opts = opts
+        if transient_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = function() return paths end,
+    spawn = function(fn) fn() end,
+    defer = function(fn, ms)
+      deferred[#deferred + 1] = { fn = fn, ms = ms }
+      return {}
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {
+      run = function() return { ok = true, tasks = { { title = "t", files = { "f" }, checks = { "true" } } } } end,
+      next_id = function() return "T1" end,
+      apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+    },
+    questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_transient = runtime.new(transient_deps)
+  rt_transient.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_transient.run_pending()
+  eq(transient_impl, 1, "the failing task ran once")
+  eq(transient_record.status, "failed", "the failure is persisted on the task")
+  eq(type(transient_record.failure), "table", "the failure is a typed record, not a string")
+  eq(transient_record.failure and transient_record.failure.cause, "network",
+    "a fetch/network error is diagnosed as a transient cause")
+  eq(transient_record.failure and transient_record.failure.transient, true,
+    "the diagnosis is marked transient")
+  eq(transient_record.failure and transient_record.failure.attempts, 1, "the attempt is counted")
+  eq(#notified, 0, "a transient failure does not wake a human")
+  eq(#deferred, 1, "the automatic retry is scheduled after the backoff")
+  eq(deferred[1] and deferred[1].ms, 30000, "the retry waits the policy's backoff")
+  eq(transient_record.branch, "metronome/t1", "the failure keeps the branch")
+  eq(transient_record.worktree, "/tmp/wt-t1", "the failure keeps the worktree")
+  eq(transient_record.run_dir, "/tmp/runs/T1", "the failure keeps the run directory")
+  eq(#(transient_record.checkpoints or {}), 2, "the failure keeps the checkpoints")
+  eq(transient_record.pr and transient_record.pr.state, "open", "the failure leaves the PR open")
+  has(tostring(transient_record.failure_reason), "network",
+    "the persisted reason names the cause")
+  eq(transient_tick_opts and transient_tick_opts.max_attempts, 0,
+    "the drain tick never retries a failed task: schedule_retry is the only authority")
+  eq(type(transient_tick_opts and transient_tick_opts.recover), "table",
+    "the drain tick still receives the recovery policy")
+  local typed_result = type(rt_transient.last_background) == "table"
+    and type(rt_transient.last_background.results) == "table"
+    and rt_transient.last_background.results[1] or nil
+  eq(type(typed_result), "table", "the drain result keeps the per-task record")
+  eq(typed_result and typed_result.failure and typed_result.failure.cause, "network",
+    "the per-task result carries the typed failure")
+  eq(typed_result and typed_result.decision and typed_result.decision.action, "auto_retry",
+    "the per-task result carries the resume decision")
+  eq(typed_result and typed_result.retrying, true,
+    "the per-task result says the task is being retried")
+  eq(type(typed_result and typed_result.error), "string",
+    "the per-task result keeps the raw step error")
+  -- Fire the deferred retry: it runs the task again, and the second failure
+  -- exhausts the budget, which is the only thing that escalates.
+  deferred[1].fn()
+  rt_transient.run_pending()
+  eq(transient_impl, 2, "the automatic retry re-dispatches the task")
+  eq(#notified, 1, "the exhausted budget escalates exactly once")
+  has(tostring(notified[1]), "network", "the escalation names the cause")
+  has(tostring(notified[1]), "check the network", "the escalation names the remedy")
+  eq(transient_record.failure and transient_record.failure.attempts, 2,
+    "the second failure is counted on the task")
+
+  -- An auth failure is not transient: one attempt, then a human is told, with
+  -- the remedy in the text. Nothing is retried behind the user's back.
+  local auth_record = {
+    id = "T1", status = "ready", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+  }
+  local auth_impl = 0
+  local auth_deferred = 0
+  local auth_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(auth_record),
+    implement = {
+      run = function()
+        auth_impl = auth_impl + 1
+        return { ok = false, error = "fatal: Authentication failed for 'https://github.com/x/y.git/'" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if auth_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    defer = function()
+      auth_deferred = auth_deferred + 1
+      return {}
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_auth = runtime.new(auth_deps)
+  rt_auth.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_auth.run_pending()
+  eq(auth_impl, 1, "an auth failure is not retried automatically")
+  eq(auth_deferred, 0, "no retry is scheduled for an auth failure")
+  eq(auth_record.failure and auth_record.failure.cause, "auth", "the auth failure is typed")
+  eq(auth_record.failure and auth_record.failure.transient, false, "auth is not transient")
+  eq(#notified, 1, "an auth failure escalates to the human")
+  has(tostring(notified[1]), "auth", "the escalation names the auth cause")
+  has(tostring(notified[1]), "credentials", "the escalation names the remedy")
+  eq(auth_record.branch, "metronome/t1", "the auth failure keeps the branch")
+
+  -- A late automatic retry must not run a task a human already resumed -----
+  --
+  -- The backoff timer and a human retry can both decide to restart the same
+  -- task. Only the first may run it: `running -> running` is a legal no-op, so
+  -- without a status guard the same worktree would get two run_tasks (and two
+  -- sessions) at once.
+  local guard_record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
+  local guard_impl = 0
+  local guard_deferred = {}
+  local guard_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(guard_record),
+    implement = {
+      run = function()
+        guard_impl = guard_impl + 1
+        if guard_impl == 1 then
+          return { ok = false, error = "could not resolve host: github.com" }
+        end
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if guard_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    defer = function(fn, ms)
+      guard_deferred[#guard_deferred + 1] = { fn = fn, ms = ms }
+      return {}
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_guard = runtime.new(guard_deps)
+  rt_guard.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_guard.run_pending()
+  eq(guard_impl, 1, "the transient failure happened once")
+  eq(guard_record.status, "failed", "the task is parked for its automatic retry")
+  eq(#guard_deferred, 1, "the automatic retry is armed")
+  -- The user resumes before the backoff elapses; this run succeeds.
+  local guard_retry = rt_guard.retry({ id = "T1" }, { session = "S1" })
+  eq(guard_retry and guard_retry.ok, true, "the human retry is accepted")
+  rt_guard.run_pending()
+  eq(guard_impl, 2, "the human retry runs the task once")
+  eq(guard_record.status, "pr_open", "the human retry carried the task forward")
+  -- The armed automatic retry fires late: the task is no longer failed.
+  guard_deferred[1].fn()
+  rt_guard.run_pending()
+  eq(guard_impl, 2, "a late automatic retry is skipped instead of running the task twice")
+
+  -- The drain never runs a task on its own turn -----------------------------
+  --
+  -- `spawn` is the seam: a host that queues it (maki.async.spawn) must let
+  -- `run_pending` return while the run_task is still in flight. The test counts
+  -- the spawn calls and proves the dispatch happens inside one of them.
+  local queued = {}
+  local spawn_calls = 0
+  local drain_record = {
+    id = "T1", status = "ready", title = "t", checks = { "true" },
+  }
+  local drain_impl = 0
+  local drain_dispatched = false
+  local drain_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    state = mem_state(drain_record),
+    implement = {
+      run = function()
+        drain_impl = drain_impl + 1
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if not drain_dispatched then
+          drain_dispatched = true
+          -- The real tick moves the task to `running` before dispatching.
+          drain_record.status = "running"
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = { "T1" } }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn)
+      spawn_calls = spawn_calls + 1
+      queued[#queued + 1] = fn
+      return { cancel = function() end }
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_drain = runtime.new(drain_deps)
+  rt_drain.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_drain.run_pending()
+  eq(spawn_calls >= 1, true, "the drain dispatches through spawn")
+  eq(drain_impl, 0, "run_pending returns before the task runs")
+  eq(#queued >= 1, true, "the run_task is still queued when the drain returns")
+  -- Run the queued spawns: the task completes off the drain's turn.
+  local guard = 0
+  while #queued > 0 and guard < 50 do
+    guard = guard + 1
+    local fn = table.remove(queued, 1)
+    fn()
+  end
+  eq(drain_impl, 1, "the queued spawn runs the task")
+  eq(drain_record.status, "pr_open", "the queued task ran its whole pipeline off the drain's turn")
+
+  -- feedback relaunches the workflow ----------------------------------------
+  local feedback_ticked = false
+  local feedback_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    state = mem_state({ id = "T1", status = "ready", title = "t" }),
+    calibrate = {
+      feedback = function(_, input)
+        return { total = 1, entries = { { rule = "no-console", vote = input and input.vote } } }
+      end,
+    },
+    pipeline = {
+      tick = function()
+        feedback_ticked = true
+        return { ok = true, started = {} }
+      end,
+    },
+    implement = {}, checks = {}, converge = {}, review = {}, git = {}, merge = {},
+    deploy = {}, qualify = {}, questions = {},
+    analyze = { gate = function() return { ok = true } end },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {}, fence = {}, mode = {},
+  }
+  local rt_feedback = runtime.new(feedback_deps)
+  local fed = rt_feedback.feedback({ id = "T1", vote = "down" })
+  eq(fed and fed.ok, true, "feedback is ingested")
+  eq(fed and fed.background, true, "feedback reports the drain it started")
+  eq(feedback_ticked, true, "feedback drains the workflow instead of waiting for a submit")
+
+  -- The fresh base the rebase reports is the base of the convergence diff ---
+  local fresh_seen = { converge = nil, review = nil, rebase = 0 }
+  local fresh_record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
+  local fresh_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+        }
+      end,
+    },
+    roles = transient_deps.roles,
+    state = mem_state(fresh_record),
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function(opts) fresh_seen.converge = opts.base; return { ok = true } end },
+    review = { review = function(opts) fresh_seen.review = opts.base; return { ok = true, approved = true } end },
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = {
+      rebase = function()
+        fresh_seen.rebase = fresh_seen.rebase + 1
+        return { ok = true, base = "origin/main@fresh", sha = "rebsha" }
+      end,
+      run = function() return { ok = true } end,
+    },
+    deploy = { run = function() return { ok = true } end },
+    pipeline = {
+      tick = function(opts)
+        if fresh_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_fresh = runtime.new(fresh_deps)
+  rt_fresh.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_fresh.run_pending()
+  eq(fresh_seen.rebase, 1, "the fresh base is fetched before the checks")
+  eq(fresh_seen.converge, "origin/main@fresh",
+    "the convergence diff uses the base the rebase reported")
+  eq(fresh_seen.review, "origin/main@fresh",
+    "the review diff uses the same fresh base")
+
+  -- A fetch failure is a transient diagnosis, not a permanent string --------
+  local fetch_record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
+  local fetch_converged = false
+  local fetch_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+          recover = { max_attempts = 3, backoff_base_secs = 0 },
+        }
+      end,
+    },
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(fetch_record),
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = { verify = function() return { ok = true } end, write_report = function() end },
+    converge = { run = function() fetch_converged = true; return { ok = true } end },
+    review = transient_deps.review,
+    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = {
+      rebase = function()
+        return nil, "fatal: could not resolve host: github.com"
+      end,
+      run = function() return { ok = true } end,
+    },
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if fetch_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_fetch = runtime.new(fetch_deps)
+  rt_fetch.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_fetch.run_pending()
+  eq(fetch_converged, false, "a fetch failure stops before the convergence diff")
+  eq(type(fetch_record.failure), "table", "the fetch failure is typed")
+  eq(fetch_record.failure and fetch_record.failure.cause, "network",
+    "a fetch failure is diagnosed as a network cause")
+  eq(fetch_record.failure and fetch_record.failure.transient, true,
+    "a fetch failure is transient, so it stays retryable")
+  has(tostring(fetch_record.failure_reason), "network", "the reason names the cause")
+
+  -- metronome_retry restarts a failed task and resets the attempt budget ----
+  local retry_record = {
+    id = "T1", status = "failed", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+    failure = { cause = "network", message = "boom", remedy = "retry", transient = true, attempts = 3 },
+  }
+  local retried_impl = 0
+  local retry_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(retry_record),
+    implement = {
+      run = function()
+        retried_impl = retried_impl + 1
+        return { ok = false, error = "still down: connection refused" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {},
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    defer = function() return {} end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {}, questions = {}, analyze = {},
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_retry = runtime.new(retry_deps)
+  local retried = rt_retry.retry({ id = "T1" }, { session = "S1" })
+  eq(retried and retried.ok, true, "metronome_retry accepts a failed task")
+  rt_retry.run_pending()
+  eq(retried_impl, 1, "metronome_retry re-dispatches the task from its checkpoint")
+  eq(retry_record.status, "failed", "the retried task failed again")
+  eq(retry_record.failure and retry_record.failure.attempts, 1,
+    "a human retry resets the attempt budget")
+  eq(rt_retry.last_background and rt_retry.last_background.failure
+    and rt_retry.last_background.failure.cause, "network",
+    "the background record carries the typed failure, not only the raw error")
+  eq(rt_retry.last_background and rt_retry.last_background.decision
+    and rt_retry.last_background.decision.action, "auto_retry",
+    "the background record carries the resume decision")
+  eq(rt_retry.last_background and rt_retry.last_background.retrying, true,
+    "the background record says the task is being retried")
+  eq(type(rt_retry.last_background and rt_retry.last_background.error), "string",
+    "the background record keeps the raw step error")
+
+  -- An async retry that completes must re-drain after itself: the queued job
+  -- runs off the drain's turn, so nothing else would notice the freed slot or a
+  -- newly ready dependent. A drain that stops after a successful retry is the
+  -- worst case this runtime exists to rule out.
+  local async_record = {
+    id = "T1", status = "failed", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+    failure = { cause = "network", message = "boom", remedy = "retry", transient = true, attempts = 1 },
+  }
+  local async_impl = 0
+  local async_ticks = 0
+  local async_queue = {}
+  local async_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(async_record),
+    implement = {
+      run = function()
+        async_impl = async_impl + 1
+        return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function()
+        async_ticks = async_ticks + 1
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn)
+      async_queue[#async_queue + 1] = fn
+      return { cancel = function() end }
+    end,
+    async = true,
+    defer = function() return {} end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = {}, questions = {},
+    analyze = { gate = function() return { ok = true } end },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_async = runtime.new(async_deps)
+  local queued_retry = rt_async.retry({ id = "T1" }, { session = "S1" })
+  eq(queued_retry and queued_retry.ok, true, "the retry is queued, not run")
+  eq(async_impl, 0, "the retry job has not run when the handler returns")
+  local async_guard = 0
+  while #async_queue > 0 and async_guard < 50 do
+    async_guard = async_guard + 1
+    local fn = table.remove(async_queue, 1)
+    fn()
+  end
+  eq(async_impl, 1, "the queued retry job runs the task off the drain's turn")
+  eq(async_ticks >= 2,
+    true, "a completed retry job re-drains the scheduler instead of stopping the workflow")
+
+  maki.session.notify = saved_notify
+  maki.session.prompt = saved_prompt
+
 end

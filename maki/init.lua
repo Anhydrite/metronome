@@ -64,6 +64,9 @@ local function wire()
     pipeline = require("metronome.pipeline"),
     fence = require("metronome.fence"),
     mode = require("metronome.mode"),
+    -- The typed failure policy: every failed run is classified, recorded on the
+    -- task and either retried within bounds or escalated to the human.
+    recover = require("metronome.recover"),
     ui_render = require("metronome.ui.render"),
     ui_panel = require("metronome.ui.panel"),
     -- Several tasks progress at once: each one runs in its own plugin-lifetime
