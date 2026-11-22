@@ -255,6 +255,9 @@ function M.verify_after_merge(opts)
 
   local result, cerr = checks.run(opts.commands or {}, {
     worktree = temp,
+    root = opts.root,
+    task_id = opts.task_id,
+    xdg_state_home = opts.xdg_state_home,
     timeout_ms = opts.timeout_ms,
   })
 

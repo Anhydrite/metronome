@@ -872,6 +872,7 @@ function M.new(deps)
         base = base,
         remote = "origin",
         commands = task.checks or cfg.checks.default,
+        xdg_state_home = cfg.checks.xdg_state_home,
       })
       if not cres then
         return { ok = false, error = "cannot verify the merged base: " .. tostring(cerr) }
@@ -1049,6 +1050,9 @@ function M.new(deps)
       local verified = deps.checks.verify({
         checks = checks,
         worktree = worktree,
+        root = paths.root,
+        task_id = task_id,
+        xdg_state_home = cfg.checks.xdg_state_home,
         timeout_ms = (cfg.checks.timeout_secs or 600) * 1000,
         rollback = false,
       })

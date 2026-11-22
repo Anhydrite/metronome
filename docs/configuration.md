@@ -85,8 +85,11 @@ thinking = "medium"
 | `default` | array of strings | `[]` | Commands that prove a task is done. A task's own `checks` override this. |
 | `re_run_after_merge` | boolean | `true` | Re-run the checks on the merged base before recording the merge. |
 | `timeout_secs` | integer | `600` | Per-command timeout. |
+| `xdg_state_home` | string | `""` | `XDG_STATE_HOME` handed to every declared check. Empty means one directory per task, under `<state>/checks/<task-id>/state`. A check that sets `XDG_STATE_HOME` itself is never rewritten. |
 
 A task is done when these commands exit 0, not when a model says so. A red check rolls the worktree back to its last checkpoint.
+
+Every check runs with its own `XDG_STATE_HOME`, so a third-party command (a shop, an application script) never shares its state with a task running at the same time. When `xdg_state_home` is empty, the directory is `<state>/checks/<task-id>/state`, created on demand; the value actually used is recorded on each result entry as `xdg_state_home`.
 
 ## `[review]`
 
