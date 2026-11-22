@@ -774,19 +774,31 @@ function M.new(deps)
     return out
   end
 
+  -- Two shapes reach this function: the `merge.run` result (`conflict_hunks`,
+  -- `conflict_commit`, `rebase_command`) and the `merge.rebase` diagnostic
+  -- (`hunks`, `commit`, `command`). Both describe the same conflict, so the
+  -- aliases are normalised here rather than at every call site: a rebase that
+  -- conflicts during implement must carry the same hunks and faulty commit as
+  -- one that conflicts during merge, or the note and the implementer prompt
+  -- would silently lose them.
   local function conflict_details(result, base)
     result = type(result) == "table" and result or {}
     local upstream = is_non_empty(result.upstream) and result.upstream
       or ("origin/" .. tostring(is_non_empty(base) and base or "main"))
+    local hunks = type(result.conflict_hunks) == "table" and result.conflict_hunks
+      or (type(result.hunks) == "table" and result.hunks or nil)
+    local commit = is_non_empty(result.conflict_commit) and result.conflict_commit
+      or (is_non_empty(result.commit) and result.commit or nil)
+    local command = is_non_empty(result.rebase_command) and result.rebase_command
+      or (is_non_empty(result.command) and result.command or nil)
     return {
       files = conflict_file_list(result),
-      hunks = type(result.conflict_hunks) == "table" and result.conflict_hunks or nil,
+      hunks = hunks,
       base = is_non_empty(result.base) and result.base or (is_non_empty(base) and base or nil),
       base_sha = is_non_empty(result.base_sha) and result.base_sha or nil,
       upstream = upstream,
-      commit = is_non_empty(result.conflict_commit) and result.conflict_commit or nil,
-      command = is_non_empty(result.rebase_command) and result.rebase_command
-        or ("git rebase " .. upstream),
+      commit = commit,
+      command = command or ("git rebase " .. upstream),
     }
   end
 
@@ -1522,15 +1534,15 @@ function M.new(deps)
           -- `merging` has no edge back to `running`: the repair is a
           -- continuation of the turn, not a failure, so status, phase and
           -- counter are written together. A reload then resumes in implement
-          -- with the conflict already journalled.
+          -- with the conflict already journalled. The note itself is written
+          -- once, by `merge.run` (the repairable branch it returns from), so
+          -- the runtime does not duplicate it: one conflict, one note.
           pcall(state.set_fields, paths.root, task_id, {
             status = "running",
             phase = "implement",
             conflict_retried = true,
             conflict_retries = repairs,
           })
-          journal_conflict(state, paths.root, task_id, details,
-            "merge conflict (repairable): " .. conflict_note(details))
           -- The branch is back on the fresh base: the PR is the same PR, so the
           -- push leases it and no second PR is opened.
           if type(deps.git.push) == "function" then
