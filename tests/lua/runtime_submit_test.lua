@@ -1770,7 +1770,7 @@ auto_deploy = false
     checkpoints = { "c1", "c2" },
     pr = { number = 3, url = "u", state = "open" },
   }
-  local transient_meta = { impl = 0, closed = 0 }
+  local transient_meta = { impl = 0, closed = 0, deleted = 0 }
   local transient_tick_opts = nil
   local transient_deps = {
     config = {
@@ -1803,6 +1803,10 @@ auto_deploy = false
       pr_close = function()
         transient_meta.closed = transient_meta.closed + 1
         return { closed = true }
+      end,
+      delete_branch = function()
+        transient_meta.deleted = transient_meta.deleted + 1
+        return { ok = true }
       end,
     },
     merge = { run = function() return { ok = true } end },
@@ -1853,7 +1857,9 @@ auto_deploy = false
   eq(transient_record.run_dir, "/tmp/runs/T1", "the failure keeps the run directory")
   eq(#(transient_record.checkpoints or {}), 2, "the failure keeps the checkpoints")
   eq(transient_record.pr and transient_record.pr.state, "open", "the failure leaves the PR open")
+  eq(transient_record.branch, "metronome/t1", "the failure keeps the branch for metronome_retry")
   eq(transient_meta.closed, 0, "the failure never closes the PR: metronome_retry resumes from it")
+  eq(transient_meta.deleted, 0, "the failure never deletes the branch: metronome_retry resumes from it")
   has(tostring(transient_record.failure_reason), "network",
     "the persisted reason names the cause")
   eq(transient_tick_opts and transient_tick_opts.max_attempts, 0,

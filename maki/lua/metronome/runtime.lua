@@ -1651,10 +1651,10 @@ function M.new(deps)
     }
   end
 
-  -- A task that will not be merged must not leave an open PR behind: the list
-  -- fills with pull requests nobody will ever look at. The branch stays, so a
-  -- retry can still resume from its checkpoints. A transient failure never
-  -- reaches this: the branch and the PR are what its retry resumes from.
+  -- Only an explicit stop or abandon closes a task's PR: both transition the
+  -- task to `abandoned`, which is the sole status whose PR and branch cleanup
+  -- belongs to the pipeline. A failure never reaches this — a failed task is
+  -- retryable, so it keeps its open PR and branch for `metronome_retry`.
   local function close_open_pr(paths, task_id)
     local loaded = deps.state.load(paths.root)
     local task = loaded and loaded.tasks and loaded.tasks[task_id]
@@ -3107,21 +3107,36 @@ function M.new(deps)
 
     local loaded = deps.state.load(paths.root) or { tasks = {} }
     local preserved_branches = {}
+    local preserved_by_number, preserved_by_url = {}, {}
     local abandoned_branches = {}
+    local abandoned_by_number, abandoned_by_url = {}, {}
+    local function index_pr(by_number, by_url, pr, value)
+      if type(pr) ~= "table" then return end
+      if pr.number ~= nil then by_number[tostring(pr.number)] = value end
+      if type(pr.url) == "string" then by_url[pr.url] = value end
+    end
     for _, task in pairs(loaded.tasks or {}) do
-      if type(task.branch) == "string" then
-        if task.status == "abandoned" then
+      if task.status == "abandoned" then
+        if type(task.branch) == "string" then
           abandoned_branches[task.branch] = task.id
-        else
-          -- Anything not explicitly abandoned is preserved: an unknown status
-          -- is not proof the task is dead, and deleting its branch is
-          -- irreversible. The known preserved statuses drive the reported
-          -- reason; a status this table does not know yet is still kept.
-          preserved_branches[task.branch] = {
-            task = task.id,
-            reason = PRESERVED[task.status] and keep_reason(task.status) or "in progress",
-          }
         end
+        -- A task that lost its `branch` string but still owns an open PR must
+        -- be reported as abandoned, not as gone: key the cleanup on the PR
+        -- identity too, so the reason and the task id stay accurate.
+        index_pr(abandoned_by_number, abandoned_by_url, task.pr, task.id)
+      else
+        -- Anything not explicitly abandoned is preserved: an unknown status
+        -- is not proof the task is dead, and deleting its branch is
+        -- irreversible. The known preserved statuses drive the reported
+        -- reason; a status this table does not know yet is still kept.
+        local entry = {
+          task = task.id,
+          reason = PRESERVED[task.status] and keep_reason(task.status) or "in progress",
+        }
+        if type(task.branch) == "string" then
+          preserved_branches[task.branch] = entry
+        end
+        index_pr(preserved_by_number, preserved_by_url, task.pr, entry)
       end
     end
 
@@ -3165,11 +3180,18 @@ function M.new(deps)
       local head = tostring(pr.head or "")
       if head:sub(1, #prefix) == prefix then
         pr_branches[head] = true
-        local owner = preserved_branches[head]
+        local function by_pr(by_number, by_url)
+          local found = by_number[tostring(pr.number)]
+          if not found and type(pr.url) == "string" then
+            found = by_url[pr.url]
+          end
+          return found
+        end
+        local owner = preserved_branches[head] or by_pr(preserved_by_number, preserved_by_url)
         if owner then
           keep(head, owner.task, owner.reason, pr.number)
         else
-          local task = abandoned_branches[head]
+          local task = abandoned_branches[head] or by_pr(abandoned_by_number, abandoned_by_url)
           local reason = task and "abandoned" or "gone"
           local called, closed_res = pcall(deps.git.pr_close, pr.number, { gh = "gh", worktree = paths.repo })
           local ok = called and pr_closed_ok(closed_res)

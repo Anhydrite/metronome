@@ -180,6 +180,25 @@ return function()
   eq(summary_has(abandoned, "closed (abandoned): ABANDONED #60 branch metronome/abandoned"), true,
     "the summary names the abandoned PR close and its number")
 
+  -- An abandoned task without a `branch` string is still abandoned ----------
+  -- Its PR is indexed by number/url on the task record, so prune must report
+  -- `abandoned` and carry the task id, not fall back to `gone`.
+  local ab_nobranch_rt = make_runtime({
+    ABANDONED = {
+      id = "ABANDONED", status = "abandoned",
+      pr = { number = 65, url = "u65", state = "open" },
+    },
+  }, {
+    { number = 65, head = "metronome/abandoned-pr", url = "u65" },
+  }, {}, {})
+  local abandoned_nobranch = ab_nobranch_rt.prune({})
+  local closed_nobranch = find_closed(abandoned_nobranch, 65)
+  eq(type(closed_nobranch), "table", "the abandoned task's PR is closed without a branch string")
+  eq(closed_nobranch and closed_nobranch.task, "ABANDONED",
+    "the closed PR keeps the task id even without a branch string")
+  eq(closed_nobranch and closed_nobranch.reason, "abandoned",
+    "the PR is classified abandoned, not gone, from the task's PR record")
+
   -- A branch/PR whose task is absent from the journal is gone --------------
   local gone_closed, gone_deleted = {}, {}
   local gone_rt = make_runtime({
