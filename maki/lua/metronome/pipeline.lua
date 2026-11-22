@@ -172,7 +172,15 @@ function M.schedule(tasks, running, opts)
       candidates[#candidates + 1] = task
     end
   end
+  -- Declared-file candidates are considered first so the runs-alone rule holds
+  -- in both directions: an undeclared task is examined only once every task
+  -- that names its blast radius had its chance to be selected.
   table.sort(candidates, function(a, b)
+    local a_declared = type(a.files) == "table" and #a.files > 0
+    local b_declared = type(b.files) == "table" and #b.files > 0
+    if a_declared ~= b_declared then
+      return a_declared
+    end
     return a.id < b.id
   end)
 

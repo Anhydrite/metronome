@@ -94,7 +94,7 @@ return function()
     task("T-2", "ready", { files = { "src/2" } }),
     task("T-3", "ready", { files = { "src/3" } }),
   }
-  local started, skipped = pipeline.schedule(tasks, {}, { max_parallel = 2 })
+  started, skipped = pipeline.schedule(tasks, {}, { max_parallel = 2 })
   eq(#started, 2, "max_parallel caps the selection")
   eq(started[1].id, "T-1", "the first task starts")
   eq(started[2].id, "T-2", "the second task starts")
@@ -121,6 +121,19 @@ return function()
   eq(started[1].id, "T-1", "the declared task is selected")
   eq(#skipped, 1, "the undeclared task is skipped")
   eq(skipped[1].id, "T-2", "the skipped task is named")
+  eq(skipped[1].reason:find("runs alone", 1, true) ~= nil, true,
+    "the skip reason is the runs-alone rule")
+
+  -- The runs-alone rule holds in both orderings: an undeclared task that sorts
+  -- before a declared one must not be selected alongside it.
+  started, skipped = pipeline.schedule({
+    task("T-a", "ready"),
+    task("T-b", "ready", { files = { "src/b" } }),
+  }, {}, { max_parallel = 2 })
+  eq(#started, 1, "an undeclared task listed first does not run beside a declared one")
+  eq(started[1].id, "T-b", "the declared task is selected")
+  eq(#skipped, 1, "the undeclared task is skipped")
+  eq(skipped[1].id, "T-a", "the skipped task is named")
   eq(skipped[1].reason:find("runs alone", 1, true) ~= nil, true,
     "the skip reason is the runs-alone rule")
 
