@@ -21,6 +21,14 @@
 -- task's last progress with `stall_minutes`. `mark_stalled()` turns a stalled
 -- `running` task into the `stalled` status (a legal transition) and flags the
 -- others suspect, because their status has no `stalled` edge.
+--
+-- A failure is not a scheduling dead end. A `failed` task that carries a
+-- transient diagnosis, is under its attempt bound and whose backoff has elapsed
+-- is a retry candidate exactly like a `ready` task: `retry_ready()` selects it,
+-- `tick()` starts it again through the legal `failed -> running` edge, and a
+-- dependent waits for it ("retrying") instead of being declared blocked. The
+-- module stays pure Lua: the clock comes from `opts.now` and the recovery
+-- policy from `opts.recover` (falling back to the `recover` module).
 
 local M = {}
 
@@ -51,6 +59,7 @@ local RESUME_PHASE = {
   reviewing = "review",
   merging = "merge",
   deploying = "deploy",
+  failed = "implement",
 }
 
 local RESUME_PATH = {
@@ -60,7 +69,12 @@ local RESUME_PATH = {
   reviewing = { "changes_requested", "running" },
   merging = { "failed", "running" },
   deploying = { "failed", "running" },
+  failed = { "running" },
 }
+
+-- Used only when neither `opts.max_attempts` nor the recover module's defaults
+-- are available, so the scheduler never loses its bound.
+local DEFAULT_MAX_ATTEMPTS = 3
 
 -- Helpers -------------------------------------------------------------------
 
@@ -70,6 +84,110 @@ end
 
 local function is_non_empty(s)
   return type(s) == "string" and trim(s) ~= ""
+end
+
+-- The recovery policy: injected through `opts.recover` so the scheduler stays
+-- testable without loading the module. When it is not injected, load it once
+-- and cache it; a missing module is not an error, only a fallback to the
+-- failure fields the task already carries.
+local cached_recover
+local function recover_module(opts)
+  if type(opts) == "table" and type(opts.recover) == "table" then
+    return opts.recover
+  end
+  if cached_recover ~= nil then
+    return cached_recover or nil
+  end
+  local ok, mod = pcall(require, "metronome.recover")
+  if ok and type(mod) == "table" then
+    cached_recover = mod
+    return mod
+  end
+  cached_recover = false
+  return nil
+end
+
+-- The attempt bound for one call: per-call opts, then the recover defaults.
+local function max_attempts(opts)
+  local value = tonumber(type(opts) == "table" and opts.max_attempts or nil)
+  if value then
+    return value
+  end
+  local rec = recover_module(opts)
+  if rec and type(rec.DEFAULTS) == "table" then
+    value = tonumber(rec.DEFAULTS.max_attempts)
+    if value then
+      return value
+    end
+  end
+  return DEFAULT_MAX_ATTEMPTS
+end
+
+-- The clock for one call: an explicit `opts.now`, else the host clock.
+local function clock(opts)
+  local now = tonumber(type(opts) == "table" and opts.now or nil)
+  if now then
+    return now
+  end
+  return os.time()
+end
+
+-- A failure is due when it carries no deadline yet or its backoff has elapsed.
+-- Kept apart from `retryable` so a dependent waits on a not-yet-due retry
+-- ("retrying") instead of calling it blocked, while only a due retry starts.
+local function failure_due(failure, now)
+  local next_at = tonumber(failure.next_retry_at)
+  if next_at == nil then
+    return true
+  end
+  return now >= next_at
+end
+
+-- Is the task allowed to retry at all (ignoring the backoff clock)? A transient
+-- cause under the attempt bound. Uses recover.decide when the module is
+-- available so the policy has a single authority, and falls back to the
+-- persisted failure fields otherwise.
+local function retryable(task, opts)
+  if type(task) ~= "table" or task.status ~= "failed" then
+    return false
+  end
+  local failure = task.failure
+  if type(failure) ~= "table" or next(failure) == nil then
+    return false
+  end
+  local limit = max_attempts(opts)
+  local rec = recover_module(opts)
+  if rec and type(rec.decide) == "function" then
+    local decision = rec.decide(failure, { max_attempts = limit })
+    if type(decision) ~= "table" or decision.action ~= "auto_retry" then
+      return false
+    end
+    return true
+  end
+  if failure.transient ~= true then
+    return false
+  end
+  local attempts = tonumber(failure.attempts) or 0
+  return attempts < limit
+end
+
+-- Start candidates -----------------------------------------------------------
+
+-- The failed tasks that may start again now: transient, under the attempt
+-- bound, and due. Sorted by id so a redraw is deterministic.
+function M.retry_ready(tasks, opts)
+  opts = type(opts) == "table" and opts or {}
+  local now = clock(opts)
+  local ready = {}
+  for _, task in ipairs(M.collect(tasks)) do
+    if retryable(task, opts) and failure_due(task.failure, now) then
+      ready[#ready + 1] = task
+    end
+  end
+  table.sort(ready, function(a, b)
+    return a.id < b.id
+  end)
+  return ready
 end
 
 -- Normalise the projection to a list. state.tasks is a map; accept an array
@@ -126,8 +244,11 @@ end
 
 -- Is every dependency of `task` done? Returns true, or false and a reason.
 -- A missing dependency is not done: silently starting would run against a task
--- that was never created.
-function M.dependencies_met(task, tasks)
+-- that was never created. A failed dependency is blocked only when it cannot
+-- retry; while a transient retry is pending (or due) the dependent waits on it
+-- like on any in-flight task, so a recoverable failure never condemns the
+-- workflow downstream.
+function M.dependencies_met(task, tasks, opts)
   if type(task) ~= "table" or type(task.depends_on) ~= "table" then
     return true
   end
@@ -141,6 +262,9 @@ function M.dependencies_met(task, tasks)
       return false, "missing dependency: " .. tostring(dep_id)
     end
     if DEAD[dep.status] then
+      if retryable(dep, opts) then
+        return false, "waiting on " .. tostring(dep_id) .. " (retrying)"
+      end
       return false, "blocked by " .. tostring(dep_id) .. " (" .. tostring(dep.status) .. ")"
     end
     if not DONE[dep.status] then
@@ -152,10 +276,11 @@ end
 
 -- Scheduling ----------------------------------------------------------------
 
--- Pick the tasks to start now. `running` is the tasks already in flight (a
--- list or a map). Returns `started, skipped`; every skipped task carries a
--- reason, so the panel and the logs can say why it waited.
-function M.schedule(tasks, running, opts)
+-- Pick the tasks to start from an already-filtered candidate list. `running`
+-- is the tasks already in flight (a list or a map). Returns `started, skipped`;
+-- every skipped task carries a reason, so the panel and the logs can say why it
+-- waited. Shared by `schedule` (ready tasks) and `tick` (ready + retries).
+local function pick(candidates, tasks, running, opts)
   opts = type(opts) == "table" and opts or {}
   local max_parallel = tonumber(opts.max_parallel) or 2
   if max_parallel < 1 then
@@ -166,12 +291,6 @@ function M.schedule(tasks, running, opts)
   local selected = {}
   local skipped = {}
 
-  local candidates = {}
-  for _, task in ipairs(M.collect(tasks)) do
-    if task.status == "ready" then
-      candidates[#candidates + 1] = task
-    end
-  end
   -- Declared-file candidates are considered first so the runs-alone rule holds
   -- in both directions: an undeclared task is examined only once every task
   -- that names its blast radius had its chance to be selected.
@@ -185,7 +304,7 @@ function M.schedule(tasks, running, opts)
   end)
 
   for _, task in ipairs(candidates) do
-    local met, reason = M.dependencies_met(task, tasks)
+    local met, reason = M.dependencies_met(task, tasks, opts)
     if not met then
       skipped[#skipped + 1] = { id = task.id, reason = reason }
     elseif #in_flight + #selected >= max_parallel then
@@ -207,6 +326,20 @@ function M.schedule(tasks, running, opts)
   end
 
   return selected, skipped
+end
+
+-- Pick the `ready` tasks to start now. `running` is the tasks already in
+-- flight (a list or a map). Returns `started, skipped`; every skipped task
+-- carries a reason, so the panel and the logs can say why it waited.
+function M.schedule(tasks, running, opts)
+  opts = type(opts) == "table" and opts or {}
+  local candidates = {}
+  for _, task in ipairs(M.collect(tasks)) do
+    if task.status == "ready" then
+      candidates[#candidates + 1] = task
+    end
+  end
+  return pick(candidates, tasks, running, opts)
 end
 
 -- Stall detection -----------------------------------------------------------
@@ -312,7 +445,13 @@ function M.resume(state, root, opts)
   local entries = {}
   for _, task in ipairs(M.collect(loaded.tasks)) do
     local phase = RESUME_PHASE[task.status]
-    if phase then
+    -- A failed task is resumed only when it is actually retryable: a red
+    -- permanent failure (auth, checks red, budget exhausted) stays failed until
+    -- a human acts, so a reload does not loop it forever.
+    if phase and (task.status ~= "failed" or retryable(task, opts)) then
+      if task.status == "failed" and type(task.failure) == "table" and is_non_empty(task.failure.phase) then
+        phase = task.failure.phase
+      end
       entries[#entries + 1] = {
         id = task.id,
         from = task.status,
@@ -391,17 +530,44 @@ function M.tick(opts)
     end
   end
 
-  local started, skipped = M.schedule(loaded.tasks, running, {
+  local schedule_opts = {
     max_parallel = opts.max_parallel,
-  })
+    now = opts.now,
+    max_attempts = opts.max_attempts,
+    recover = opts.recover,
+  }
+
+  -- A failed but retryable task is a start candidate exactly like a ready one.
+  -- Both compete for the same max_parallel budget and obey the same runs-alone
+  -- rule, so a retry never wedges the drain.
+  local retries = M.retry_ready(loaded.tasks, schedule_opts)
+  local retry_ids = {}
+  local candidates = {}
+  for _, task in ipairs(M.collect(loaded.tasks)) do
+    if task.status == "ready" then
+      candidates[#candidates + 1] = task
+    end
+  end
+  for _, task in ipairs(retries) do
+    retry_ids[task.id] = true
+    candidates[#candidates + 1] = task
+  end
+
+  local started, skipped = pick(candidates, loaded.tasks, running, schedule_opts)
 
   if opts.apply ~= false then
     for _, task in ipairs(started) do
-      local moved, merr = state.transition(root, task.id, "running", { phase = "implement" })
+      local phase = "implement"
+      if retry_ids[task.id] and type(task.failure) == "table" and is_non_empty(task.failure.phase) then
+        phase = task.failure.phase
+      end
+      local moved, merr = state.transition(root, task.id, "running", { phase = phase })
       if not moved then
+        -- A task that cannot move is reported, never fatal: the tick succeeded
+        -- and the next one can try again.
         skipped[#skipped + 1] = { id = task.id, reason = merr }
       elseif type(opts.dispatch) == "function" then
-        pcall(opts.dispatch, moved, "implement")
+        pcall(opts.dispatch, moved, phase)
       end
     end
   end
@@ -411,6 +577,7 @@ function M.tick(opts)
     started = started,
     skipped = skipped,
     stalled = stalled,
+    retrying = retries,
     running = running,
   }
 end

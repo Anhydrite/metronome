@@ -60,6 +60,34 @@ return function()
 
   eq(render.detail(with_questions), "2 blocked", "detail counts blocked questions")
   eq(render.detail(task("T-1", "a", "failed")), "failed", "detail shows the failure status")
+
+  -- A failed task names its cause and its resume action, not only its status --
+  local transient_failure = task("T-1", "a", "failed", {
+    failure = { cause = "git_identity", message = "empty ident", remedy = "set user.email",
+      transient = true, attempts = 2, at = 10, next_retry_at = 70 },
+  })
+  eq(render.detail(transient_failure), "git_identity · reprise auto 2/3",
+    "a transient failure shows the automatic retry and its attempt count")
+  local human_failure = task("T-1", "a", "failed", {
+    failure = { cause = "auth", message = "401", remedy = "gh auth login",
+      transient = false, attempts = 1, at = 10 },
+  })
+  eq(render.detail(human_failure), "auth · metronome_retry",
+    "a non-transient failure names the tool that resumes it")
+  local legacy_failure = task("T-1", "a", "failed", { failure_reason = "git commit exit 1" })
+  has(render.detail(legacy_failure), "metronome_retry",
+    "a legacy failure_reason still says how to resume")
+  local failed_row = render.rows({ transient_failure })[1]
+  has(render.text(render.row_line(failed_row, {})), "git_identity",
+    "the row carries the typed cause and its action")
+
+  -- The detail honours the column width and cuts cleanly --------------------
+  local wide = render.detail(human_failure, "failures", 12)
+  eq(render.width_of(wide) <= 12, true, "the failure detail fits the column width")
+  has(wide, "…", "a clipped failure detail ends with an ellipsis")
+  eq(render.detail(human_failure, "failures", 40), "auth · metronome_retry",
+    "a detail that fits is left alone")
+
   local review_task = task("T-1", "a", "reviewing", { review = { round = 2, max_rounds = 3 } })
   eq(render.detail(review_task), "review 2/3", "detail shows the review round")
   eq(render.detail(task("T-1", "a", "running", { phase = "implement" })), "implement",

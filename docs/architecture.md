@@ -27,6 +27,7 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `calibrate.lua` | Analyze the repository and generate `review-rules.md`; ingest feedback. |
 | `pipeline.lua` | Scheduler: dependencies, `max_parallel`, runs-alone rule for undeclared files, stall detection, resume. |
 | `runtime.lua` | The production runtime the tools and commands call: paths, init, config (read and merge-update), submit, status, answer, retry, abandon, calibrate, panel, resume, feedback, mode. |
+| `recover.lua` | Classify a run error into a closed, typed cause with an actionable remedy, then record and decide a bounded exponential-backoff retry (`auto_retry`, `human` or `none`). No I/O, never raises. |
 | `mode.lua` | Persist the on/off routing flag, contribute a routing prompt hint evaluated before every run, and guard the main session from `write`/`edit`/`bash` while the mode is on. |
 | `fence.lua` | Wrap untrusted output in sentinels and escape forged sentinels. |
 | `tools.lua` | The twelve agent tools, as thin adapters over an injected runtime. |
@@ -93,6 +94,26 @@ An intention that qualifies into more than one task does not merge those tasks i
 - **`max_parallel`** — the hard cap on tasks in flight.
 - **Stall detection** — an active task whose last progress is older than `stall_minutes` is stale. A stale `running` task moves to `stalled`; the other active statuses are flagged `stall.suspect`.
 - **Resume** — `/reload` kills in-flight sessions. Resume walks each interrupted task back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase.
+
+## Recovery
+
+A task that fails is never lost: `failed` is resumable from its last stable state. The recovery loop is `recover.lua` → scheduler → per-task spawn, and it never runs a task synchronously in the scheduler's loop.
+
+1. **Typed diagnosis** — `recover.lua` classifies a run error into a closed set of causes (`nothing_to_commit`, `git_identity`, `network`, `binary_missing`, `timeout`, `killed`, `session_dead`, `quota`, `conflict`, `checks_failed`, `auth`, …) and attaches an actionable remedy. It is pure: no I/O, never raises. `nothing_to_commit` is benign — a tree already at the requested state is not a failure.
+2. **Bounded decision** — `recover.decide` returns `auto_retry`, `human` or `none` with an exponential backoff computed from `recover.DEFAULTS`:
+
+   | Constant | Default | Meaning |
+   | --- | --- | --- |
+   | `max_attempts` | `3` | Automatic attempts before a failure needs a human. |
+   | `backoff_base_secs` | `30` | Delay before the first retry. |
+   | `backoff_max_secs` | `900` | Ceiling on the backoff delay. |
+   | `factor` | `2` | Multiplier applied to the delay per attempt. |
+
+   These bounds are constants, not `config.toml` keys: `[limits]` exposes budget, timeout and question cap only.
+3. **Scheduler never stops** — `pipeline.lua` never halts on a `failed` task and never runs `run_task` on its own turn: `dispatch_one` only calls `spawn`, so each task runs in its own plugin-lifetime spawn (a strong reference, because a task finishing its own run must keep the shared upvalues alive). A retry queue therefore never blocks the drain: other ready tasks keep starting while a failed one is being redone.
+4. **Human relaunch** — `metronome_retry`, `metronome_answer`, `metronome_feedback` and a `/reload` followed by resume all re-dispatch the workflow through the same scheduler path; the task resumes from its last checkpoint, keeping its worktree, branch, checkpoints and transcript.
+
+**Fresh base before checks.** The task base is resolved from the task itself (`task.base_ref` for an epic subtask, `cfg.project.base_ref` otherwise), fetched from `origin`, and the branch is rebased onto that fresh commit before the convergence diff and the declared checks run. A fix merged into master or into the epic branch is therefore seen by every task still in flight, and a rebase conflict redoes the task once on the fresh base instead of failing it.
 
 ## Security
 

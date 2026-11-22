@@ -33,6 +33,70 @@
       "type": "string",
       "description": "Why the task last failed, persisted from the transition that moved it to failed. Absent when the task never failed."
     },
+    "failure": {
+      "type": "object",
+      "description": "The last typed failure: what broke, what a human can do about it, and where the bounded retry stands. Written by state.transition(..., \"failed\", { failure = ... }) alongside failure_reason, and kept across a resume — a retry reads it to decide whether to start again and from which checkpoint.",
+      "additionalProperties": false,
+      "properties": {
+        "cause": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The closed-set cause from recover.CAUSES (git_identity, network, timeout, quota, ...). This is what the retry policy keys on.",
+          "examples": [
+            "git_identity"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "What actually happened, on one line, as the failing tool printed it."
+        },
+        "remedy": {
+          "type": "string",
+          "description": "The actionable fix for a human, or the command to run, when the retry cannot do it alone."
+        },
+        "transient": {
+          "type": "boolean",
+          "description": "Whether the same attempt can succeed again without a human. A transient failure is retried under a bounded backoff; anything else escalates."
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many times this failure was recorded. A resume resets it to 0, because the budget is for consecutive attempts, not for the task's whole life."
+        },
+        "at": {
+          "description": "When the failure was recorded: ISO 8601 UTC, or epoch seconds as recover.record produces it. The cause survives a resume; this timestamp does.",
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        },
+        "next_retry_at": {
+          "description": "When the bounded retry may run again, same representation as `at`. Absent once the task resumed: nothing is scheduled any more.",
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        },
+        "phase": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The pipeline stage that was running when it broke, so the resume restarts there instead of from the top.",
+          "examples": [
+            "implement"
+          ]
+        }
+      }
+    },
     "origin": {
       "type": "string",
       "description": "The intention the user submitted, kept verbatim. Every task a submission produced carries the same origin, which is what the panel groups requests by. Absent on tasks created before this field existed; readers fall back to `intent`."

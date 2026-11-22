@@ -500,19 +500,20 @@ local function run_impl(opts)
   local no_changes = false
 
   if opts.commit ~= false then
-    local before, berr = opts.git.head_sha(ctx.worktree)
-    if not before then
-      return { ok = false, error = berr, ctx = ctx, checkpoint = checkpoint, run = run }
-    end
-
     local csha, ccerr = opts.git.commit(ctx.worktree, M.commit_message(opts.task, opts))
     if not csha then
-      if ccerr == "nothing to commit" then
-        -- A runner that committed by itself leaves nothing for us to do. The
-        -- head is the turn's result, and it only counts as "no change" when it
-        -- is still the checkpoint we started from.
-        sha = before
-        no_changes = (before == checkpoint)
+      -- A commit that found nothing to record is benign: the tree is clean,
+      -- either because the turn really committed (HEAD moved past the
+      -- checkpoint) or because it had nothing to do (HEAD is the checkpoint).
+      -- The sentinel is a stable value, so a French or English git, or any
+      -- other locale, cannot turn this success into a failure.
+      if ccerr == "nothing to commit" or ccerr == "nothing_to_commit" then
+        local head, herr = opts.git.head_sha(ctx.worktree)
+        if not head then
+          return { ok = false, error = herr, ctx = ctx, checkpoint = checkpoint, run = run }
+        end
+        sha = head
+        no_changes = (head == checkpoint)
       else
         return { ok = false, error = ccerr, ctx = ctx, checkpoint = checkpoint, run = run }
       end
