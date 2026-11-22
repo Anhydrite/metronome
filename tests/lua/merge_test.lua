@@ -488,6 +488,15 @@ return function()
   eq(res8 and res8.conflict, true, "a conflicting rebase is flagged as a conflict")
   eq(type(res8 and res8.conflict_files), "string", "conflict_files is a joined string")
   has(res8 and res8.conflict_files, "README.md", "conflict_files names the file")
+  eq(type(res8 and res8.conflict_file_list), "table", "conflict_file_list is the raw list")
+  eq(res8 and res8.conflict_file_list and res8.conflict_file_list[1], "README.md",
+    "conflict_file_list names the file")
+  -- The runtime fails the task with `result.error` once the repair bound is
+  -- reached: that message must be the escalation, not git's bare output.
+  has(res8 and res8.error, "README.md", "error is the escalation, naming the files")
+  has(res8 and res8.error, "git rebase origin/main", "error names the command")
+  eq(tostring(res8 and res8.error):find("rebase failed", 1, true), nil,
+    "error is not the bare rebase-failed text")
   eq(type(res8 and res8.conflict_hunks), "table", "conflict_hunks is returned")
   eq(res8 and res8.conflict_hunks and res8.conflict_hunks[1]
     and res8.conflict_hunks[1].file, "README.md", "the first hunk names its file")
@@ -509,15 +518,20 @@ return function()
   -- runtime can send it back to implement with the files in hand.
   local after8 = state.load(root).tasks[id8]
   eq(after8 and after8.status, "merging", "a conflicting rebase leaves the status merging")
-  local failed_note8, conflict_note8 = false, false
+  local failed_note8, conflict_note8, unrepaired_note8 = false, false, false
   for _, note in ipairs(after8 and after8.notes or {}) do
     if type(note) == "string" then
       if note:find("merge failed", 1, true) then failed_note8 = true end
       if note:find("merge conflict", 1, true) then conflict_note8 = true end
+      if note:find("cannot be repaired automatically", 1, true) then
+        unrepaired_note8 = true
+      end
     end
   end
   eq(failed_note8, false, "a repairable conflict writes no failure note")
   eq(conflict_note8, true, "the conflict is journaled as a note")
+  eq(unrepaired_note8, false,
+    "a repairable conflict is not journaled as unrepairable")
   eq(read_log(), "", "a conflicting rebase does not touch the PR")
 
   -- escalation: names what a human needs --------------------------------------

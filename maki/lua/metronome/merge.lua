@@ -136,49 +136,88 @@ end
 -- on every repair cannot inflate the journal without limit.
 local MAX_HUNK_LINES_PER_FILE = 80
 
+-- Split a hunk into its real lines. Unlike `text:gmatch("(.-)\n")` on a
+-- newline-terminated copy, this keeps an empty hunk empty and never produces a
+-- spurious trailing empty line that would be counted against the budget.
+local function split_lines(text)
+  local lines = {}
+  if text == "" then
+    return lines
+  end
+  local pos = 1
+  while true do
+    local nl = text:find("\n", pos, true)
+    if not nl then
+      lines[#lines + 1] = text:sub(pos)
+      return lines
+    end
+    lines[#lines + 1] = text:sub(pos, nl - 1)
+    pos = nl + 1
+  end
+end
+
 -- Cap the hunks per file, marking the truncation instead of silently dropping
--- lines: the implementer must know the excerpt is partial.
+-- lines: the implementer must know the excerpt is partial. A hunk that finds
+-- the file's budget already spent is dropped rather than emitted as an empty
+-- body (a header with no content is noise, not conflict context), and the
+-- marker is attached once to the last hunk actually kept for that file.
 local function cap_hunks(hunks)
   if type(hunks) ~= "table" then
     return nil
   end
+  local marker = "\n... (conflict hunks truncated at "
+    .. MAX_HUNK_LINES_PER_FILE .. " lines)"
   local out = {}
   local used = {}
+  local last = {}
   local truncated = {}
+
+  local function truncate(file)
+    if truncated[file] then
+      return
+    end
+    truncated[file] = true
+    local entry = last[file]
+    if entry then
+      entry.text = entry.text .. marker
+    end
+  end
+
   for _, hunk in ipairs(hunks) do
     if type(hunk) == "table" then
       local file = is_non_empty(hunk.file) and hunk.file or "unknown"
       local count = used[file] or 0
-      local kept = {}
-      local cut = false
-      for line in (tostring(hunk.text or "") .. "\n"):gmatch("(.-)\n") do
-        if count >= MAX_HUNK_LINES_PER_FILE then
-          cut = true
-          break
+      if count >= MAX_HUNK_LINES_PER_FILE then
+        truncate(file)
+      else
+        local lines = split_lines(tostring(hunk.text or ""))
+        local kept = {}
+        local cut = false
+        for i = 1, #lines do
+          if count >= MAX_HUNK_LINES_PER_FILE then
+            cut = true
+            break
+          end
+          kept[#kept + 1] = lines[i]
+          count = count + 1
         end
-        kept[#kept + 1] = line
-        count = count + 1
+        used[file] = count
+        local entry = { file = file, start = hunk.start, text = table.concat(kept, "\n") }
+        out[#out + 1] = entry
+        last[file] = entry
+        if cut then
+          truncate(file)
+        end
       end
-      used[file] = count
-      local text = table.concat(kept, "\n")
-      if cut and not truncated[file] then
-        text = text .. "\n... (conflict hunks truncated at "
-          .. MAX_HUNK_LINES_PER_FILE .. " lines)"
-        truncated[file] = true
-      end
-      out[#out + 1] = { file = file, start = hunk.start, text = text }
     end
   end
   return #out > 0 and out or nil
 end
 
--- A conflict beyond the repair bound must reach a human with the means to act
--- on it: the files, the base (with the actual SHA), the exact command and the
--- commit that could not be replayed. A bare "rebase failed" leaves the reader
--- to reconstruct all of that from git's raw output.
-function M.escalation(result)
-  result = type(result) == "table" and result or {}
-
+-- The facts a conflict message must name: the files, the base (with its actual
+-- SHA when known), the exact command and, when git reported it, the commit.
+-- Extracted once so the escalation and the repairable note stay consistent.
+local function conflict_facts(result)
   local files = result.conflict_files
   if not is_non_empty(files) and type(result.conflict) == "table" then
     files = table.concat(result.conflict, ", ")
@@ -194,9 +233,35 @@ function M.escalation(result)
   if is_non_empty(result.base_sha) then
     base = string.format("%s (%s)", upstream, result.base_sha)
   end
+  return files, base, command
+end
 
+-- A conflict beyond the repair bound must reach a human with the means to act
+-- on it: the files, the base (with the actual SHA), the exact command and the
+-- commit that could not be replayed. A bare "rebase failed" leaves the reader
+-- to reconstruct all of that from git's raw output.
+function M.escalation(result)
+  result = type(result) == "table" and result or {}
+
+  local files, base, command = conflict_facts(result)
   local parts = {
     string.format("rebase conflict on %s cannot be repaired automatically", base),
+    "files: " .. files,
+    "command: `" .. command .. "`",
+  }
+  if is_non_empty(result.conflict_commit) then
+    parts[#parts + 1] = "commit: " .. result.conflict_commit
+  end
+  return table.concat(parts, "; ")
+end
+
+-- A first conflict is auto-repaired, so its journal note must not claim the
+-- opposite: same facts as the escalation, but stating that the work will be
+-- redone on the fresh base instead of "cannot be repaired automatically".
+local function repair_note(result)
+  local files, base, command = conflict_facts(result)
+  local parts = {
+    string.format("rebase conflict on %s will be redone on the fresh base", base),
     "files: " .. files,
     "command: `" .. command .. "`",
   }
@@ -491,6 +556,7 @@ local function run_impl(opts)
       local details = {
         conflict = true,
         conflict_files = table.concat(conflict, ", "),
+        conflict_file_list = conflict,
         conflict_hunks = cap_hunks(rinfo.hunks),
         conflict_commit = is_non_empty(rinfo.commit) and rinfo.commit or nil,
         base = base,
@@ -499,12 +565,16 @@ local function run_impl(opts)
         rebase_command = is_non_empty(rinfo.command) and rinfo.command
           or ("git rebase " .. upstream),
       }
+      -- The escalation wording is what the runtime surfaces when the repair
+      -- bound is reached (`error`), so it must carry the files, the base, the
+      -- command and the faulty commit instead of git's raw "rebase failed".
       details.escalation = M.escalation(details)
 
       -- Journal the conflict (files, hunks, base, command) without touching
-      -- the status: the repair re-enters implement on the fresh base.
+      -- the status: the repair re-enters implement on the fresh base. The note
+      -- says the conflict is being repaired, not that it cannot be.
       if type(state.append) == "function" then
-        local lines = { "merge conflict (repairable): " .. details.escalation }
+        local lines = { "merge conflict (repairable): " .. repair_note(details) }
         for _, hunk in ipairs(details.conflict_hunks or {}) do
           lines[#lines + 1] = string.format("--- %s:%s\n%s",
             tostring(hunk.file), tostring(hunk.start), tostring(hunk.text))
@@ -518,10 +588,11 @@ local function run_impl(opts)
 
       return {
         ok = false,
-        error = rerr,
+        error = details.escalation,
         rebase = rebase,
         conflict = true,
         conflict_files = details.conflict_files,
+        conflict_file_list = details.conflict_file_list,
         conflict_hunks = details.conflict_hunks,
         conflict_commit = details.conflict_commit,
         base = details.base,
