@@ -282,6 +282,41 @@
       "type": "integer",
       "minimum": 0,
       "description": "How many times the task was redone on a fresh base after a conflict."
+    },
+    "quarantine": {
+      "type": "object",
+      "description": "Why the analysis gate is holding this task in qualifying. Present only while a blocking finding (or a failed analysis) keeps it out of the ready queue; cleared when the task passes the gate, so a repaired sheet stops showing as quarantined.",
+      "required": [
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "type": "string",
+          "description": "The first blocking rule, e.g. missing_dependency, or a pipeline error such as analysis failed.",
+          "minLength": 1
+        },
+        "rules": {
+          "type": "array",
+          "description": "Every blocking rule that named the task, sorted.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "findings": {
+          "type": "array",
+          "description": "The blocking findings themselves, kept so the panel can show what to repair.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "since": {
+          "type": "string",
+          "description": "When the task was quarantined, ISO 8601 UTC.",
+          "format": "date-time"
+        }
+      }
     }
   }
 }
