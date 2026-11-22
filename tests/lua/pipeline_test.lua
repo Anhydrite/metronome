@@ -349,6 +349,175 @@ return function()
   eq(resume.resumed[4].phase, "merge", "a merging task resumes the merge phase")
   eq(resume.resumed[5].phase, "deploy", "a deploying task resumes the deploy phase")
 
+  -- retry_ready: a transient failure under the bound and due -------------
+
+  local retry_now = 1000000
+  local function failed(id, failure, extra)
+    local t = task(id, "failed", extra)
+    t.failure = failure
+    return t
+  end
+  local function diag(extra)
+    local f = {
+      cause = "network",
+      message = "network blip",
+      remedy = "retry",
+      transient = true,
+      attempts = 1,
+      at = retry_now - 120,
+      next_retry_at = retry_now - 10,
+      phase = "implement",
+    }
+    for k, v in pairs(extra or {}) do
+      f[k] = v
+    end
+    return f
+  end
+
+  local retry_pool = {
+    failed("T-due", diag(), { files = { "src/due" } }),
+    failed("T-future", diag({ next_retry_at = retry_now + 60 }), { files = { "src/future" } }),
+    failed("T-exhausted", diag({ attempts = 3 }), { files = { "src/exhausted" } }),
+    failed("T-permanent", diag({ transient = false }), { files = { "src/permanent" } }),
+    task("T-ready", "ready", { files = { "src/ready" } }),
+  }
+  local retries = pipeline.retry_ready(retry_pool, { now = retry_now, max_attempts = 3 })
+  eq(#retries, 1, "only the due transient failure under the bound is retryable")
+  eq(retries[1].id, "T-due", "the due task is selected")
+
+  local no_deadline = pipeline.retry_ready({
+    failed("T-nodeadline", diag({ next_retry_at = nil })),
+  }, { now = retry_now, max_attempts = 3 })
+  eq(#no_deadline, 1, "a failure without a deadline is due")
+
+  local no_failure = pipeline.retry_ready({
+    task("T-none", "failed"),
+  }, { now = retry_now, max_attempts = 3 })
+  eq(#no_failure, 0, "a failed task without a diagnosis is not retried")
+
+  -- dependencies: a retryable failure is "retrying", not "blocked" --------
+
+  local child = task("T-child", "ready", { depends_on = { "T-due" } })
+  met, reason = pipeline.dependencies_met(child, retry_pool, { now = retry_now, max_attempts = 3 })
+  eq(met, false, "a retrying dependency is not met")
+  eq(reason:find("waiting on T-due (retrying)", 1, true) ~= nil, true,
+    "the reason says the dependency is retrying")
+
+  met, reason = pipeline.dependencies_met(
+    task("T-child2", "ready", { depends_on = { "T-permanent" } }),
+    retry_pool,
+    { now = retry_now, max_attempts = 3 }
+  )
+  eq(reason:find("blocked by T-permanent (failed)", 1, true) ~= nil, true,
+    "a permanent failure still blocks its dependent")
+
+  -- A not-yet-due retry is still retrying: the dependent waits, not blocked.
+  met, reason = pipeline.dependencies_met(
+    task("T-child3", "ready", { depends_on = { "T-future" } }),
+    retry_pool,
+    { now = retry_now, max_attempts = 3 }
+  )
+  eq(reason:find("waiting on T-future (retrying)", 1, true) ~= nil, true,
+    "a pending backoff is reported as retrying")
+
+  -- Integration: tick retries a failed task instead of wedging -------------
+
+  local retry_root = tmp_root("pipeline-retry")
+  state.create(retry_root, {
+    id = "T-20261122-e001",
+    title = "retry me",
+    status = "failed",
+    files = { "src/retry" },
+    failure = diag(),
+  })
+  state.create(retry_root, {
+    id = "T-20261122-e002",
+    title = "give up",
+    status = "failed",
+    files = { "src/giveup" },
+    failure = diag({ attempts = 3 }),
+  })
+  state.create(retry_root, {
+    id = "T-20261122-e003",
+    title = "child",
+    status = "ready",
+    files = { "src/child" },
+    depends_on = { "T-20261122-e001" },
+  })
+
+  local retry_tick = pipeline.run({
+    state = state,
+    root = retry_root,
+    max_parallel = 4,
+    stall = false,
+    now = retry_now,
+    max_attempts = 3,
+    dispatch = function(t, phase)
+      dispatched[#dispatched + 1] = { id = t.id, phase = phase }
+    end,
+  })
+  eq(retry_tick.ok, true, "a tick with failures never returns ok=false")
+  eq(#retry_tick.retrying, 1, "the tick reports one retry candidate")
+  eq(retry_tick.retrying[1].id, "T-20261122-e001", "the retry candidate is the due one")
+  local retry_after = state.load(retry_root).tasks
+  eq(retry_after["T-20261122-e001"].status, "running", "the retryable task is running again")
+  eq(retry_after["T-20261122-e002"].status, "failed", "the exhausted task stays failed")
+  eq(retry_after["T-20261122-e003"].status, "ready", "the dependent waits instead of being blocked")
+  local child_skip
+  for _, item in ipairs(retry_tick.skipped) do
+    if item.id == "T-20261122-e003" then
+      child_skip = item
+    end
+  end
+  eq(child_skip ~= nil, true, "the dependent is reported as skipped")
+  eq(child_skip.reason:find("retrying", 1, true) ~= nil, true,
+    "the dependent waits on a retrying dependency")
+
+  -- A tick over a state with only failed-permanent tasks still succeeds.
+  local stuck_tick = pipeline.tick({
+    state = state,
+    root = retry_root,
+    max_parallel = 2,
+    stall = false,
+    now = retry_now,
+    max_attempts = 3,
+    apply = false,
+  })
+  eq(stuck_tick.ok, true, "a dry tick over failed tasks succeeds")
+
+  -- Integration: resume relaunches a retryable failed task ---------------
+
+  local retry_resume_root = tmp_root("pipeline-retry-resume")
+  state.create(retry_resume_root, {
+    id = "T-20261122-f001",
+    title = "retry me",
+    status = "failed",
+    failure = diag(),
+  })
+  state.create(retry_resume_root, {
+    id = "T-20261122-f002",
+    title = "give up",
+    status = "failed",
+    failure = diag({ transient = false }),
+  })
+  local retry_resume = pipeline.resume(state, retry_resume_root, {
+    now = retry_now,
+    max_attempts = 3,
+    apply = false,
+  })
+  eq(#retry_resume.resumed, 1, "resume includes only the retryable failed task")
+  eq(retry_resume.resumed[1].id, "T-20261122-f001", "the retryable task is resumed")
+  eq(retry_resume.resumed[1].phase, "implement", "the retry resumes its failure phase")
+
+  local applied_resume = pipeline.resume(state, retry_resume_root, {
+    now = retry_now,
+    max_attempts = 3,
+  })
+  eq(#applied_resume.errors, 0, "the failed -> running resume path is legal")
+  local retry_resumed = state.load(retry_resume_root).tasks
+  eq(retry_resumed["T-20261122-f001"].status, "running", "the retryable task is running after resume")
+  eq(retry_resumed["T-20261122-f002"].status, "failed", "the permanent failure stays failed after resume")
+
   -- Resume refuses bad input -----------------------------------------------
 
   local no_state = pipeline.resume(nil, "/tmp")
