@@ -1993,6 +1993,56 @@ function M.new(deps)
     end
   end
 
+  -- A quarantined task must leave quarantine without a new submit: the gate
+  -- re-analyses every `qualifying` sheet (cheaply, through its fingerprint
+  -- cache) but `after_questions` only runs when the scheduler is dirty, and
+  -- once the rest of the queue has drained nothing dirties it any more. So a
+  -- pass that leaves quarantine behind arms one more pass later, with a bounded
+  -- backoff so a permanently blocked sheet costs a gate pass every few minutes
+  -- instead of a spin. The timer is a one-shot host callback, not a coroutine
+  -- suspended for the life of the plugin.
+  local QUARANTINE_REPOLL_MS = 30000
+  local QUARANTINE_REPOLL_MAX_MS = 300000
+  local quarantine_passes = 0
+  local quarantine_repoll_armed = false
+
+  -- Does any task still carry a non-empty quarantine? Read errors are treated
+  -- as "nothing to re-poll": a state that cannot be loaded must not arm a timer
+  -- that would fail the same way forever.
+  local function has_quarantined_tasks(paths)
+    local called, loaded = pcall(deps.state.load, paths.root)
+    if not called or type(loaded) ~= "table" or type(loaded.tasks) ~= "table" then
+      return false
+    end
+    for _, task in pairs(loaded.tasks) do
+      if type(task) == "table" and type(task.quarantine) == "table"
+        and next(task.quarantine) ~= nil then
+        return true
+      end
+    end
+    return false
+  end
+
+  -- Arm the next re-analysis pass. Only the async path needs it: the scripted
+  -- e2e path is synchronous and driven by its own drain.
+  local function arm_quarantine_pass()
+    if not deps.async or quarantine_repoll_armed then
+      return
+    end
+    local delay = math.min(QUARANTINE_REPOLL_MS * (2 ^ quarantine_passes), QUARANTINE_REPOLL_MAX_MS)
+    if quarantine_passes < 8 then
+      quarantine_passes = quarantine_passes + 1
+    end
+    local armed = later(function()
+      quarantine_repoll_armed = false
+      scheduler_dirty = true
+      pcall(runtime.run_pending)
+    end, delay)
+    if armed ~= nil then
+      quarantine_repoll_armed = true
+    end
+  end
+
   -- Quarantine the tasks an analysis-gate failure names, or the whole analysed
   -- batch when it names none. The gate is not the only way a task is set aside:
   -- a gate that raises, or reports an error/blocked verdict, must still isolate
@@ -2000,7 +2050,12 @@ function M.new(deps)
   -- returned ids are the ones actually marked, so the caller can log and report
   -- them without a second read of the journal.
   local function isolate_gate_failure(paths, gate, message)
-    local loaded = deps.state.load(paths.root)
+    -- This branch exists to survive a broken analysis. A state that cannot be
+    -- read must not raise out of it either: the caller still has to drain.
+    local called, loaded = pcall(deps.state.load, paths.root)
+    if not called then
+      return {}
+    end
     local all = type(loaded) == "table" and type(loaded.tasks) == "table" and loaded.tasks or {}
     local batch, in_batch = {}, {}
     for id, task in pairs(all) do
@@ -2097,9 +2152,23 @@ function M.new(deps)
       local message = tostring(gerr
         or (type(gate) == "table" and (gate.error or gate.verdict))
         or "analysis gate failed")
-      quarantined = isolate_gate_failure(paths, gate, message)
+      -- The isolation work itself must never raise out of the recovery branch:
+      -- a state or journal that fails here would escape `after_questions` and
+      -- skip the drain, which is the opposite of the contract.
+      local isolated, marked = pcall(isolate_gate_failure, paths, gate, message)
+      if not isolated then
+        log(paths, "analysis gate failure could not be isolated: " .. tostring(marked))
+        marked = {}
+      end
+      quarantined = marked or {}
+      -- Log the ids *and* the rule actually stored in their quarantine, so the
+      -- error path is as readable as the blocked one.
+      local parts = {}
+      for _, id in ipairs(quarantined) do
+        parts[#parts + 1] = tostring(id) .. " (analysis_gate_error)"
+      end
       log(paths, "analysis gate failed (" .. message .. "); quarantined "
-        .. (#quarantined > 0 and table.concat(quarantined, ", ") or "none")
+        .. (#parts > 0 and table.concat(parts, "; ") or "none")
         .. "; draining ready tasks anyway")
     elseif type(gate.quarantined) == "table" and #gate.quarantined > 0 then
       local blocked = type(gate.blocked) == "table" and gate.blocked or {}
@@ -2663,6 +2732,10 @@ function M.new(deps)
     end
     scheduler_running = true
     local job = scheduler_job
+    -- Set when the last pass left a task quarantined: a clean pass must be
+    -- reached without a new submit, so one more pass is armed once the drain has
+    -- released `scheduler_running` (arming from inside it would be a no-op).
+    local requeue_quarantine = false
     local ok, err = pcall(function()
       while #scheduler_extra > 0 or scheduler_dirty do
         while #scheduler_extra > 0 do
@@ -2686,12 +2759,24 @@ function M.new(deps)
           scheduler_dirty = false
           runtime.last_background = after_questions(
             job.opts, job.paths, job.cfg, job.runner, job.session)
+          if has_quarantined_tasks(job.paths) then
+            requeue_quarantine = true
+          else
+            -- The queue is clean again: the next quarantine starts its backoff
+            -- from the short delay.
+            quarantine_passes = 0
+          end
         end
       end
     end)
     scheduler_running = false
     if not ok then
       log(job.paths, "background scheduler error: " .. tostring(err))
+    end
+    -- Re-analyse a still-quarantined batch until a pass finds it clean, with no
+    -- new submit needed: the fingerprint cache makes an unchanged pass free.
+    if requeue_quarantine then
+      arm_quarantine_pass()
     end
   end
 

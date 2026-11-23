@@ -2952,6 +2952,104 @@ auto_deploy = false
   local e_log = maki.fs.read(maki.fs.joinpath(root, "runtime.log")) or ""
   has(e_log, "analysis gate failed", "the gate error is logged")
   has(e_log, "T-blocked", "the gate-error log names the quarantined task")
+  has(e_log, "analysis_gate_error", "the gate-error log names the quarantine rule")
+
+  -- A quarantined task is re-analysed without a new submit --------------------
+  -- Once the queue has drained nothing dirties the scheduler, so a pass that
+  -- leaves a task quarantined arms one more pass with a bounded backoff. When
+  -- the sheet is repaired, that pass finds it clean and leaves quarantine.
+  local r_blocked = {
+    id = "T-blocked", status = "qualifying", title = "blocked", checks = { "true" },
+  }
+  local r_deferred = {}
+  local r_gate_calls = 0
+  local r_fixed = false
+  local r_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = {
+      load = function()
+        if r_fixed then r_blocked.quarantine = nil end
+        return { tasks = { ["T-blocked"] = r_blocked } }
+      end,
+      transition = function(_, id, status)
+        if id == "T-blocked" then r_blocked.status = status end
+        return { id = id, status = status }
+      end,
+      set_fields = function(_, id, fields)
+        for key, value in pairs(fields or {}) do r_blocked[key] = value end
+        return r_blocked
+      end,
+      clear_quarantine = function(_, id)
+        if id == "T-blocked" then r_blocked.quarantine = nil end
+        return r_blocked
+      end,
+    },
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function() return { ok = true, started = {} } end,
+    },
+    paths = transient_deps.paths,
+    spawn = function() return { cancel = function() end } end,
+    async = true,
+    defer = function(fn, ms)
+      r_deferred[#r_deferred + 1] = { fn = fn, ms = ms }
+      return { cancel = function() end }
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = {
+      gate = function()
+        r_gate_calls = r_gate_calls + 1
+        if r_fixed then
+          r_blocked.quarantine = nil
+          return { ok = true, verdict = "pass", findings = {}, quarantined = {}, blocked = {} }
+        end
+        r_blocked.quarantine = {
+          reason = "analysis_blocked",
+          rules = { "missing_dependency" },
+          findings = { { severity = "blocking", rule = "missing_dependency", message = "missing dep" } },
+          since = 1,
+        }
+        return {
+          ok = true,
+          verdict = "blocked",
+          findings = { { severity = "blocking", rule = "missing_dependency",
+            message = "missing dep", tasks = { "T-blocked" } } },
+          quarantined = { "T-blocked" },
+          blocked = { ["T-blocked"] = { reason = "analysis_blocked",
+            rules = { "missing_dependency" } } },
+        }
+      end,
+    },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_r = runtime.new(r_deps)
+  rt_r.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_r.run_pending()
+  eq(r_gate_calls, 1, "the first pass runs the analysis gate")
+  eq(type(r_blocked.quarantine), "table", "the blocked task is quarantined")
+  eq(#r_deferred, 1, "a still-quarantined queue arms one more re-analysis pass")
+  eq((r_deferred[1] and r_deferred[1].ms) and r_deferred[1].ms > 0, true,
+    "the re-analysis pass is delayed, not a spin")
+  -- The user repairs the sheet: the next pass finds it clean, no new submit.
+  r_fixed = true
+  r_deferred[1].fn()
+  eq(r_gate_calls, 2, "the armed pass re-runs the analysis gate")
+  eq(r_blocked.quarantine, nil, "a clean pass leaves quarantine without a new submit")
+  eq(#r_deferred, 1, "a clean queue arms no further pass")
   end
   check_quarantine_drain()
 
