@@ -711,6 +711,8 @@ return function()
   eq(gated and #gated.tasks, 2, "the gate moves both tasks")
   eq(gated and gated.tasks[1], "T-20261114-m001", "the first moved task is sorted")
   eq(gated and gated.tasks[2], "T-20261114-m002", "the second moved task is sorted")
+  eq(gated and #gated.quarantined, 0, "a coherent pair quarantines nothing")
+  eq(gated and next(gated.blocked), nil, "a coherent pair has an empty blocked map")
 
   local after_gate = state.load(root)
   eq(after_gate.tasks["T-20261114-m001"].status, "ready", "the first task moved to ready")
@@ -745,13 +747,236 @@ return function()
   })
 
   local blocked_gate = analyze.gate(state, root, { intention = "add cache", now = "2026-11-14T00:01:00Z" })
-  eq(blocked_gate and blocked_gate.ok, false, "the gate blocks a duplicate title")
+  eq(blocked_gate and blocked_gate.ok, true, "a completed analysis is always ok, even when blocked")
   eq(blocked_gate and blocked_gate.verdict, "blocked", "the gate verdict is blocked")
-  eq(blocked_gate and #blocked_gate.tasks, 0, "the gate moves nothing when blocked")
+  eq(blocked_gate and #blocked_gate.tasks, 0, "the gate moves nothing when both tasks are blocked")
+  eq(blocked_gate and blocked_gate.quarantined[1], "T-20261114-m003", "the first duplicate is quarantined (sorted)")
+  eq(blocked_gate and blocked_gate.quarantined[2], "T-20261114-m004", "the second duplicate is quarantined (sorted)")
   local gate_finding = find_rule(blocked_gate, "duplicate_title")
   eq(gate_finding and gate_finding.severity, "blocking", "the gate reports the blocking finding")
+  eq(blocked_gate and blocked_gate.findings ~= nil, true, "the gate exposes every finding")
 
   local after_blocked = state.load(root)
   eq(after_blocked.tasks["T-20261114-m003"].status, "qualifying", "the first duplicate stays qualifying")
   eq(after_blocked.tasks["T-20261114-m004"].status, "qualifying", "the second duplicate stays qualifying")
+  local first_quarantine = after_blocked.tasks["T-20261114-m003"].quarantine
+  eq(type(first_quarantine), "table", "a blocked task carries a quarantine marker")
+  eq(first_quarantine and first_quarantine.reason, "analysis_blocked", "the quarantine names its reason")
+  eq(first_quarantine and first_quarantine.rules[1], "duplicate_title", "the quarantine names the rules")
+  eq(type(first_quarantine and first_quarantine.findings), "table", "the quarantine carries the findings")
+  eq(first_quarantine and first_quarantine.findings[1].severity, "blocking", "the quarantined finding is blocking")
+  eq(first_quarantine and first_quarantine.since, "2026-11-14T00:01:00Z", "the quarantine records when it started")
+
+  -- gate: a mixed batch moves only the clean task --------------------------
+
+  local mixed_root = maki.fs.joinpath(base, "mixed")
+
+  state.create(mixed_root, {
+    id = "T-20261114-n001",
+    title = "Blocked task",
+    files = { "src/blocked.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+    depends_on = { "T-20261114-ffff" },
+  })
+  state.create(mixed_root, {
+    id = "T-20261114-n002",
+    title = "Clean task",
+    files = { "src/clean.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+  })
+
+  local mixed = analyze.gate(state, mixed_root, { intention = "mixed batch", now = "2026-11-14T00:02:00Z" })
+  eq(mixed and mixed.ok, true, "a mixed batch is a completed analysis")
+  eq(mixed and mixed.verdict, "blocked", "a mixed batch keeps the analysis verdict blocked")
+  eq(mixed and #mixed.tasks, 1, "a mixed batch moves exactly one task")
+  eq(mixed and mixed.tasks[1], "T-20261114-n002", "the clean task moves to ready")
+  eq(mixed and mixed.quarantined[1], "T-20261114-n001", "the blocked task is quarantined")
+  eq(mixed and mixed.quarantined[2], nil, "only the blocked task is quarantined")
+  local mixed_missing = find_rule(mixed, "missing_dependency")
+  eq(mixed_missing and mixed_missing.severity, "blocking", "the mixed batch reports missing_dependency")
+  eq(mixed and mixed.blocked["T-20261114-n001"] ~= nil, true, "the blocked map names the blocked task")
+  eq(mixed and mixed.blocked["T-20261114-n001"].reason, "analysis_blocked", "the blocked map carries the reason")
+  eq(mixed and mixed.blocked["T-20261114-n001"].rules[1], "missing_dependency", "the blocked map carries the rules")
+  eq(mixed and mixed.blocked["T-20261114-n001"].findings[1].tasks[1], "T-20261114-n001",
+    "the blocked map keeps the finding and its task")
+  eq(mixed and mixed.blocked["T-20261114-n002"], nil, "the clean task is not in the blocked map")
+
+  local mixed_after = state.load(mixed_root)
+  eq(mixed_after.tasks["T-20261114-n001"].status, "qualifying", "the blocked task stays qualifying")
+  eq(mixed_after.tasks["T-20261114-n002"].status, "ready", "the clean task is ready")
+  local mixed_quarantine = mixed_after.tasks["T-20261114-n001"].quarantine
+  eq(type(mixed_quarantine), "table", "the blocked task carries a quarantine marker")
+  eq(mixed_quarantine and mixed_quarantine.rules[1], "missing_dependency", "the mixed quarantine names the rule")
+  eq(mixed_quarantine and mixed_quarantine.findings[1].rule, "missing_dependency", "the mixed quarantine carries the finding")
+
+  local mixed_report_text = maki.fs.read(maki.fs.joinpath(mixed_root, "analysis.json"))
+  local mixed_report_ok, mixed_report = pcall(maki.json.decode, mixed_report_text)
+  eq(mixed_report_ok, true, "the mixed gate writes analysis.json")
+  eq(mixed_report and mixed_report.verdict, "blocked", "the mixed analysis.json keeps its verdict")
+  eq(type(mixed_report and mixed_report.findings), "table", "the mixed analysis.json keeps its findings")
+
+  -- gate: an unattributable blocking finding quarantines the whole batch ---
+
+  local unattributable_root = maki.fs.joinpath(base, "unattributable")
+
+  state.create(unattributable_root, {
+    id = "T-20261114-p001",
+    title = "First clean",
+    files = { "src/p1.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+  })
+  state.create(unattributable_root, {
+    id = "T-20261114-p002",
+    title = "Second clean",
+    files = { "src/p2.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+  })
+
+  -- A batch-level finding names no task: it cannot be pinned on one sheet, so
+  -- it sets aside every task of the analysed batch and moves none.
+  local batch_runner = function()
+    return {
+      ok = true,
+      text = '{"findings":[{"severity":"blocking","rule":"contradiction","message":"the batch contradicts itself","tasks":[]}]}',
+    }
+  end
+  local unattributable = analyze.gate(state, unattributable_root, {
+    intention = "unattributable",
+    runner = batch_runner,
+    session_opts = session_opts,
+    now = "2026-11-14T00:03:00Z",
+  })
+  eq(unattributable ~= nil, true, "the unattributable gate returns a result, not an error")
+  eq(unattributable and unattributable.ok, true, "the unattributable analysis is ok")
+  eq(unattributable and #unattributable.tasks, 0, "the unattributable batch moves nothing")
+  eq(unattributable and #unattributable.quarantined, 2, "the unattributable batch quarantines every task")
+  eq(unattributable and unattributable.quarantined[1], "T-20261114-p001", "the first task is quarantined (sorted)")
+  eq(unattributable and unattributable.quarantined[2], "T-20261114-p002", "the second task is quarantined (sorted)")
+  eq(unattributable and unattributable.blocked["T-20261114-p002"].rules[1], "contradiction",
+    "the batch-level rule reaches every task")
+
+  local unattributable_after = state.load(unattributable_root)
+  eq(unattributable_after.tasks["T-20261114-p001"].status, "qualifying", "the first task stays qualifying")
+  eq(unattributable_after.tasks["T-20261114-p002"].status, "qualifying", "the second task stays qualifying")
+  eq(type(unattributable_after.tasks["T-20261114-p001"].quarantine), "table", "the first task is marked")
+  eq(type(unattributable_after.tasks["T-20261114-p002"].quarantine), "table", "the second task is marked")
+
+  -- gate: the fingerprint cache -------------------------------------------
+
+  local cache_root = maki.fs.joinpath(base, "cache")
+  local cache_tasks_dir = maki.fs.joinpath(cache_root, "tasks")
+  maki.fs.mkdir(cache_tasks_dir, { parents = true })
+  maki.fs.write(maki.fs.joinpath(cache_tasks_dir, "T-20261114-q001.md"), "# First sheet\n")
+
+  state.create(cache_root, {
+    id = "T-20261114-q001",
+    title = "Cached first",
+    files = { "src/q1.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+  })
+  state.create(cache_root, {
+    id = "T-20261114-q002",
+    title = "Cached second",
+    files = { "src/q2.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+  })
+
+  local cache_calls = 0
+  local cache_runner = function()
+    cache_calls = cache_calls + 1
+    return {
+      ok = true,
+      text = '{"findings":[{"severity":"blocking","rule":"ordering","message":"the pair must land together","tasks":["T-20261114-q001","T-20261114-q002"]}]}',
+    }
+  end
+
+  local cache_first = analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = cache_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+    now = "2026-11-14T00:04:00Z",
+  })
+  eq(cache_calls, 1, "the first gate calls the semantic runner")
+  eq(cache_first and cache_first.cached, false, "the first gate is a cache miss")
+  eq(cache_first and #cache_first.tasks, 0, "the blocked pair moves nothing")
+  eq(cache_first and cache_first.quarantined[1], "T-20261114-q001", "the blocking finding quarantines q001")
+  eq(cache_first and cache_first.quarantined[2], "T-20261114-q002", "the blocking finding quarantines q002")
+
+  local cache_second = analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = cache_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+    now = "2026-11-14T00:05:00Z",
+  })
+  eq(cache_calls, 1, "an unchanged input reuses the cache and never calls the runner")
+  eq(cache_second and cache_second.cached, true, "the second gate is a cache hit")
+  eq(cache_second and cache_second.quarantined[1], "T-20261114-q001", "the cached findings still quarantine q001")
+  eq(cache_second and find_rule(cache_second, "ordering") ~= nil, true, "the cached findings are reused")
+  local cache_after_second = state.load(cache_root)
+  eq(cache_after_second.tasks["T-20261114-q001"].quarantine.since, "2026-11-14T00:04:00Z",
+    "a repeated quarantine keeps its original since")
+
+  maki.fs.write(maki.fs.joinpath(cache_tasks_dir, "T-20261114-q001.md"), "# First sheet, edited\n")
+  analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = cache_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+  })
+  eq(cache_calls, 2, "changing a sheet invalidates the cache")
+
+  state.set_fields(cache_root, "T-20261114-q002", { depends_on = { "T-20261114-q001" } })
+  analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = cache_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+  })
+  eq(cache_calls, 3, "changing a dependency invalidates the cache")
+
+  -- Edit the finding the cache stores: the signature no longer matches, so the
+  -- gate cannot trust the cache and asks the analyst again.
+  local cache_file = maki.fs.joinpath(cache_root, "analysis-cache.json")
+  local cache_text = maki.fs.read(cache_file)
+  local cache_ok, cache_payload = pcall(maki.json.decode, cache_text)
+  eq(cache_ok and type(cache_payload) == "table", true, "the cache file is readable")
+  cache_payload.findings[1].message = "the pair perhaps lands together"
+  maki.fs.write(cache_file, maki.json.encode(cache_payload))
+  analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = cache_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+  })
+  eq(cache_calls, 4, "changing a finding invalidates the cache")
+
+  -- A re-analysis that finds the quarantined tasks clean lifts the markers and
+  -- moves them to ready without a new submit. The sheet changes, so the cache
+  -- is invalidated and the analyst gets a fresh say.
+  maki.fs.write(maki.fs.joinpath(cache_tasks_dir, "T-20261114-q001.md"), "# First sheet, fixed\n")
+  local clean_runner = function()
+    cache_calls = cache_calls + 1
+    return { ok = true, text = '{"findings":[]}' }
+  end
+  local reopened = analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = clean_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+  })
+  eq(reopened and reopened.ok, true, "the clean re-analysis is ok")
+  eq(reopened and reopened.quarantined[1], nil, "the clean re-analysis quarantines nothing")
+  eq(reopened and #reopened.tasks, 2, "the clean re-analysis moves both tasks")
+  local reopened_after = state.load(cache_root)
+  eq(reopened_after.tasks["T-20261114-q001"].status, "ready", "the formerly blocked task moves to ready")
+  eq(reopened_after.tasks["T-20261114-q001"].quarantine, nil, "the quarantine marker is cleared")
+  eq(reopened_after.tasks["T-20261114-q002"].quarantine, nil, "the second marker is cleared")
 end

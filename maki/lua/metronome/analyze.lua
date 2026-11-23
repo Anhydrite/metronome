@@ -1039,14 +1039,127 @@ function M.write_report(root, result, opts)
   return path, nil
 end
 
+-- Fingerprint cache ----------------------------------------------------------
+
+-- Two independent polynomial hashes, concatenated. A single 32-bit hash has a
+-- collision rate low enough to be unlikely but not low enough to bet a cache
+-- hit on; two bases make an accidental match negligible without pulling a
+-- crypto library into the module.
+local function digest(text)
+  local h1, h2 = 5381, 2166136261
+  for i = 1, #text do
+    local byte = text:byte(i)
+    h1 = (h1 * 33 + byte) % 4294967296
+    h2 = (h2 * 16777619 + byte) % 4294967296
+  end
+  return string.format("%.0f-%.0f", h1, h2)
+end
+
+-- The findings a cache hit reuses, rendered so that any change to a severity,
+-- a rule, a message or an attributed task changes the signature. A cache whose
+-- stored signature no longer matches its own findings is stale: someone edited
+-- the report, or a previous run wrote it half-way.
+local function findings_signature(findings)
+  local parts = {}
+  for i, finding in ipairs(type(findings) == "table" and findings or {}) do
+    parts[i] = table.concat({
+      tostring(finding.severity or ""),
+      tostring(finding.rule or ""),
+      tostring(finding.message or ""),
+      table.concat(string_list(finding.tasks), ","),
+    }, "\31")
+  end
+  return digest(table.concat(parts, "\30"))
+end
+
+-- The analysis input: the selected ids, each sheet's structural fields, the
+-- dependency edges and the sheet text itself. Sorted by id, so the order the
+-- caller happened to pass the tasks in never invalidates the cache.
+local function input_fingerprint(tasks, tasks_dir)
+  local ids = {}
+  for i, task in ipairs(tasks) do
+    ids[i] = task_id(task, i)
+  end
+  local order = {}
+  for i = 1, #tasks do
+    order[i] = i
+  end
+  table.sort(order, function(a, b)
+    return ids[a] < ids[b]
+  end)
+
+  local rows = {}
+  for _, i in ipairs(order) do
+    local task = tasks[i]
+    local sheet = ""
+    if type(tasks_dir) == "string" and tasks_dir ~= "" then
+      local text = fs.read(fs.joinpath(tasks_dir, ids[i] .. ".md"))
+      if type(text) == "string" then
+        sheet = text
+      end
+    end
+    rows[#rows + 1] = table.concat({
+      ids[i],
+      tostring(task.title or ""),
+      tostring(task.base_ref or ""),
+      table.concat(dedupe_sorted(string_list(task.files)), ","),
+      table.concat(string_list(task.checks), "\1"),
+      table.concat(dedupe_sorted(string_list(task.depends_on)), ","),
+      sheet,
+    }, "\2")
+  end
+  return digest(table.concat(rows, "\3"))
+end
+
+local CACHE_FILE = "analysis-cache.json"
+
+local function read_cache(root)
+  local text = fs.read(fs.joinpath(root, CACHE_FILE))
+  if type(text) ~= "string" then
+    return nil
+  end
+  local ok, decoded = pcall(json.decode, text)
+  if not ok or type(decoded) ~= "table" then
+    return nil
+  end
+  return decoded
+end
+
+local function write_cache(root, fingerprint, findings)
+  local payload = {
+    fingerprint = fingerprint,
+    findings = findings,
+    findings_signature = findings_signature(findings),
+    at = now_iso(),
+  }
+  local ok, encoded = pcall(json.encode, payload)
+  if not ok or type(encoded) ~= "string" then
+    return nil
+  end
+  return fs.write(fs.joinpath(root, CACHE_FILE), encoded)
+end
+
 -- Gate -----------------------------------------------------------------------
 
--- The `qualifying -> ready` gate.
+-- The `qualifying -> ready` gate, decided per task.
 --
--- Select the sheets that are waiting (or the ones the caller names), analyze
--- them, write the report, and only then move the ones still qualifying to
--- ready. A blocking finding moves nothing: the whole batch stays where it is
--- so the user can fix the sheets and re-run.
+-- The structural and semantic halves produce one findings list for the batch;
+-- the gate then attributes every blocking finding to the task ids it names. A
+-- task that carries one stays in `qualifying` with a `quarantine` marker, and
+-- every other task moves to `ready`. One broken sheet therefore never freezes
+-- the tasks that are fine.
+--
+-- A blocking finding that names no selected task (an empty tasks list, or a
+-- batch-level rule) cannot be pinned on one sheet: it quarantines the whole
+-- analysed batch and moves none. That is still a completed analysis, so the
+-- gate returns ok=true and the caller dispatches whatever else is ready.
+--
+-- A fingerprint of the analysis input (ids, sheets, dependencies) and of the
+-- findings keys a persistent cache under the state root. When nothing changed,
+-- the gate reuses the cached findings and never calls the semantic runner; a
+-- change to a sheet, an edge or a finding misses the cache. A re-analysis that
+-- finds a quarantined task clean clears its quarantine and moves it to ready
+-- without waiting for a new submit.
 function M.gate(state, root, opts)
   opts = type(opts) == "table" and opts or {}
   if type(state) ~= "table" or type(state.load) ~= "function" then
@@ -1081,43 +1194,192 @@ function M.gate(state, root, opts)
   end
 
   if #selected == 0 then
-    return { ok = true, verdict = "ok", findings = {}, tasks = {} }
+    return { ok = true, verdict = "ok", findings = {}, tasks = {}, quarantined = {}, blocked = {} }
   end
+
+  local selected_by_id = {}
+  local selected_ids = {}
+  for i, task in ipairs(selected) do
+    local id = task_id(task, i)
+    selected_ids[i] = id
+    selected_by_id[id] = task
+  end
+  table.sort(selected_ids)
 
   local known_ids = {}
   for id in pairs(all) do
     known_ids[id] = true
   end
 
-  local result = M.run({
-    tasks = selected,
-    intention = opts.intention,
-    known_ids = known_ids,
-    repo = opts.repo,
-    ref = opts.ref,
-    git = opts.git,
-    runner = opts.runner,
-    session_opts = opts.session_opts,
-    semantic = opts.semantic,
-    tasks_dir = opts.tasks_dir or fs.joinpath(root, "tasks"),
-    state_root = opts.state_root,
-    ctx = opts.ctx,
-    now = opts.now,
-  })
+  local tasks_dir = opts.tasks_dir or fs.joinpath(root, "tasks")
+  -- Only a run that actually consulted the semantic half is worth caching: a
+  -- structural-only dry run must never hide the analyst from the next gate.
+  local cacheable = type(opts.runner) == "function" and opts.semantic ~= false
+  local fingerprint = input_fingerprint(selected, tasks_dir)
+  local cache_hit = false
+  local result = nil
+
+  if cacheable then
+    local cache = read_cache(root)
+    if type(cache) == "table"
+      and cache.fingerprint == fingerprint
+      and type(cache.findings) == "table"
+      and cache.findings_signature == findings_signature(cache.findings) then
+      result = {
+        ok = true,
+        verdict = "ok",
+        findings = cache.findings,
+        semantic = { ok = true, cached = true },
+      }
+      cache_hit = true
+    end
+  end
+
+  if not result then
+    result = M.run({
+      tasks = selected,
+      intention = opts.intention,
+      known_ids = known_ids,
+      repo = opts.repo,
+      ref = opts.ref,
+      git = opts.git,
+      runner = opts.runner,
+      session_opts = opts.session_opts,
+      semantic = opts.semantic,
+      tasks_dir = tasks_dir,
+      state_root = opts.state_root,
+      ctx = opts.ctx,
+      now = opts.now,
+    })
+    local ok = true
+    for _, finding in ipairs(result.findings or {}) do
+      if finding.severity == "blocking" then
+        ok = false
+        break
+      end
+    end
+    result.ok = ok
+    result.verdict = ok and "ok" or "blocked"
+    if cacheable then
+      write_cache(root, fingerprint, result.findings)
+    end
+  end
 
   local _, report_err = M.write_report(root, result, opts)
   if report_err then
     return nil, report_err
   end
 
-  local moved = {}
-  if result.ok then
-    local fresh = state.load(root)
-    local current_tasks = type(fresh) == "table" and type(fresh.tasks) == "table" and fresh.tasks or {}
-    for _, task in ipairs(selected) do
-      local id = task_id(task, 1)
-      local current = current_tasks[id]
-      if type(current) == "table" and current.status == "qualifying" then
+  -- Attribution: a blocking finding blocks the selected tasks it names. One
+  -- that names none of them is unattributable and blocks the whole batch.
+  local per_task = {}
+  local unattributable = {}
+  for _, finding in ipairs(result.findings or {}) do
+    if finding.severity == "blocking" then
+      local attributed = false
+      for _, id in ipairs(string_list(finding.tasks)) do
+        if selected_by_id[id] then
+          attributed = true
+          per_task[id] = per_task[id] or {}
+          table.insert(per_task[id], finding)
+        end
+      end
+      if not attributed then
+        unattributable[#unattributable + 1] = finding
+      end
+    end
+  end
+
+  local function dedupe_order(list)
+    local seen = {}
+    local out = {}
+    for _, item in ipairs(list) do
+      if not seen[item] then
+        seen[item] = true
+        out[#out + 1] = item
+      end
+    end
+    return out
+  end
+
+  -- The marker a task carries. `rules` keeps report order (the schema says so)
+  -- and the findings are copied without their empty `tasks` list so they stay
+  -- schema-legal in the journal.
+  local function quarantine_payload(findings_list, existing)
+    local rules = {}
+    local copies = {}
+    for _, finding in ipairs(findings_list) do
+      rules[#rules + 1] = is_non_empty(finding.rule) and trim(finding.rule) or "semantic"
+      local copy = { severity = finding.severity, message = finding.message }
+      if is_non_empty(finding.rule) then
+        copy.rule = trim(finding.rule)
+      end
+      local named = string_list(finding.tasks)
+      if #named > 0 then
+        copy.tasks = named
+      end
+      copies[#copies + 1] = copy
+    end
+    local since = type(existing) == "table" and existing.since or (opts.now or now_iso())
+    return {
+      reason = "analysis_blocked",
+      rules = dedupe_order(rules),
+      findings = copies,
+      since = since,
+    }
+  end
+
+  local fresh = state.load(root)
+  local current_tasks = type(fresh) == "table" and type(fresh.tasks) == "table" and fresh.tasks or {}
+
+  local ready = {}
+  local quarantined = {}
+  local blocked = {}
+
+  for _, id in ipairs(selected_ids) do
+    local current = current_tasks[id]
+    if type(current) == "table" then
+      local own = per_task[id]
+      local list = nil
+      if #unattributable > 0 then
+        list = {}
+        for _, finding in ipairs(own or {}) do
+          list[#list + 1] = finding
+        end
+        for _, finding in ipairs(unattributable) do
+          list[#list + 1] = finding
+        end
+      elseif own and #own > 0 then
+        list = own
+      end
+
+      if list then
+        local payload = quarantine_payload(list, current.quarantine)
+        local wrote_ok, wrote, write_err = pcall(
+          state.set_fields, root, id, { quarantine = payload }
+        )
+        if not wrote_ok then
+          return nil, "cannot quarantine " .. id .. ": " .. tostring(wrote)
+        end
+        if not wrote then
+          return nil, write_err
+        end
+        quarantined[#quarantined + 1] = id
+        blocked[id] = {
+          reason = payload.reason,
+          rules = payload.rules,
+          findings = payload.findings,
+        }
+      elseif current.status == "qualifying" then
+        if current.quarantine ~= nil then
+          local cleared_ok, cleared, clear_err = pcall(state.clear_quarantine, root, id)
+          if not cleared_ok then
+            return nil, "cannot clear the quarantine of " .. id .. ": " .. tostring(cleared)
+          end
+          if not cleared then
+            return nil, clear_err
+          end
+        end
         local moved_ok, transitioned, transition_err = pcall(
           state.transition, root, id, "ready", { phase = "analyze" }
         )
@@ -1127,16 +1389,23 @@ function M.gate(state, root, opts)
         if not transitioned then
           return nil, transition_err
         end
-        moved[#moved + 1] = id
+        ready[#ready + 1] = id
+      elseif current.quarantine ~= nil then
+        -- A clean re-analysis of a task that is no longer qualifying still
+        -- lifts a stale marker, without touching its status.
+        pcall(state.clear_quarantine, root, id)
       end
     end
   end
 
   return {
-    ok = result.ok,
+    ok = true,
     verdict = result.verdict,
     findings = result.findings,
-    tasks = moved,
+    tasks = ready,
+    quarantined = quarantined,
+    blocked = blocked,
+    cached = cache_hit,
   }
 end
 
