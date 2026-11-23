@@ -146,10 +146,11 @@ The scheduler (`pipeline.lua`) decides what may run, never how a step runs:
 
 - **Dependencies** — a task starts only when every `depends_on` task is `merged` or `deployed`. A missing, failed or abandoned dependency blocks it with a named reason.
 - **Parallelism** — a task starts only when its `depends_on` tasks are `merged` or `deployed` and `max_parallel` has a free slot: parallelism is bounded only by `max_parallel` and `depends_on`. A shared declared file is not a conflict: each task works in its own worktree on its own branch, several agents may touch the same file at once, and any textual conflict is resolved at merge time. A task that declares no files has an unknown blast radius and runs alone.
-- **`max_parallel`** — the hard cap on tasks in flight.
+- **`max_parallel`** — the hard cap on tasks actually in flight (`running`, `verifying`, `reviewing`, `merging`). It is the only bound: a shared declared file never serialises anything, because each task has its own worktree and branch and any conflict is resolved at merge. A retry and a resume count against the same cap as a fresh dispatch.
+- **Retry and resume obey the cap** — `metronome_retry`, an automatic retry and a resume start a task only when `max_parallel` has a free slot. When the cap is full the task is not launched: it is marked persisted with `slot_wait = true`, its wait recorded as `slot_wait_since` and the reason `waiting for a free slot` written to the journal, while it keeps its status and phase (a task interrupted in `reviewing` stays `reviewing`, a retried `failed` task stays `failed`) and keeps its worktree, branch, checkpoints, transcript and failure cause. The scheduler dispatches it when a slot frees, and the dispatch clears `slot_wait` in the same move to `running`. The slot is reserved before the run is spawned, so two retries cannot both take the last slot.
 - **Stall detection** — an active task whose last progress is older than `stall_minutes` is stale; a stale `running` task moves to `stalled`, the other active statuses are flagged suspect.
-- **Resume** — `/reload` leaves tasks in active statuses. Resume walks each back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase.
-- **Never stops on a failure** — the scheduler never halts because a task is `failed`. Each `run_task` runs in its own spawn, off the scheduler's turn, so a retry never blocks the drain: other ready tasks keep starting while a failed task is being redone.
+- **Resume** — `/reload` leaves tasks in active statuses. Resume walks each back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase, subject to the slot rule above: an interrupted task that finds no free slot is parked with `slot_wait = true` instead of being launched.
+- **Never stops on a failure** — the scheduler never halts because a task is `failed`. Each `run_task` runs in its own spawn, off the scheduler's turn, so a retry never blocks the drain: other ready tasks keep starting while a failed task is being redone, up to `max_parallel` and never past it.
 
 ## Recovery
 
@@ -157,7 +158,7 @@ You do not guess your way out of a failure, and you never let one end the run. T
 
 1. **Read the diagnosis.** Call `metronome_status` for the failed task and read three fields: `checkpoint` (the last stable SHA the task can resume from), `last_error` (the typed cause — `git_identity`, `network`, `binary_missing`, `timeout`, `killed`, `session_dead`, `quota`, …) and `retry_action` (what to do next: `auto_retry`, `human` or `none`, with the remedy text).
 2. **Act on the remedy.** A transient cause is retried automatically with bounded exponential backoff — you do not have to do anything. When the diagnosis names an action you can take (identity unset, branch already clean, quota exhausted), state it to the user and fix the environment, not the code.
-3. **Resume.** Call `metronome_retry` (or `/metronome retry <id>`) to restart the task from its last checkpoint when the automatic path has been exhausted or when the cause needs a human decision. The retry is a relaunch of the workflow, not a new task: worktree, branch, checkpoints and transcript are unchanged.
+3. **Resume.** Call `metronome_retry` (or `/metronome retry <id>`) to restart the task from its last checkpoint when the automatic path has been exhausted or when the cause needs a human decision. The retry is a relaunch of the workflow, not a new task: worktree, branch, checkpoints and transcript are unchanged. It also obeys `max_parallel`: with no free slot the task is parked with `slot_wait = true` and the journaled reason `waiting for a free slot`, still `failed` (or `stalled`, or `abandoned`) and still holding its cause, until the scheduler dispatches it on a freed slot.
 4. **Escalate last.** Escalate to the human only when a retry is impossible — a missing credential, an unrecoverable conflict, a protected-path finding, a decision only the user can make. Never escalate a transient failure the pipeline can retry itself.
 
 A failed task is never a reason to stop the pipeline. Something is always able to resume it.
@@ -196,9 +197,9 @@ You report what the pipeline recorded. If a check is red, you say red. If a revi
 You drive the pipeline through twelve tools:
 
 - `metronome_submit` — create an intent and start qualification; returns at once, qualification runs in the background.
-- `metronome_status` — read the state of all tasks, or the detail of one. For a failed task, read its `checkpoint`, typed `last_error` and `retry_action` before acting.
+- `metronome_status` — read the state of all tasks, or the detail of one. For a failed task, read its `checkpoint`, typed `last_error` and `retry_action` before acting. For a task that did not start, `wait_reason` names why the way it names a dependency wait: `waiting for a free slot` with `slot_wait = { reason, in_flight, max_parallel }` when `max_parallel` has no free slot, `slot_wait_flag` telling whether the task is parked at all.
 - `metronome_answer` — deliver answers to the pending question round.
-- `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase; the relaunch keeps the worktree, branch, checkpoints and transcript.
+- `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase; the relaunch keeps the worktree, branch, checkpoints and transcript. It starts the task only when `max_parallel` has a free slot, otherwise it parks it with `slot_wait = true` and the reason `waiting for a free slot` until the scheduler dispatches it.
 - `metronome_abandon` — archive a task.
 - `metronome_prune` — reconcile GitHub with the journal: close PRs and delete branches of tasks that are failed, abandoned or gone.
 - `metronome_stop` — stop an in-flight task and park it as abandoned.

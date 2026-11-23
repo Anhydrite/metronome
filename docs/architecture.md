@@ -25,8 +25,8 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `merge.lua` | Rebase on the fresh base, merge the PR, re-run the checks on the merged base. |
 | `deploy.lua` | Run `deploy.md` with the user in the loop, guarded by a merged PR and green checks. |
 | `calibrate.lua` | Analyze the repository and generate `review-rules.md`; ingest feedback. |
-| `pipeline.lua` | Scheduler: dependencies, `max_parallel`, runs-alone rule for undeclared files, stall detection, resume. |
-| `runtime.lua` | The production runtime the tools and commands call: paths, init, config (read and merge-update), submit, status, answer, retry, abandon, calibrate, panel, resume, feedback, mode. |
+| `pipeline.lua` | Scheduler: dependencies, `max_parallel` (a retry or a resume is parked `slot_wait` when no slot is free), runs-alone rule for undeclared files, stall detection, resume. |
+| `runtime.lua` | The production runtime the tools and commands call: paths, init, config (read and merge-update), submit, status (including the named dependency and slot wait), answer, retry, abandon, calibrate, panel, resume, feedback, mode. |
 | `recover.lua` | Classify a run error into a closed, typed cause with an actionable remedy, then record and decide a bounded exponential-backoff retry (`auto_retry`, `human` or `none`). No I/O, never raises. |
 | `mode.lua` | Persist the on/off routing flag, contribute a routing prompt hint evaluated before every run, and guard the main session from `write`/`edit`/`bash` while the mode is on. |
 | `fence.lua` | Wrap untrusted output in sentinels and escape forged sentinels. |
@@ -67,6 +67,8 @@ draft -> qualifying -> awaiting_answers -> qualifying
 
 `failed`, `stalled` and `abandoned` are reachable from the active states. `state.lua` owns the legal edges; an illegal move is refused with the allowed alternatives named. The task and event shapes are pinned by `schemas/task.schema.json` and `schemas/event.schema.json`.
 
+A retry or a resume that finds no free `max_parallel` slot parks the task instead of launching it: the projection carries the persisted `slot_wait = true` with `slot_wait_since`, both declared in `schemas/task.schema.json`. A slot wait is not a failure — the task keeps its status and phase and never gains a `failure_reason` — and the flag is cleared at dispatch, in the same event that moves the task to `running`, so a `/reload` replays the wait and the drain still finds it.
+
 ## Pipeline
 
 One task goes through these phases, each owned by a module:
@@ -91,9 +93,9 @@ An intention that qualifies into more than one task does not merge those tasks i
 
 - **Dependencies** — a task starts only when every `depends_on` task is `merged` or `deployed`. A missing, failed or abandoned dependency blocks it with a named reason.
 - **Parallelism** — a task starts as soon as its `depends_on` tasks are `merged` or `deployed` and `max_parallel` has a free slot. Declared files never serialise anything: two tasks that declare the same file run in parallel because each works in its own worktree on its own branch, and any textual conflict is resolved at merge time. The only file-driven case is the opposite one — a task that declares no files at all has an unknown blast radius and runs alone until the pipeline is empty (naming a file buys the parallelism back).
-- **`max_parallel`** — the hard cap on tasks in flight.
+- **`max_parallel`** — the hard cap on tasks in flight (`running`, `verifying`, `reviewing`, `merging`). Retries and resumes count against the same cap as a fresh dispatch: the slot is reserved before the run is spawned, so two concurrent retries cannot both take the last slot.
 - **Stall detection** — an active task whose last progress is older than `stall_minutes` is stale. A stale `running` task moves to `stalled`; the other active statuses are flagged `stall.suspect`.
-- **Resume** — `/reload` kills in-flight sessions. Resume walks each interrupted task back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase.
+- **Resume** — `/reload` kills in-flight sessions. Resume walks each interrupted task back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase — but only when a slot is free. With the cap reached, the task is marked persisted with `slot_wait = true`, `slot_wait_since` and the journaled reason `waiting for a free slot`, keeps its status and phase, its worktree, branch, checkpoints, transcript and failure cause, and is dispatched by the scheduler when a slot frees. `metronome_status` reports that wait through `wait_reason` and the structured `slot_wait = { reason, in_flight, max_parallel }`, the way it names a dependency wait, with `slot_wait_flag` for the bare parked flag.
 
 ## Recovery
 
@@ -111,7 +113,7 @@ A task that fails is never lost: `failed` is resumable from its last stable stat
 
    These bounds are constants, not `config.toml` keys: `[limits]` exposes budget, timeout and question cap only.
 3. **Scheduler never stops** — `pipeline.lua` never halts on a `failed` task and never runs `run_task` on its own turn: `dispatch_one` only calls `spawn`, so each task runs in its own plugin-lifetime spawn (a strong reference, because a task finishing its own run must keep the shared upvalues alive). A retry queue therefore never blocks the drain: other ready tasks keep starting while a failed one is being redone.
-4. **Human relaunch** — `metronome_retry`, `metronome_answer`, `metronome_feedback` and a `/reload` followed by resume all re-dispatch the workflow through the same scheduler path; the task resumes from its last checkpoint, keeping its worktree, branch, checkpoints and transcript.
+4. **Human relaunch** — `metronome_retry`, `metronome_answer`, `metronome_feedback` and a `/reload` followed by resume all re-dispatch the workflow through the same scheduler path; the task resumes from its last checkpoint, keeping its worktree, branch, checkpoints and transcript. That path obeys `max_parallel`: with no free slot the task is parked `slot_wait` with the reason `waiting for a free slot` and waits for the scheduler instead of starting immediately.
 
 **Fresh base before checks.** The task base is resolved from the task itself (`task.base_ref` for an epic subtask, `cfg.project.base_ref` otherwise), fetched from `origin`, and the branch is rebased onto that fresh commit before the convergence diff and the declared checks run. A fix merged into master or into the epic branch is therefore seen by every task still in flight, and a rebase conflict redoes the task once on the fresh base instead of failing it.
 
