@@ -10,8 +10,9 @@
 return function()
   local q = load_module("qualify")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "qualify-schema")
-  maki.fs.mkdir(base, { parents = true })
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree.
+  local base = test_dir("qualify-schema")
   local validate_tmp = maki.fs.joinpath(base, "validate-tmp")
 
   -- task_projection ---------------------------------------------------------
