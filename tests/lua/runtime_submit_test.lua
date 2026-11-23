@@ -3125,6 +3125,16 @@ local function case_failure_policy(env)
     escalated_state.append = function(_, event)
       escalated_steps[#escalated_steps + 1] = "event:" .. tostring(event.kind)
       escalated_events[#escalated_events + 1] = event
+      -- A real `append` is the journal: apply the batched events the way the
+      -- replay would, so a `slot_wait` field written this way is observable.
+      local batch = type(event) == "table" and event[1] ~= nil and event or { event }
+      for _, one in ipairs(batch) do
+        if one.kind == "field" and type(one.fields) == "table" then
+          for key, value in pairs(one.fields) do
+            escalated_record[key] = value
+          end
+        end
+      end
       return true
     end
     local escalated_feedback = nil
@@ -3160,7 +3170,22 @@ local function case_failure_policy(env)
       },
       merge = { run = function() return { ok = true } end },
       deploy = { run = function() return { ok = true, deployed = true } end },
-      pipeline = {},
+      -- The drain is the only dispatch authority: a retry parks the task with
+      -- `slot_wait` and the tick moves it back to `running` before spawning it.
+      pipeline = {
+        tick = function(tick_opts)
+          if escalated_record.slot_wait then
+            escalated_record.slot_wait = nil
+            escalated_steps[#escalated_steps + 1] = "status:running"
+            escalated_record.status = "running"
+            if type(tick_opts.dispatch) == "function" then
+              tick_opts.dispatch({ id = "T1" })
+            end
+            return { ok = true, started = { "T1" } }
+          end
+          return { ok = true, started = {} }
+        end,
+      },
       paths = transient_deps.paths,
       spawn = function(fn) fn() end,
       defer = function() return {} end,
@@ -3172,10 +3197,10 @@ local function case_failure_policy(env)
     notified = {}
     local rt_escalated = runtime.new(escalated_deps)
     local relaunched = rt_escalated.retry({ id = "T1" }, { session = "S1" })
+
     eq(relaunched and relaunched.ok, true, "a review-escalated task can be relaunched")
-    eq(relaunched and relaunched.task and relaunched.task.status, "running",
-      "the relaunch moves the task back to running")
-    eq(escalated_record.review and escalated_record.review.round, 0,
+    eq(relaunched and relaunched.requeued, true,
+      "the relaunch hands the task to the drain instead of starting it itself")    eq(escalated_record.review and escalated_record.review.round, 0,
       "the relaunch resets the review round to 0")
     eq(escalated_record.review and escalated_record.review.max_rounds, 3,
       "the relaunch keeps the configured review budget")
@@ -3193,7 +3218,7 @@ local function case_failure_policy(env)
       end
     end
     eq(type(reset_at), "number", "the reset writes a review field patch")
-    eq(type(running_at), "number", "the task crosses back to running")
+    eq(type(running_at), "number", "the drain moves the task back to running")
     eq(reset_at and running_at and reset_at < running_at, true,
       "the reset lands before the task crosses to running")
     local reset_field, reset_note = nil, nil

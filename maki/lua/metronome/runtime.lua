@@ -3936,24 +3936,11 @@ function M.new(deps)
     if reset_err then
       return { ok = false, error = reset_err }
     end
-    local moved, err = deps.state.transition(paths.root, input.id, "running", { phase = "implement" })
-    if not moved then
-      -- The transition re-loads and may refuse (illegal or concurrent move).
-      -- The reset has already landed, and the task stayed failed: undo it and
-      -- journal the rollback rather than leave a budget grant that never
-      -- corresponded to a relaunch.
-      if review_reset and prior_review then
-        pcall(deps.state.set_fields, paths.root, input.id, { review = prior_review })
-        if type(deps.state.append) == "function" then
-          pcall(deps.state.append, paths.root, {
-            kind = "note",
-            task_id = input.id,
-            text = "review budget reset rolled back: the task never crossed to running",
-          })
-        end
-      end
-      return { ok = false, error = err }
-    end
+    -- The transition to `running` belongs to the drain, which is the single
+    -- dispatch authority: a retry only parks the task with `slot_wait` and keeps
+    -- its original status and phase. The review budget is still granted here,
+    -- in the same gesture, so the first review of the relaunch gets a full
+    -- budget; if parking fails it is rolled back below.
     -- A human retry is a fresh start: the attempt budget starts again from
     -- zero, so the automatic policy can act on the next failure instead of
     -- seeing a budget the user just reset as already spent.
@@ -4000,6 +3987,19 @@ function M.new(deps)
     local reason = waiting and wait_slot_reason() or REQUEUE_FOR_DISPATCH
     local marked, merr = mark_slot_wait(paths, input.id, reason)
     if not marked then
+      -- The task was never parked, so it will not be relaunched: undo the
+      -- review budget grant rather than leave a grant that never corresponded
+      -- to a relaunch, and journal the rollback.
+      if review_reset and prior_review then
+        pcall(deps.state.set_fields, paths.root, input.id, { review = prior_review })
+        if type(deps.state.append) == "function" then
+          pcall(deps.state.append, paths.root, {
+            kind = "note",
+            task_id = input.id,
+            text = "review budget reset rolled back: the task was never parked for dispatch",
+          })
+        end
+      end
       return { ok = false, error = merr }
     end
     log(paths, string.format("task %s: queued for dispatch (%s)", tostring(input.id), reason))
