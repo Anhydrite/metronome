@@ -41,6 +41,7 @@ M.CAUSES = {
   "conflict",
   "checks_failed",
   "auth",
+  "review_escalated",
   "unknown",
 }
 
@@ -138,6 +139,19 @@ end
 -- Per-cause classification rules, in priority order. The first match wins, so
 -- the specific and benign patterns come before the broad ones.
 local RULES = {
+  {
+    cause = "review_escalated",
+    -- The review loop ran out of rounds and handed the task to a human. It is
+    -- not transient in the retry sense: re-running the same attempt would
+    -- escalate on its first round again. A human relaunch (metronome_retry,
+    -- /metronome resume) grants a fresh review budget; no automatic retry loop
+    -- is created for it.
+    patterns = {
+      "review escalated",
+    },
+    transient = false,
+    remedy = "relaunch the task with metronome_retry (or /metronome resume): it resets the review round budget and keeps the last findings as feedback.",
+  },
   {
     cause = "nothing_to_commit",
     -- A commit that found nothing to do is not a failure. The French forms are
@@ -582,6 +596,8 @@ function M.decide(failure, opts)
   local why
   if cause == "auth" then
     why = "authentication must be fixed before any retry can succeed"
+  elseif cause == "review_escalated" then
+    why = "the review budget is spent: a human must relaunch the task with a fresh review round budget"
   elseif cause == "unknown" then
     why = "unknown cause: a human must inspect the transcript"
   elseif cause == "conflict" then
@@ -637,6 +653,78 @@ function M.describe(failure)
   end
   suffix = suffix .. ")"
   return line .. suffix
+end
+
+-- Review budget ---------------------------------------------------------------
+
+-- Is this task's failure a review escalation? Two shapes are admitted:
+--   * the typed cause `review_escalated`, written by the current pipeline;
+--   * a legacy escalation, where the task carries a stored round that reached
+--     its budget AND the review phase or the escalation wording proves the
+--     review is what failed it. A task that simply reached its round count
+--     (an in-flight round, a task parked for another reason) is not one.
+function M.is_review_escalation(task)
+  if type(task) ~= "table" then
+    return false
+  end
+  local failure = type(task.failure) == "table" and task.failure or nil
+  if failure and failure.cause == "review_escalated" then
+    return true
+  end
+
+  local review = type(task.review) == "table" and task.review or {}
+  local round = tonumber(review.round)
+  local max_rounds = tonumber(review.max_rounds)
+  if round == nil or max_rounds == nil or round < max_rounds then
+    return false
+  end
+  if failure and failure.phase == "review" then
+    return true
+  end
+  local text = tostring(
+    (failure and (failure.message or failure.reason)) or task.failure_reason or task.reason or ""
+  ):lower()
+  return contains(text, "review escalated")
+end
+
+-- The fresh review budget a relaunch grants an escalated task: the counter
+-- goes back to 0 in the same gesture as the move back to `running`, the last
+-- round's findings stay as the implementer's feedback (otherwise the relaunch
+-- repeats the same diff), and the reset carries the note that makes it
+-- auditable. Returns nil when the task was not escalated by its review; no I/O.
+function M.review_budget_reset(task)
+  if not M.is_review_escalation(task) then
+    return nil
+  end
+  local previous = type(task.review) == "table" and task.review or nil
+  if previous == nil then
+    return nil
+  end
+  local round = tonumber(previous.round)
+  local max_rounds = tonumber(previous.max_rounds)
+  if round == nil or max_rounds == nil or max_rounds < 1 then
+    return nil
+  end
+  round = math.floor(round)
+  max_rounds = math.floor(max_rounds)
+
+  local review = {}
+  for key, value in pairs(previous) do
+    review[key] = value
+  end
+  review.round = 0
+  review.max_rounds = max_rounds
+
+  local note = string.format(
+    "review.round %d -> 0: review budget %d granted, findings kept as implementer feedback",
+    round, max_rounds
+  )
+  return {
+    review = review,
+    previous_round = round,
+    max_rounds = max_rounds,
+    note = note,
+  }
 end
 
 return M

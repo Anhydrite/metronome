@@ -2741,6 +2741,234 @@ auto_deploy = false
   eq(async_ticks >= 2,
     true, "a completed retry job re-drains the scheduler instead of stopping the workflow")
 
+  -- The review budget on relaunch is checked in its own function: the outer
+  -- case already holds too many locals for Lua 5.1 to accept them inline.
+  local function check_review_budget()
+    -- A review escalation gets its review budget back on relaunch --------------
+    --
+    -- Reproduction T-20261122-0043: the task failed at review.round = 3 with
+    -- review.max_rounds = 3. `metronome_retry` moved it back to `running` but kept
+    -- the counter, so the first review of the new attempt computed round 4 and
+    -- escalated with no review at all. The relaunch must reset the counter to 0,
+    -- keep the findings as the implementer's feedback, journal the reset, and let
+    -- the new attempt run a real review round.
+    local escalated_findings = {
+      { severity = "blocking", message = "no test covers the change", path = "src/a.lua", line = 2, rule = "tests" },
+    }
+    local escalated_record = {
+      id = "T1", status = "failed", title = "t", checks = { "true" },
+      branch = "metronome/t1", worktree = "/tmp/wt-t1",
+      review = { round = 3, max_rounds = 3, commit_sha = "abcdef1234567", findings = escalated_findings },
+      failure = { cause = "review_escalated", message = "review escalated after 3 rounds",
+        remedy = "relaunch", transient = false, attempts = 3, phase = "review" },
+      failure_reason = "review escalated after 3 rounds: human review required (see note)",
+    }
+    local escalated_state = mem_state(escalated_record)
+    local escalated_events = {}
+    local escalated_fields = {}
+    local escalated_steps = {}
+    local escalated_set_fields = escalated_state.set_fields
+    local escalated_transition = escalated_state.transition
+    escalated_state.set_fields = function(root, id, fields)
+      escalated_fields[#escalated_fields + 1] = fields
+      if type(fields.review) == "table" then
+        escalated_steps[#escalated_steps + 1] = "fields:review"
+      end
+      return escalated_set_fields(root, id, fields)
+    end
+    escalated_state.transition = function(root, id, status, extra)
+      escalated_steps[#escalated_steps + 1] = "status:" .. tostring(status)
+      return escalated_transition(root, id, status, extra)
+    end
+    escalated_state.append = function(_, event)
+      escalated_steps[#escalated_steps + 1] = "event:" .. tostring(event.kind)
+      escalated_events[#escalated_events + 1] = event
+      return true
+    end
+    local escalated_feedback = nil
+    local escalated_round_at_review = nil
+    local escalated_deps = {
+      config = transient_deps.config,
+      roles = transient_deps.roles,
+      recover = recover_mod,
+      state = escalated_state,
+      implement = {
+        run = function(run_opts)
+          escalated_feedback = run_opts.feedback
+          return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abcdef1234567" }
+        end,
+        read_sheet = function() return {} end,
+      },
+      checks = { verify = function() return { ok = true } end, write_report = function() end },
+      converge = { run = function() return { ok = true } end },
+      review = {
+        review = function(review_opts)
+          escalated_round_at_review = escalated_record.review and escalated_record.review.round
+          return {
+            ok = true,
+            approved = true,
+            round = (escalated_round_at_review or 0) + 1,
+            sha = "abcdef1234567",
+          }
+        end,
+      },
+      git = {
+        pr_open = function() return { number = 1, url = "u", state = "open" } end,
+        pr_attach = function() end,
+      },
+      merge = { run = function() return { ok = true } end },
+      deploy = { run = function() return { ok = true, deployed = true } end },
+      pipeline = {},
+      paths = transient_deps.paths,
+      spawn = function(fn) fn() end,
+      defer = function() return {} end,
+      wait_turn_end = false,
+      runner = {},
+      qualify = {}, questions = {}, analyze = {},
+      calibrate = {}, fence = {}, mode = {},
+    }
+    notified = {}
+    local rt_escalated = runtime.new(escalated_deps)
+    local relaunched = rt_escalated.retry({ id = "T1" }, { session = "S1" })
+    eq(relaunched and relaunched.ok, true, "a review-escalated task can be relaunched")
+    eq(relaunched and relaunched.task and relaunched.task.status, "running",
+      "the relaunch moves the task back to running")
+    eq(escalated_record.review and escalated_record.review.round, 0,
+      "the relaunch resets the review round to 0")
+    eq(escalated_record.review and escalated_record.review.max_rounds, 3,
+      "the relaunch keeps the configured review budget")
+    eq(type(escalated_record.review and escalated_record.review.findings), "table",
+      "the last round's findings are still stored")
+    -- The reset belongs to the same gesture as the move back to `running`, and
+    -- must land before it: the relaunched review then computes round 1.
+    local reset_at, running_at
+    for i, step in ipairs(escalated_steps) do
+      if step == "fields:review" and reset_at == nil then
+        reset_at = i
+      end
+      if step == "status:running" and running_at == nil then
+        running_at = i
+      end
+    end
+    eq(type(reset_at), "number", "the reset writes a review field patch")
+    eq(type(running_at), "number", "the task crosses back to running")
+    eq(reset_at and running_at and reset_at < running_at, true,
+      "the reset lands before the task crosses to running")
+    local reset_field, reset_note = nil, nil
+    for _, fields in ipairs(escalated_fields) do
+      if type(fields.review) == "table" then
+        reset_field = fields
+      end
+    end
+    for _, event in ipairs(escalated_events) do
+      if event.kind == "note" and tostring(event.text or ""):find("review.round", 1, true) then
+        reset_note = event.text
+      end
+    end
+    eq(type(reset_field), "table", "the reset is journaled as a field patch on review")
+    eq(reset_field and reset_field.review and reset_field.review.round, 0,
+      "the field patch carries the reset round")
+    eq(type(reset_note), "string", "the reset is journaled as a note")
+    has(reset_note or "", "review.round 3 -> 0", "the note names the old round")
+    has(reset_note or "", "budget 3", "the note names the granted budget")
+    rt_escalated.run_pending()
+    eq(type(escalated_feedback), "table", "the implementer receives feedback on the relaunch")
+    eq(escalated_feedback and escalated_feedback[1] and escalated_feedback[1].message,
+      "no test covers the change", "the feedback is the escalated round's findings")
+    eq(escalated_round_at_review, 0, "the review is dispatched with a reset round")
+    eq(escalated_record.status ~= "failed", true,
+      "the relaunched review does not escalate empty: status is " .. tostring(escalated_record.status))
+    local escalated_notes = {}
+    for _, event in ipairs(escalated_events) do
+      escalated_notes[#escalated_notes + 1] = tostring(event.text or "")
+    end
+    has(table.concat(escalated_notes, "\n"), "review.round 3 -> 0",
+      "the relaunch journal keeps the reset note")
+
+    -- A retry for another cause leaves the review counter alone ----------------
+    local untouched_record = {
+      id = "T1", status = "failed", title = "t", checks = { "true" },
+      branch = "metronome/t1", worktree = "/tmp/wt-t1",
+      review = { round = 1, max_rounds = 3, commit_sha = "abcdef1234567" },
+      failure = { cause = "network", message = "boom", remedy = "retry", transient = true,
+        attempts = 3, phase = "implement" },
+    }
+    local untouched_deps = {
+      config = transient_deps.config,
+      roles = transient_deps.roles,
+      recover = recover_mod,
+      state = mem_state(untouched_record),
+      implement = {
+        run = function()
+          return { ok = false, error = "still down: connection refused" }
+        end,
+        read_sheet = function() return {} end,
+      },
+      checks = transient_deps.checks,
+      converge = transient_deps.converge,
+      review = transient_deps.review,
+      git = transient_deps.git,
+      merge = transient_deps.merge,
+      deploy = transient_deps.deploy,
+      pipeline = {},
+      paths = transient_deps.paths,
+      spawn = function(fn) fn() end,
+      defer = function() return {} end,
+      wait_turn_end = false,
+      runner = {},
+      qualify = {}, questions = {}, analyze = {},
+      calibrate = {}, fence = {}, mode = {},
+    }
+    notified = {}
+    local rt_untouched = runtime.new(untouched_deps)
+    eq(type(rt_untouched.retry({ id = "T1" }, { session = "S1" })), "table",
+      "a non-review retry is accepted")
+    eq(untouched_record.review and untouched_record.review.round, 1,
+      "a retry for another cause does not touch the review counter")
+
+    -- A `/reload` relaunch grants the same budget ------------------------------
+    -- pipeline.resume used to skip every failed task it could not retry
+    -- automatically, which silently dropped a review-escalated task. It now
+    -- admits it and applies the same reset before the task crosses to `running`.
+    local pipeline = load_module("pipeline")
+    local resume_record = {
+      id = "T9", status = "failed", title = "t", checks = { "true" },
+      branch = "metronome/t9", worktree = "/tmp/wt-t9",
+      review = { round = 3, max_rounds = 3, commit_sha = "abcdef1" },
+      failure = { cause = "review_escalated", message = "review escalated after 3 rounds",
+        transient = false, attempts = 1, phase = "review" },
+    }
+    local resume_state = mem_state(resume_record)
+    local resume_events = {}
+    resume_state.append = function(_, event)
+      resume_events[#resume_events + 1] = event
+      return true
+    end
+    local dispatched = {}
+    local resumed_result = pipeline.resume(resume_state, "/tmp/nowhere", {
+      apply = true,
+      recover = recover_mod,
+      max_attempts = 3,
+      dispatch = function(task) dispatched[#dispatched + 1] = task end,
+    })
+    eq(type(resumed_result), "table", "the resume reports its work")
+    eq(#(resumed_result and resumed_result.resumed or {}), 1,
+      "a review-escalated task is no longer skipped by the resume")
+    eq(resume_record.status, "running", "the resume moves the task back to running")
+    eq(resume_record.review and resume_record.review.round, 0,
+      "the resume resets the review round budget")
+    local resume_note = nil
+    for _, event in ipairs(resume_events) do
+      if event.kind == "note" then
+        resume_note = event.text
+      end
+    end
+    has(tostring(resume_note), "review.round 3 -> 0", "the resume journals the reset")
+    has(tostring(resume_note), "budget 3", "the resume note names the granted budget")
+    eq(#dispatched, 1, "the resumed task is dispatched from its checkpoint")
+  end
+  check_review_budget()
+
   -- metronome_status exposes the resume state for every task ----------------
   -- A failed task must be readable and resumable from the status tool alone:
   -- its checkpoint, its typed last error and the action a human (or the
@@ -2751,9 +2979,18 @@ auto_deploy = false
     id = "T1", status = "failed", title = "resume me",
     branch = "metronome/t1", worktree = "/tmp/wt-t1",
     checkpoints = { { sha = "abc123" }, { sha = "def456" } },
+    review = { round = 0, max_rounds = 3, commit_sha = "abcdef1" },
     failure = { cause = "git_identity", message = "empty ident name",
       remedy = "set git user.email and user.name", transient = true,
       attempts = 2, at = 10, next_retry_at = 70 },
+  }
+  local escalated_status_record = {
+    id = "T3", status = "failed", title = "escalated",
+    branch = "metronome/t3", worktree = "/tmp/wt-t3",
+    review = { round = 3, max_rounds = 3, commit_sha = "abcdef1",
+      findings = { { severity = "blocking", message = "still broken" } } },
+    failure = { cause = "review_escalated", message = "review escalated after 3 rounds",
+      remedy = "relaunch", transient = false, attempts = 1, phase = "review" },
   }
   local legacy_record = {
     id = "T2", status = "failed", title = "old journal",
@@ -2764,7 +3001,7 @@ auto_deploy = false
     recover = recover_mod,
     state = {
       load = function()
-        return { tasks = { T1 = status_record, T2 = legacy_record } }
+        return { tasks = { T1 = status_record, T2 = legacy_record, T3 = escalated_status_record } }
       end,
       checkpoint_of = function(t) return status_checkpoints.checkpoint_of(t) end,
     },
@@ -2797,6 +3034,16 @@ auto_deploy = false
   eq(view and view.status, "failed", "the raw status field is still there")
   eq(view and view.failure and view.failure.cause, "git_identity",
     "the raw failure object is still there")
+  -- The review budget is visible: a relaunched task shows its full budget, an
+  -- escalated one shows nothing remaining, and the raw review object is intact.
+  eq(view and view.review_round, 0, "status exposes the current review round")
+  eq(view and view.review_max_rounds, 3, "status exposes the review budget")
+  eq(view and view.review_rounds_remaining, 3, "a reset task shows its full review budget")
+  local escalated_view = listed.tasks and listed.tasks.T3
+  eq(escalated_view and escalated_view.review_rounds_remaining, 0,
+    "an escalated task shows no review round remaining")
+  eq(escalated_view and escalated_view.review and escalated_view.review.round, 3,
+    "the raw review object stays untouched")
   local legacy_view = listed.tasks and listed.tasks.T2
   eq(legacy_view and legacy_view.last_error ~= nil, true,
     "a legacy failure_reason still reads as a typed last error")
@@ -2808,6 +3055,8 @@ auto_deploy = false
   eq(detailed and detailed.task and detailed.task.retry_action
     and detailed.task.retry_action.action, "auto_retry",
     "the by-id detail exposes the resume action too")
+  eq(detailed and detailed.task and detailed.task.review_rounds_remaining, 3,
+    "the by-id detail exposes the review budget too")
   end
   check_status_view()
 
