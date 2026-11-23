@@ -1075,7 +1075,13 @@ end
 -- The analysis input: the selected ids, each sheet's structural fields, the
 -- dependency edges and the sheet text itself. Sorted by id, so the order the
 -- caller happened to pass the tasks in never invalidates the cache.
-local function input_fingerprint(tasks, tasks_dir)
+--
+-- `extra` folds in everything the findings depend on that is not part of the
+-- selected sheets: the ids the pipeline already knows (a `missing_dependency`
+-- clears as soon as the referenced task is created), whether each declared file
+-- exists in the tree the worktree is cut from (an `unknown_file` clears when the
+-- file lands), and the intention, repo and ref handed to the semantic prompt.
+local function input_fingerprint(tasks, tasks_dir, extra)
   local ids = {}
   for i, task in ipairs(tasks) do
     ids[i] = task_id(task, i)
@@ -1108,7 +1114,7 @@ local function input_fingerprint(tasks, tasks_dir)
       sheet,
     }, "\2")
   end
-  return digest(table.concat(rows, "\3"))
+  return digest(table.concat(rows, "\3") .. "\4" .. tostring(extra or ""))
 end
 
 local CACHE_FILE = "analysis-cache.json"
@@ -1211,11 +1217,59 @@ function M.gate(state, root, opts)
     known_ids[id] = true
   end
 
+  -- Everything outside the sheets that can change a finding: the known ids, the
+  -- declared files' existence, and the semantic prompt's intention/repo/ref.
+  local function input_signature()
+    local known_sorted = {}
+    for id in pairs(known_ids) do
+      known_sorted[#known_sorted + 1] = tostring(id)
+    end
+    table.sort(known_sorted)
+
+    local ref_files = nil
+    if type(opts.ref) == "string" and opts.ref ~= ""
+      and type(opts.git) == "table" and type(opts.git.ls_tree) == "function"
+      and type(opts.repo) == "string" and opts.repo ~= "" then
+      local listed = opts.git.ls_tree(opts.repo, opts.ref)
+      if type(listed) == "table" then
+        ref_files = {}
+        for _, path in ipairs(listed) do
+          ref_files[path] = true
+        end
+      end
+    end
+
+    local repo = type(opts.repo) == "string" and opts.repo or ""
+    local file_bits = {}
+    if repo ~= "" then
+      for _, id in ipairs(selected_ids) do
+        local task = selected_by_id[id]
+        for _, file in ipairs(dedupe_sorted(string_list(task.files))) do
+          local exists
+          if type(ref_files) == "table" then
+            exists = ref_files[file] == true
+          else
+            exists = exists_under(repo, file)
+          end
+          file_bits[#file_bits + 1] = tostring(file) .. (exists and "=1" or "=0")
+        end
+      end
+    end
+
+    return table.concat({
+      table.concat(known_sorted, ","),
+      tostring(opts.intention or ""),
+      repo,
+      tostring(opts.ref or ""),
+      table.concat(file_bits, ","),
+    }, "\5")
+  end
+
   local tasks_dir = opts.tasks_dir or fs.joinpath(root, "tasks")
   -- Only a run that actually consulted the semantic half is worth caching: a
   -- structural-only dry run must never hide the analyst from the next gate.
   local cacheable = type(opts.runner) == "function" and opts.semantic ~= false
-  local fingerprint = input_fingerprint(selected, tasks_dir)
+  local fingerprint = input_fingerprint(selected, tasks_dir, input_signature())
   local cache_hit = false
   local result = nil
 
@@ -1225,9 +1279,19 @@ function M.gate(state, root, opts)
       and cache.fingerprint == fingerprint
       and type(cache.findings) == "table"
       and cache.findings_signature == findings_signature(cache.findings) then
+      -- A cache hit replays findings, not a verdict: recompute the verdict from
+      -- the cached findings exactly as a fresh run does, so `analysis.json`
+      -- never says ok next to a blocking finding.
+      local cached_ok = true
+      for _, finding in ipairs(cache.findings) do
+        if finding.severity == "blocking" then
+          cached_ok = false
+          break
+        end
+      end
       result = {
-        ok = true,
-        verdict = "ok",
+        ok = cached_ok,
+        verdict = cached_ok and "ok" or "blocked",
         findings = cache.findings,
         semantic = { ok = true, cached = true },
       }
@@ -1260,7 +1324,11 @@ function M.gate(state, root, opts)
     end
     result.ok = ok
     result.verdict = ok and "ok" or "blocked"
-    if cacheable then
+    -- Never cache a run whose semantic half failed: `M.run` synthesises a
+    -- blocking `semantic_failed` finding then, and reusing it would pin the
+    -- batch in quarantine forever instead of retrying the analyst next pass.
+    local semantic_failed = type(result.semantic) == "table" and result.semantic.ok == false
+    if cacheable and not semantic_failed then
       write_cache(root, fingerprint, result.findings)
     end
   end
@@ -1371,15 +1439,6 @@ function M.gate(state, root, opts)
           findings = payload.findings,
         }
       elseif current.status == "qualifying" then
-        if current.quarantine ~= nil then
-          local cleared_ok, cleared, clear_err = pcall(state.clear_quarantine, root, id)
-          if not cleared_ok then
-            return nil, "cannot clear the quarantine of " .. id .. ": " .. tostring(cleared)
-          end
-          if not cleared then
-            return nil, clear_err
-          end
-        end
         local moved_ok, transitioned, transition_err = pcall(
           state.transition, root, id, "ready", { phase = "analyze" }
         )
@@ -1390,10 +1449,29 @@ function M.gate(state, root, opts)
           return nil, transition_err
         end
         ready[#ready + 1] = id
+        -- Clear only after the move succeeded: a failed transition must not
+        -- lose the marker that still explains why the task is blocked.
+        if current.quarantine ~= nil then
+          local cleared_ok, cleared, clear_err = pcall(state.clear_quarantine, root, id)
+          if not cleared_ok then
+            return nil, "cannot clear the quarantine of " .. id .. ": " .. tostring(cleared)
+          end
+          if not cleared then
+            return nil, clear_err
+          end
+        end
       elseif current.quarantine ~= nil then
         -- A clean re-analysis of a task that is no longer qualifying still
-        -- lifts a stale marker, without touching its status.
-        pcall(state.clear_quarantine, root, id)
+        -- lifts a stale marker, without touching its status. A failure to clear
+        -- is reported rather than swallowed: a stale quarantine must not
+        -- survive silently.
+        local cleared_ok, cleared, clear_err = pcall(state.clear_quarantine, root, id)
+        if not cleared_ok then
+          return nil, "cannot clear the quarantine of " .. id .. ": " .. tostring(cleared)
+        end
+        if not cleared then
+          return nil, clear_err
+        end
       end
     end
   end

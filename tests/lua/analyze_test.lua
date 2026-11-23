@@ -918,8 +918,17 @@ return function()
   })
   eq(cache_calls, 1, "an unchanged input reuses the cache and never calls the runner")
   eq(cache_second and cache_second.cached, true, "the second gate is a cache hit")
+  eq(cache_second and cache_second.verdict, "blocked", "a cache hit keeps the blocked verdict")
   eq(cache_second and cache_second.quarantined[1], "T-20261114-q001", "the cached findings still quarantine q001")
   eq(cache_second and find_rule(cache_second, "ordering") ~= nil, true, "the cached findings are reused")
+  local cache_second_report_text = maki.fs.read(maki.fs.joinpath(cache_root, "analysis.json"))
+  local cache_second_report_ok, cache_second_report = pcall(maki.json.decode, cache_second_report_text)
+  eq(cache_second_report_ok and type(cache_second_report) == "table", true,
+    "a cache hit writes analysis.json")
+  eq(cache_second_report and cache_second_report.verdict, "blocked",
+    "a cache hit keeps the blocked verdict in analysis.json")
+  eq(cache_second_report and cache_second_report.findings[1].rule, "ordering",
+    "a cache hit keeps the findings in analysis.json")
   local cache_after_second = state.load(cache_root)
   eq(cache_after_second.tasks["T-20261114-q001"].quarantine.since, "2026-11-14T00:04:00Z",
     "a repeated quarantine keeps its original since")
@@ -979,4 +988,46 @@ return function()
   eq(reopened_after.tasks["T-20261114-q001"].status, "ready", "the formerly blocked task moves to ready")
   eq(reopened_after.tasks["T-20261114-q001"].quarantine, nil, "the quarantine marker is cleared")
   eq(reopened_after.tasks["T-20261114-q002"].quarantine, nil, "the second marker is cleared")
+
+  -- A failed semantic run is never cached: the next pass retries the analyst
+  -- instead of replaying the synthesised `semantic_failed` finding forever.
+  local retry_root = maki.fs.joinpath(base, "semantic-retry")
+  state.create(retry_root, {
+    id = "T-20261114-r001",
+    title = "Retried task",
+    files = { "src/r1.lua" },
+    checks = { "make test" },
+    status = "qualifying",
+  })
+  local retry_calls = 0
+  local flaky_runner = function()
+    retry_calls = retry_calls + 1
+    if retry_calls == 1 then
+      return { ok = false, error = "analyst timed out" }
+    end
+    return { ok = true, text = '{"findings":[]}' }
+  end
+
+  local retry_first = analyze.gate(state, retry_root, {
+    intention = "retry",
+    runner = flaky_runner,
+    session_opts = session_opts,
+  })
+  eq(retry_calls, 1, "the first gate asks the analyst")
+  eq(retry_first and find_rule(retry_first, "semantic_failed") ~= nil, true,
+    "a failed analyst is a blocking semantic_failed finding")
+  eq(retry_first and retry_first.quarantined[1], "T-20261114-r001",
+    "the failed analyst quarantines the task")
+
+  local retry_second = analyze.gate(state, retry_root, {
+    intention = "retry",
+    runner = flaky_runner,
+    session_opts = session_opts,
+  })
+  eq(retry_calls, 2, "an unchanged input after a semantic failure still retries the analyst")
+  eq(retry_second and retry_second.cached, false, "a failed semantic run is not served from the cache")
+  eq(retry_second and retry_second.quarantined[1], nil, "the retried pass quarantines nothing")
+  eq(retry_second and retry_second.tasks[1], "T-20261114-r001", "the retried pass moves the task to ready")
+  local retry_after = state.load(retry_root)
+  eq(retry_after.tasks["T-20261114-r001"].quarantine, nil, "the retried pass clears the marker")
 end
