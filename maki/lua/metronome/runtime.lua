@@ -738,6 +738,18 @@ function M.new(deps)
     return (task and task.conflict_retried) and 1 or 0
   end
 
+  -- Git ref-lock replay helpers: `run_epic` and `run_task` both use them, so
+  -- they are declared before either and defined with the other diagnosis
+  -- helpers below.
+  local git_lock_sleep
+  local retry_git_lock
+  local git_lock_diagnosis
+  local git_lock_error_diag
+  local git_error_diag
+  local replay_merge
+  local later
+  local retry_attempts
+
   -- An epic task owns the single PR from the epic branch to the project base.
   --
   -- It has no implementation, no checks and no review of its own: the subtasks
@@ -786,15 +798,27 @@ function M.new(deps)
         and deps.git.rev_parse(paths.repo, remote_ref) or nil
       if remote_sha then
         if type(deps.git.branch_reset) == "function" then
-          local aligned, aerr = deps.git.branch_reset(paths.repo, branch, remote_ref)
+          local aligned, aerr, adiag = retry_git_lock(opts, function()
+            return deps.git.branch_reset(paths.repo, branch, remote_ref)
+          end)
           if not aligned then
-            return { ok = false, error = "cannot align the epic branch: " .. tostring(aerr) }
+            return {
+              ok = false,
+              error = "cannot align the epic branch: " .. tostring(aerr),
+              diagnosis = git_lock_diagnosis(adiag),
+            }
           end
         end
       elseif type(deps.git.push_branch) == "function" then
-        local pushed, perr = deps.git.push_branch(paths.repo, branch, { remote = "origin" })
+        local pushed, perr, pdiag = retry_git_lock(opts, function()
+          return deps.git.push_branch(paths.repo, branch, { remote = "origin" })
+        end)
         if not pushed then
-          return { ok = false, error = "cannot push the epic branch: " .. tostring(perr) }
+          return {
+            ok = false,
+            error = "cannot push the epic branch: " .. tostring(perr),
+            diagnosis = git_lock_diagnosis(pdiag),
+          }
         end
       end
 
@@ -841,14 +865,14 @@ function M.new(deps)
         auto_rebase = false
       end
 
-      local merge_err
-      merged, merge_err = with_merge_gate(function()
+      local merge_err, merge_diag
+      merged, merge_err, merge_diag = replay_merge(opts, state, task_id, function(merge_state)
         return deps.merge.run({
           task = task_id,
           worktree = worktree,
           repo = paths.repo,
           git = deps.git,
-          state = state,
+          state = merge_state,
           root = paths.root,
           remote = "origin",
           base = base,
@@ -861,7 +885,11 @@ function M.new(deps)
         })
       end)
       if not merged then
-        return { ok = false, error = tostring(merge_err or "epic merge failed") }
+        return {
+          ok = false,
+          error = tostring(merge_err or "epic merge failed"),
+          diagnosis = git_lock_diagnosis(merge_diag),
+        }
       end
       if not merged.ok then
         -- A red base or a refused merge is a real failure: there is no
@@ -960,15 +988,6 @@ function M.new(deps)
   local describe_failure
   local typed_failure
   local fetch_diagnosis
-  -- Git ref-lock replay helpers: `run_task` uses them, so they are declared
-  -- before it and defined with the other diagnosis helpers below.
-  local git_lock_sleep
-  local retry_git_lock
-  local git_lock_diagnosis
-  local git_lock_error_diag
-  local later
-  local retry_attempts
-
   local function run_task(opts, task_id, paths, cfg, runner, session)
     local state = deps.state
     local loaded = state.load(paths.root)
@@ -1054,12 +1073,19 @@ function M.new(deps)
             base = base,
             git = deps.git,
           })
-          -- merge.rebase folds the git diagnostic into the error string and
-          -- drops the third value when its internal fetch fails, so recover a
-          -- git_lock cause from the text: otherwise a ref lock during the
-          -- rebase's fetch would never be replayed nor named.
-          if not value and type(diag) ~= "table" then
-            diag = git_lock_error_diag(err)
+          -- `merge.rebase` folds the git diagnostic into the error string and
+          -- reports `{ conflict = ... }` as its third value for every rebase
+          -- failure -- a ref lock arrives as `{ conflict = nil }` -- so recover
+          -- the cause from the text whenever the table carries none: otherwise
+          -- a lock during the rebase would neither be replayed nor named.
+          if not value then
+            local recovered = git_error_diag(diag, err)
+            if recovered then
+              -- Keep the conflict marker merge.rebase reports alongside the
+              -- cause, so a real conflict still sends the task back to work.
+              recovered.conflict = type(diag) == "table" and diag.conflict or nil
+              diag = recovered
+            end
           end
           return value, err, diag
         end)
@@ -1091,9 +1117,13 @@ function M.new(deps)
                 })
                 pcall(state.transition, paths.root, task_id, "running", { phase = "implement" })
                 -- The reset rewrote the branch: lease the push so the PR shows
-                -- the commit the next turn will build on.
+                -- the commit the next turn will build on. A ref lock here is
+                -- the same transient race as anywhere else: replay it instead
+                -- of leaving the PR on the pre-rebase commit.
                 if type(deps.git.push) == "function" then
-                  deps.git.push(worktree, impl.ctx.branch, { remote = "origin", force = true })
+                  retry_git_lock(opts, function()
+                    return deps.git.push(worktree, impl.ctx.branch, { remote = "origin", force = true })
+                  end)
                 end
                 return implement_and_verify(feedback)
               end
@@ -1373,13 +1403,13 @@ function M.new(deps)
       return { ok = true, task_id = task_id, sha = approved_sha, pr = pr, pr_open = true }
     end
 
-    local merged, merge_err = with_merge_gate(function()
+    local merged, merge_err, merge_diag = replay_merge(opts, state, task_id, function(merge_state)
       return deps.merge.run({
         task = task_id,
         worktree = worktree,
         repo = paths.repo,
         git = deps.git,
-        state = state,
+        state = merge_state,
         root = paths.root,
         remote = "origin",
         base = base,
@@ -1395,7 +1425,13 @@ function M.new(deps)
       })
     end)
     if not merged then
-      return { ok = false, error = tostring(merge_err or "merge failed") }
+      return {
+        ok = false,
+        error = tostring(merge_err or "merge failed"),
+        -- An exhausted ref lock is contention, not a broken task: name it so
+        -- the failure policy reports git_lock and its remedy.
+        diagnosis = git_lock_diagnosis(merge_diag),
+      }
     end
     if not merged.ok then
       -- A conflict with the base is repairable without a human: move the
@@ -1818,6 +1854,81 @@ function M.new(deps)
       retryable = true,
       remediable = true,
     }
+  end
+
+  -- The typed diagnosis of a failed git step. Its own diagnostic is
+  -- authoritative when it carries a `cause`; when it does not -- `merge.rebase`
+  -- reports `{ conflict = ... }` for every rebase failure and drops the cause
+  -- -- recover a ref lock from the error text, which is where `git.describe`
+  -- puts it. Returns nil for a failure nobody named, so the textual policy
+  -- still classifies it.
+  function git_error_diag(diag, err)
+    if type(diag) == "table" and diag.cause ~= nil then
+      local lock = git_lock_diagnosis(diag)
+      if lock then
+        return lock
+      end
+      return {
+        cause = diag.cause,
+        message = diag.message or tostring(err or "the git step failed"),
+        remedy = diag.remedy or diag.hint or "inspect the git error and retry.",
+        transient = diag.transient == true,
+        retryable = diag.retryable == true,
+        remediable = diag.remediable ~= false,
+      }
+    end
+    return git_lock_error_diag(err)
+  end
+
+  -- `merge.run` moves the task to `failed` itself when one of its git steps
+  -- fails. During the bounded replay that would end the task on the first ref
+  -- lock -- the next attempt would be refused with "cannot merge from failed"
+  -- -- so the replay hands it a view of the state that reports the `failed`
+  -- transition as done without moving the task: the caller decides once, after
+  -- the attempts, and `handle_failure` records the typed reason.
+  local function replayed_state(state, task_id)
+    if type(state) ~= "table" or type(state.transition) ~= "function" then
+      return state
+    end
+    local view = setmetatable({}, { __index = state })
+    view.transition = function(root, id, status, extra)
+      if status == "failed" and tostring(id) == tostring(task_id) then
+        local loaded = type(state.load) == "function" and state.load(root) or nil
+        local current = type(loaded) == "table" and type(loaded.tasks) == "table"
+          and loaded.tasks[id] or nil
+        return { id = id, status = current and current.status or "merging" }
+      end
+      return state.transition(root, id, status, extra)
+    end
+    return view
+  end
+
+  -- Run one merge (`deps.merge.run`), replaying a ref lock and naming it when
+  -- the attempts are spent. `merge.run` reports a git failure as
+  -- `{ ok = false, error = <string> }` with no diagnosis and folds the cause
+  -- into the text, so a lock is recognized there and replayed as such. Returns
+  -- `(merged)`, `(nil, err, diag)` when the caller must fail the task.
+  function replay_merge(opts, state, task_id, run)
+    local view = replayed_state(state, task_id)
+    local merged, merge_err, merge_diag = retry_git_lock(opts, function()
+      local value, err = with_merge_gate(function()
+        return run(view)
+      end)
+      if not value then
+        return nil, err, git_error_diag(nil, err)
+      end
+      if value.ok == false then
+        local lock = git_error_diag(nil, value.error)
+        if lock then
+          return nil, value.error, lock
+        end
+      end
+      return value
+    end)
+    if not merged then
+      return nil, merge_err, merge_diag
+    end
+    return merged
   end
 
   -- A task that will not be merged must not leave an open PR behind: the list

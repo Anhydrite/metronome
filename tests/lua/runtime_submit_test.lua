@@ -2228,9 +2228,11 @@ auto_deploy = false
   local function classify(what, result)
     return git_mod.classify(what, result)
   end
-  -- The real merge.rebase drops the fetch diagnostic and hands back only
-  -- `(nil, err)`; the stub mirrors that so the test proves the runtime recovers
-  -- the git_lock cause from the error text rather than from a synthetic table.
+  -- The real merge.rebase reports `{ conflict = ... }` as its third value for
+  -- every rebase failure -- a ref lock arrives as `{ conflict = nil }`, never as
+  -- bare `(nil, err)` -- so the stubs below use that production shape: the
+  -- runtime must read the git_lock cause from the error text, because the table
+  -- carries none.
   local replay_seen = { rebase = 0, checks = 0 }
   local replay_sleeps = {}
   local replay_record = {
@@ -2261,7 +2263,8 @@ auto_deploy = false
       rebase = function()
         replay_seen.rebase = replay_seen.rebase + 1
         if replay_seen.rebase < 3 then
-          return nil, "rebase failed [git_lock]: cannot lock ref"
+          -- Production shape: no cause, no conflict.
+          return nil, "rebase failed [git_lock]: cannot lock ref", { conflict = nil }
         end
         return { ok = true, base = "origin/main@fresh", sha = "rebsha" }
       end,
@@ -2334,7 +2337,7 @@ auto_deploy = false
     merge = {
       rebase = function()
         exhausted_seen.rebase = exhausted_seen.rebase + 1
-        return nil, "rebase failed [git_lock]: cannot lock ref"
+        return nil, "rebase failed [git_lock]: cannot lock ref", { conflict = nil }
       end,
       run = function() return { ok = true } end,
     },
@@ -2376,6 +2379,127 @@ auto_deploy = false
   eq(exhausted_record.worktree, "/tmp/wt-t1", "the failure keeps the worktree")
   eq(exhausted_record.run_dir, "/tmp/runs/T1", "the failure keeps the transcript directory")
   eq(#(exhausted_record.checkpoints or {}), 2, "the failure keeps the checkpoints")
+
+  -- A git_lock inside merge.run is replayed too -----------------------------
+  --
+  -- merge.run marks the task failed itself when its internal git step fails,
+  -- then folds the cause into its error string and returns no diagnosis. A
+  -- runtime that only wraps the call would see the second attempt refused
+  -- ("cannot merge from failed") and condemn the task on the first lock, so the
+  -- replay keeps the task alive and names the lock once the attempts are spent.
+  local function merge_lock_deps(record, sleeps, run_stub)
+    return {
+      config = {
+        load = function()
+          return {
+            project = { repo = "/tmp/repo", base_ref = "main" },
+            checks = { default = { "true" }, timeout_secs = 10 },
+            merge = { method = "squash", auto_merge = true },
+            review = { max_rounds = 3 },
+            deploy = { auto_deploy = false },
+            recover = { max_attempts = 1, backoff_base_secs = 0 },
+          }
+        end,
+      },
+      roles = transient_deps.roles,
+      recover = recover_mod,
+      state = mem_state(record),
+      implement = {
+        run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+        read_sheet = function() return {} end,
+      },
+      checks = transient_deps.checks,
+      converge = transient_deps.converge,
+      review = transient_deps.review,
+      git = { classify = classify, pr_open = function() return { number = 9, url = "u", state = "open" } end },
+      merge = {
+        rebase = function() return { ok = true, base = "origin/main@fresh", sha = "rebsha" } end,
+        run = run_stub,
+      },
+      deploy = transient_deps.deploy,
+      pipeline = {
+        tick = function(opts)
+          if record.status == "ready" then
+            opts.dispatch({ id = "T1" })
+          end
+          return { ok = true, started = {} }
+        end,
+      },
+      paths = transient_deps.paths,
+      spawn = function(fn) fn() end,
+      sleep = function(ms) sleeps[#sleeps + 1] = ms end,
+      defer = function() return {} end,
+      wait_turn_end = false,
+      runner = {},
+      qualify = transient_deps.qualify,
+      questions = transient_deps.questions,
+      analyze = transient_deps.analyze,
+      calibrate = {}, fence = {}, mode = {},
+    }
+  end
+
+  local merge_new = function(id)
+    return {
+      id = id, status = "ready", title = "t", checks = { "true" },
+      branch = "metronome/t1", worktree = "/tmp/wt-t1",
+      checkpoints = { "c1", "c2" }, run_dir = "/tmp/runs/T1",
+      pr = { number = 9, url = "u", state = "open" },
+    }
+  end
+
+  local merge_seen = { run = 0, self_failed = 0 }
+  local merge_sleeps = {}
+  local merge_record = merge_new("T1")
+  local merge_deps = merge_lock_deps(merge_record, merge_sleeps, function(copts)
+    merge_seen.run = merge_seen.run + 1
+    if merge_seen.run < 3 then
+      -- Production shape: merge.run fails the task itself, then returns an
+      -- error string with no diagnosis.
+      local moved = copts.state.transition(copts.root, "T1", "failed", { phase = "merge" })
+      if type(moved) == "table" and moved.status == "failed" then
+        merge_seen.self_failed = merge_seen.self_failed + 1
+      end
+      return { ok = false, error = "fetch failed [git_lock]: cannot lock ref" }
+    end
+    return { ok = true }
+  end)
+  notified = {}
+  local rt_merge = runtime.new(merge_deps)
+  rt_merge.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_merge.run_pending()
+  eq(merge_seen.run, 3, "a git_lock inside merge.run is replayed up to the third attempt")
+  eq(merge_seen.self_failed, 0,
+    "the replay keeps merge.run from failing the task on the first lock")
+  eq(#merge_sleeps, 2, "the merge replay backs off between attempts")
+  eq(merge_record.status ~= "failed", true, "a first git_lock in merge.run does not fail the task")
+  eq(merge_record.failure, nil, "a replayed merge git_lock leaves no failure on the task")
+
+  -- The same lock, never cleared: three attempts, then a failure naming
+  -- git_lock, with every artefact a retry resumes from still in place.
+  local merge_ex_seen = { run = 0 }
+  local merge_ex_sleeps = {}
+  local merge_ex_record = merge_new("T1")
+  local merge_ex_deps = merge_lock_deps(merge_ex_record, merge_ex_sleeps, function(copts)
+    merge_ex_seen.run = merge_ex_seen.run + 1
+    copts.state.transition(copts.root, "T1", "failed", { phase = "merge" })
+    return { ok = false, error = "fetch failed [git_lock]: cannot lock ref" }
+  end)
+  notified = {}
+  local rt_merge_ex = runtime.new(merge_ex_deps)
+  rt_merge_ex.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_merge_ex.run_pending()
+  eq(merge_ex_seen.run, 3, "an exhausted merge git_lock stops after three attempts")
+  eq(#merge_ex_sleeps, 2, "an exhausted merge replay backs off twice")
+  eq(merge_ex_record.status, "failed", "an exhausted merge git_lock fails the task")
+  eq(merge_ex_record.failure and merge_ex_record.failure.cause, "git_lock",
+    "the merge failure names git_lock")
+  eq(merge_ex_record.failure and merge_ex_record.failure.transient, true,
+    "the merge git_lock is transient")
+  has(tostring(merge_ex_record.failure_reason), "git_lock", "the merge reason names git_lock")
+  eq(merge_ex_record.branch, "metronome/t1", "the merge failure keeps the branch")
+  eq(merge_ex_record.worktree, "/tmp/wt-t1", "the merge failure keeps the worktree")
+  eq(merge_ex_record.run_dir, "/tmp/runs/T1", "the merge failure keeps the transcript directory")
+  eq(#(merge_ex_record.checkpoints or {}), 2, "the merge failure keeps the checkpoints")
 
   -- A git_lock exhausted during a fix round still names git_lock and keeps
   -- every artefact. The review loop forwards only `error` from a failed fix,
