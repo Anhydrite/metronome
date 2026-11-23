@@ -671,8 +671,14 @@ function M.transition(root, task_id, to, extra)
   -- other transition to `running` would leave `slot_wait` on an in-flight task,
   -- and the next tick would see it as a candidate and dispatch the same
   -- worktree a second time, invisible to `max_parallel`.
+  --
+  -- A terminal status clears the wait too. `abandon` and `stop` move a parked
+  -- (`slot_wait`) task to `abandoned`; if the flag survived, the next tick would
+  -- treat the cancelled task as a dispatch candidate — `abandoned -> running` is
+  -- a legal transition — and resurrect it on the very slot its cancellation
+  -- freed. A dead task is never waiting for a slot.
   local fields = type(extra.fields) == "table" and extra.fields or nil
-  if ACTIVE[to] and not (fields and fields.slot_wait ~= nil) then
+  if (ACTIVE[to] or TERMINAL[to]) and not (fields and fields.slot_wait ~= nil) then
     local merged = {}
     for key, value in pairs(fields or {}) do
       merged[key] = value

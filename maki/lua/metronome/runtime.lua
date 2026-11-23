@@ -2150,7 +2150,13 @@ function M.new(deps)
       end
     end
     local in_flight, cap, free = slot_counts(projection, max_parallel, task.id)
-    if not task.slot_wait and free > 0 then
+    -- A free slot means the drain can dispatch the task right away. A
+    -- `slot_wait` flag set while a slot is available is a hand-off to that
+    -- drain, not a wait — reporting it as `0 in flight, max_parallel 1` would
+    -- contradict itself. The journal still keeps the exact reason ("requeued
+    -- for dispatch"); the status only names a wait when the cap is actually
+    -- full, which is when a human wonders why nothing started.
+    if free > 0 then
       return nil, nil
     end
     local reason = wait_slot_reason()
@@ -3834,10 +3840,19 @@ function M.new(deps)
     if not selected then
       return { ok = false, error = err }
     end
-    local requeued, refused = {}, {}
+    local requeued, refused, live = {}, {}, {}
     for _, entry in ipairs(selected.resumed or {}) do
       local id = type(entry) == "table" and entry.id or nil
-      if id then
+      if id and task_handles[id] ~= nil then
+        -- A resume can run mid-session, while tasks are still live. A task that
+        -- still holds a spawn handle is not interrupted: parking it as
+        -- `slot_wait` would drop it out of the in-flight count, let the drain
+        -- re-dispatch the same worktree a second time and admit another task
+        -- into its slot — the `max_parallel` bypass this change removes.
+        entry.live = true
+        live[#live + 1] = id
+        log(paths, string.format("task %s: still live, resume leaves it alone", tostring(id)))
+      elseif id then
         local current = deps.state.load(paths.root)
         local in_flight, cap, free = slot_counts(
           current and current.tasks or {}, max_parallel, id)
@@ -3874,6 +3889,7 @@ function M.new(deps)
       errors = selected.errors,
       requeued = requeued,
       waiting = refused,
+      live = live,
     }
   end
 

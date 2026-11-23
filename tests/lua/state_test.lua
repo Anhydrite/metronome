@@ -607,6 +607,22 @@ return function()
   eq(replayed_active and replayed_active.slot_wait, nil,
     "the cleared wait stays cleared after a replay")
 
+  -- A terminal move drops the wait too: `abandon`/`stop` move a parked task to
+  -- `abandoned`, which is terminal but not active. Without this, the flag would
+  -- survive on a cancelled task and the next tick — where `abandoned -> running`
+  -- is legal — would resurrect it on the slot it just freed.
+  state.set_fields(slot_root, "T-20261122-w001", {
+    slot_wait = true,
+    slot_wait_since = "2026-11-22T22:00:05Z",
+  })
+  local moved_abandoned = state.transition(slot_root, "T-20261122-w001", "abandoned", {
+    reason = "cancelled",
+  })
+  eq(moved_abandoned and moved_abandoned.slot_wait, nil,
+    "a transition to a terminal status clears slot_wait")
+  eq(moved_abandoned and moved_abandoned.slot_wait_since, nil,
+    "a transition to a terminal status clears slot_wait_since too")
+
   local qualify = load_module("qualify")
   local validate_tmp = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "state-validate")
   local wait_schema, wait_schema_err = qualify.validate_projection(replayed_slot, {

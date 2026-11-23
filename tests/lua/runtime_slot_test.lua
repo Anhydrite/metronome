@@ -434,6 +434,13 @@ return function()
     "the idle hand-off is journaled with its reason")
   eq(#env3.calls, 0, "the retry still does not start the task itself")
   eq(state.load(root).tasks[F].slot_wait, true, "the task is marked for dispatch")
+  -- A requeued task whose slot is already free is a hand-off, not a wait: the
+  -- status must not contradict itself by reporting `0 in flight, max_parallel 1`.
+  local handed_off = rt3.status({ id = F })
+  eq(handed_off and handed_off.task and handed_off.task.wait_reason, nil,
+    "a hand-off with a free slot reports no slot wait")
+  eq(handed_off and handed_off.task and handed_off.task.slot_wait, nil,
+    "a hand-off with a free slot carries no structured wait")
   pump_calls(env3, 1)
   eq(#env3.calls, 1, "the retry is dispatched exactly once")
   eq(env3.calls[1], F, "the task that starts is the retried one")
@@ -494,6 +501,43 @@ return function()
   pump_all(env4)
   eq(env4.peak <= 1, true, "a resume never exceeds max_parallel")
   eq(#env4.calls >= 2, true, "the drain starts the other task once the slot frees")
+
+  -- A resume must not park a task that is still live ------------------------
+  --
+  -- `/metronome resume` can be invoked mid-session. A task that still holds a
+  -- spawn handle is not interrupted: parking it as `slot_wait` would drop it out
+  -- of the in-flight count, let the drain re-dispatch the same worktree and
+  -- admit another task into its slot. The resume skips live tasks.
+  reset()
+  local env6 = new_env()
+  local rt6 = build(env6)
+  local K = "T-20261122-0011"
+  create_failed(K, "deja relance")
+  local retried6 = rt6.retry({ id = K }, { session = "S1" })
+  eq(retried6 and retried6.ok, true, "the retry is accepted")
+  -- One drain dispatches K: the task now holds a live spawn handle and is
+  -- running, but its spawn has not executed yet.
+  pump_one(env6)
+  local live_before = state.load(root).tasks[K]
+  eq(live_before.status, "running", "the retried task is dispatched and running")
+  eq(live_before.slot_wait, nil, "the dispatch cleared the wait")
+  eq(#env6.calls, 0, "the dispatched spawn has not run yet")
+
+  local resumed_live = rt6.resume()
+  eq(resumed_live and resumed_live.ok, true, "the mid-session resume succeeds")
+  eq(type(resumed_live and resumed_live.live), "table", "the resume reports live tasks")
+  eq(#(resumed_live and resumed_live.live or {}), 1, "the running task is reported as live")
+  eq((resumed_live and resumed_live.live or {})[1], K, "the live task is the one still running")
+  local live_after = state.load(root).tasks[K]
+  eq(live_after.status, "running", "the resume leaves the live task running")
+  eq(live_after.slot_wait, nil, "the resume does not park the live task")
+
+  -- Pump the resume's drain and the task's own spawn: the live task runs once,
+  -- never twice, and the cap is never exceeded.
+  pump_all(env6)
+  eq(#env6.calls, 1, "the live task is never dispatched a second time")
+  eq(env6.calls[1], K, "the one implementer turn belongs to the live task")
+  eq(env6.peak <= 1, true, "the mid-session resume never exceeds max_parallel")
 
   -- A parked retry disarms the automatic retry that was still armed ---------
   --

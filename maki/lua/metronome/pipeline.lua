@@ -56,6 +56,18 @@ local DEAD = {
   abandoned = true,
 }
 
+-- Statuses a `slot_wait` task can never be dispatched from. A parked task keeps
+-- its original status, and `failed` is a legitimate one (a retried task stays
+-- failed while it waits), so this is narrower than `DEAD`: only a task that is
+-- cancelled or already landed is refused. `state.transition` clears the wait on
+-- these moves, so this is a second line of defence: a stale `slot_wait` on a
+-- terminal task must never resurrect it on the next drain.
+local NO_DISPATCH = {
+  merged = true,
+  deployed = true,
+  abandoned = true,
+}
+
 -- How a resumed task gets back to `running`, using only legal transitions.
 -- `running` is already there and stays; the path is a no-op status event.
 local RESUME_PHASE = {
@@ -630,7 +642,7 @@ function M.tick(opts)
   local retry_ids = {}
   local candidates = {}
   for _, task in ipairs(M.collect(loaded.tasks)) do
-    if task.slot_wait then
+    if task.slot_wait and not NO_DISPATCH[task.status] then
       candidates[#candidates + 1] = task
     elseif task.status == "ready" then
       candidates[#candidates + 1] = task

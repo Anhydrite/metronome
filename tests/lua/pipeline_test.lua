@@ -403,6 +403,52 @@ return function()
   eq(#dup_tick.started, 0, "an in-flight task is not a dispatch candidate")
   eq(#dup_dispatched, 0, "the in-flight task is never dispatched a second time")
 
+  -- A parked task that is abandoned is never resurrected ---------------------
+  --
+  -- `abandon`/`stop` move a parked task to `abandoned`, which is terminal but
+  -- not active. Without clearing the wait, the next drain would treat the
+  -- cancelled task as a candidate (`abandoned -> running` is legal) and spawn it
+  -- on the very slot its cancellation freed.
+  local dead_root = tmp_root("pipeline-slot-dead")
+  state.create(dead_root, {
+    id = "T-20261122-x001", title = "parked then abandoned", status = "failed",
+    files = { "src/x1" }, slot_wait = true, slot_wait_since = "2026-11-22T22:00:03Z",
+  })
+  state.transition(dead_root, "T-20261122-x001", "abandoned", { reason = "cancelled" })
+  eq(state.load(dead_root).tasks["T-20261122-x001"].slot_wait, nil,
+    "an abandoned parked task drops its wait")
+  local dead_dispatched = {}
+  local dead_tick = pipeline.run({
+    state = state,
+    root = dead_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t)
+      dead_dispatched[#dead_dispatched + 1] = t.id
+    end,
+  })
+  eq(dead_tick.ok, true, "a tick over the abandoned task succeeds")
+  eq(#dead_tick.started, 0, "an abandoned task is never a dispatch candidate")
+  eq(#dead_dispatched, 0, "an abandoned task is never resurrected")
+
+  -- Even a stale flag cannot revive a dead task: the candidate loop refuses
+  -- terminal statuses outright, so a bad journal write stays inert.
+  state.set_fields(dead_root, "T-20261122-x001", {
+    slot_wait = true, slot_wait_since = "2026-11-22T22:00:04Z",
+  })
+  local stale_tick = pipeline.run({
+    state = state,
+    root = dead_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t)
+      dead_dispatched[#dead_dispatched + 1] = t.id
+    end,
+  })
+  eq(stale_tick.ok, true, "a tick over a stale parked dead task succeeds")
+  eq(#stale_tick.started, 0, "a stale slot_wait on an abandoned task admits no dispatch")
+  eq(#dead_dispatched, 0, "a stale slot_wait never resurrects an abandoned task")
+
   -- Integration: dependency in the state -----------------------------------
 
   local dep_root = tmp_root("pipeline-dep")
