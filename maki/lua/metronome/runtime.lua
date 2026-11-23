@@ -1993,20 +1993,133 @@ function M.new(deps)
     end
   end
 
+  -- Quarantine the tasks an analysis-gate failure names, or the whole analysed
+  -- batch when it names none. The gate is not the only way a task is set aside:
+  -- a gate that raises, or reports an error/blocked verdict, must still isolate
+  -- the offending sheets and leave the rest of the queue free to drain. The
+  -- returned ids are the ones actually marked, so the caller can log and report
+  -- them without a second read of the journal.
+  local function isolate_gate_failure(paths, gate, message)
+    local loaded = deps.state.load(paths.root)
+    local all = type(loaded) == "table" and type(loaded.tasks) == "table" and loaded.tasks or {}
+    local batch, in_batch = {}, {}
+    for id, task in pairs(all) do
+      if type(task) == "table" and task.status == "qualifying" then
+        id = tostring(id)
+        batch[#batch + 1] = id
+        in_batch[id] = true
+      end
+    end
+    table.sort(batch)
+    if #batch == 0 then
+      return {}
+    end
+
+    local named, seen = {}, {}
+    local function name(id)
+      id = tostring(id)
+      if in_batch[id] and not seen[id] then
+        seen[id] = true
+        named[#named + 1] = id
+      end
+    end
+    if type(gate) == "table" then
+      if type(gate.quarantined) == "table" then
+        for _, id in ipairs(gate.quarantined) do
+          name(id)
+        end
+      end
+      for _, finding in ipairs(type(gate.findings) == "table" and gate.findings or {}) do
+        if type(finding) == "table" and type(finding.tasks) == "table" then
+          for _, id in ipairs(finding.tasks) do
+            name(id)
+          end
+        end
+      end
+    end
+    if #named == 0 and message ~= "" then
+      -- An unattributable failure: the raw message may still name a task.
+      for _, id in ipairs(batch) do
+        if message:find(id, 1, true) then
+          name(id)
+        end
+      end
+    end
+    local targets = #named > 0 and named or batch
+
+    local rule = "analysis_gate_error"
+    local quarantined = {}
+    for _, id in ipairs(targets) do
+      local payload = {
+        reason = "analysis_gate_error",
+        rules = { rule },
+        findings = {
+          { severity = "blocking", rule = rule,
+            message = message ~= "" and message or "analysis gate failed" },
+        },
+        since = os.time(),
+      }
+      local ok, wrote = pcall(deps.state.set_fields, paths.root, id, { quarantine = payload })
+      if ok and wrote then
+        quarantined[#quarantined + 1] = id
+      end
+    end
+    return quarantined
+  end
+
   -- The part of a run that follows qualification: the analysis gate, the
   -- scheduler loop and the optional deploy. `submit` reaches it after applying
   -- the qualified tasks; `answer` reaches it after the pending questions are
   -- answered, so answering resumes the pipeline instead of leaving the tasks
   -- stuck in `qualifying` forever.
+  --
+  -- A blocking finding never stops this function. The gate quarantines its
+  -- tasks and every pass still drains whatever is ready; a gate that raises or
+  -- reports an error/blocked verdict is caught, its tasks are quarantined and
+  -- the drain runs anyway. Every quarantine is logged with its named rules, so
+  -- a freeze is never silent.
   local function after_questions(opts, paths, cfg, runner, session)
-    local gate, gerr = deps.analyze.gate(deps.state, paths.root, {
+    local gate_called, gate, gerr = pcall(deps.analyze.gate, deps.state, paths.root, {
       tasks_dir = paths.tasks,
       repo = paths.repo,
       ref = "origin/" .. tostring(cfg.project.base_ref),
       git = deps.git,
     })
-    if not gate or not gate.ok then
-      return { ok = false, error = gerr or (gate and gate.verdict) or "analysis gate failed" }
+    if not gate_called then
+      gerr = gate
+      gate = nil
+    end
+
+    local quarantined = {}
+    local findings = type(gate) == "table" and type(gate.findings) == "table"
+      and gate.findings or {}
+    if not gate_called or type(gate) ~= "table" or gate.ok ~= true then
+      local message = tostring(gerr
+        or (type(gate) == "table" and (gate.error or gate.verdict))
+        or "analysis gate failed")
+      quarantined = isolate_gate_failure(paths, gate, message)
+      log(paths, "analysis gate failed (" .. message .. "); quarantined "
+        .. (#quarantined > 0 and table.concat(quarantined, ", ") or "none")
+        .. "; draining ready tasks anyway")
+    elseif type(gate.quarantined) == "table" and #gate.quarantined > 0 then
+      local blocked = type(gate.blocked) == "table" and gate.blocked or {}
+      local parts = {}
+      for _, raw_id in ipairs(gate.quarantined) do
+        local id = tostring(raw_id)
+        quarantined[#quarantined + 1] = id
+        local info = blocked[id]
+        local rules = type(info) == "table" and type(info.rules) == "table" and info.rules or {}
+        local label
+        if #rules > 0 then
+          label = table.concat(rules, ", ")
+        elseif type(info) == "table" and info.reason ~= nil then
+          label = tostring(info.reason)
+        else
+          label = "analysis_blocked"
+        end
+        parts[#parts + 1] = id .. " (" .. label .. ")"
+      end
+      log(paths, "analysis quarantined " .. table.concat(parts, "; "))
     end
 
     local results = {}
@@ -2068,7 +2181,8 @@ function M.new(deps)
         recover = recover_module(),
       })
       if not tick.ok then
-        return { ok = false, error = tick.error, results = results }
+        return { ok = false, error = tick.error, results = results,
+          quarantined = quarantined, findings = findings }
       end
       if #tick.started == 0 then
         break
@@ -2079,7 +2193,8 @@ function M.new(deps)
     -- check and the final deploy belong to the synchronous path (the scripted
     -- e2e driver), where every task has already finished by now.
     if deps.async then
-      return { ok = true, results = results, background = true }
+      return { ok = true, results = results, background = true,
+        quarantined = quarantined, findings = findings }
     end
 
     local loaded = deps.state.load(paths.root)
@@ -2092,7 +2207,11 @@ function M.new(deps)
         if M.task_base(task, cfg) == cfg.project.base_ref then
           last = task
         end
-      elseif task.status ~= "deployed" and task.status ~= "abandoned" then
+      elseif task.status ~= "deployed" and task.status ~= "abandoned"
+        and not (type(task.quarantine) == "table" and next(task.quarantine) ~= nil) then
+        -- A quarantined task stays `qualifying` on purpose: a blocking finding
+        -- parks it without stopping the workflow, so it is not an unfinished
+        -- task for the scripted drain.
         pending[#pending + 1] = task.id
       end
     end
@@ -2101,6 +2220,8 @@ function M.new(deps)
         ok = false,
         error = "tasks did not finish: " .. table.concat(pending, ", "),
         results = results,
+        quarantined = quarantined,
+        findings = findings,
       }
     end
     if last then
@@ -2123,7 +2244,8 @@ function M.new(deps)
       results[#results + 1] = deployed_result
     end
 
-    return { ok = true, results = results, deployed = deployed }
+    return { ok = true, results = results, deployed = deployed,
+      quarantined = quarantined, findings = findings }
   end
 
   -- Background scheduler -----------------------------------------------------
@@ -3140,14 +3262,37 @@ function M.new(deps)
       return { ok = true, task = status_view(paths, task, opts) }
     end
     local tasks = {}
+    local quarantined = {}
     for id, task in pairs(loaded.tasks or {}) do
       if type(task) == "table" then
         tasks[id] = status_view(paths, task, opts)
+        -- A top-level, sorted summary of what the analyzer set aside, so a
+        -- freeze reads at a glance: the task id and its named rules. The raw
+        -- quarantine object stays in the per-task view above.
+        local q = task.quarantine
+        if type(q) == "table" and next(q) ~= nil then
+          local reasons = {}
+          if type(q.rules) == "table" then
+            for _, rule in ipairs(q.rules) do
+              if is_non_empty(rule) then
+                reasons[#reasons + 1] = trim(rule)
+              end
+            end
+          end
+          if #reasons == 0 and is_non_empty(q.reason) then
+            reasons[1] = trim(q.reason)
+          end
+          table.sort(reasons)
+          quarantined[#quarantined + 1] = { id = tostring(id), reasons = reasons }
+        end
       else
         tasks[id] = task
       end
     end
-    return { ok = true, tasks = tasks, events = loaded.events }
+    table.sort(quarantined, function(a, b)
+      return tostring(a.id) < tostring(b.id)
+    end)
+    return { ok = true, tasks = tasks, events = loaded.events, quarantined = quarantined }
   end
 
   function runtime.answer(input, ctx)

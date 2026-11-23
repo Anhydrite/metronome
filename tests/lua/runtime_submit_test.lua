@@ -2741,6 +2741,221 @@ auto_deploy = false
   eq(async_ticks >= 2,
     true, "a completed retry job re-drains the scheduler instead of stopping the workflow")
 
+  local function check_quarantine_drain()
+  -- A blocked task never stops the drain -------------------------------------
+  -- One blocking finding must only quarantine its own task: the independent
+  -- ready task is dispatched in the same pass, no task is marked `failed`, and
+  -- the result names the quarantine it left behind so a freeze is not silent.
+  local q_blocked = {
+    id = "T-blocked", status = "qualifying", title = "blocked", checks = { "true" },
+    quarantine = {
+      reason = "analysis_blocked",
+      rules = { "missing_dependency", "gate_cycle" },
+      findings = { { severity = "blocking", rule = "missing_dependency", message = "missing dep" } },
+      since = 1,
+    },
+  }
+  local q_ready = {
+    id = "T-ready", status = "ready", title = "ready", checks = { "true" },
+    branch = "metronome/t-ready", worktree = "/tmp/wt-ready",
+  }
+  local q_transitions = {}
+  local q_queue = {}
+  local q_ready_dispatched = false
+  local q_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = {
+      load = function()
+        return { tasks = { ["T-blocked"] = q_blocked, ["T-ready"] = q_ready } }
+      end,
+      transition = function(_, id, status)
+        q_transitions[#q_transitions + 1] = { id = id, status = status }
+        if id == "T-blocked" then q_blocked.status = status end
+        if id == "T-ready" then q_ready.status = status end
+        return { id = id, status = status }
+      end,
+      set_fields = function(_, id, fields)
+        local rec = id == "T-blocked" and q_blocked or q_ready
+        for key, value in pairs(fields or {}) do rec[key] = value end
+        return rec
+      end,
+      clear_quarantine = function(_, id)
+        if id == "T-blocked" then q_blocked.quarantine = nil end
+        if id == "T-ready" then q_ready.quarantine = nil end
+        return q_blocked
+      end,
+    },
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if q_ready.status == "ready" and not q_ready_dispatched then
+          q_ready_dispatched = true
+          q_ready.status = "running"
+          opts.dispatch({ id = "T-ready" })
+          return { ok = true, started = { "T-ready" } }
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn)
+      q_queue[#q_queue + 1] = fn
+      return { cancel = function() end }
+    end,
+    async = true,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = {
+      gate = function()
+        return {
+          ok = true,
+          verdict = "blocked",
+          findings = { { severity = "blocking", rule = "missing_dependency",
+            message = "missing dep", tasks = { "T-blocked" } } },
+          quarantined = { "T-blocked" },
+          blocked = { ["T-blocked"] = { reason = "analysis_blocked",
+            rules = { "missing_dependency", "gate_cycle" } } },
+        }
+      end,
+    },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_q = runtime.new(q_deps)
+  rt_q.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_q.run_pending()
+  local q_bg = rt_q.last_background
+  eq(q_bg and q_bg.ok, true, "a quarantined task does not fail the drain")
+  eq(q_bg and q_bg.background, true, "the async drain still reports background")
+  eq(q_ready_dispatched, true, "an independent ready task is still dispatched")
+  eq(#q_queue >= 1, true, "the dispatched ready task owns a spawn")
+  eq(q_blocked.status, "qualifying", "the blocked task stays qualifying")
+  local q_failed = false
+  for _, moved in ipairs(q_transitions) do
+    if moved.status == "failed" then q_failed = true end
+  end
+  eq(q_failed, false, "no task is marked failed for a blocking finding")
+  local q_named = false
+  for _, id in ipairs(q_bg and q_bg.quarantined or {}) do
+    if id == "T-blocked" then q_named = true end
+  end
+  eq(q_named, true, "the result names the quarantined task")
+  eq(type(q_bg and q_bg.findings), "table", "the result carries the findings")
+  -- The quarantine is logged with its rules: a freeze must never be silent.
+  local q_log = maki.fs.read(maki.fs.joinpath(root, "runtime.log")) or ""
+  has(q_log, "T-blocked", "the quarantine log names the task")
+  has(q_log, "missing_dependency", "the quarantine log names the rule")
+
+  -- A gate that raises still quarantines and drains --------------------------
+  -- An analysis-gate error must not stop the queue: the task it names is
+  -- quarantined, the independent task is dispatched, and the failure is logged.
+  local e_blocked = {
+    id = "T-blocked", status = "qualifying", title = "blocked", checks = { "true" },
+  }
+  local e_ready = {
+    id = "T-ready", status = "ready", title = "ready", checks = { "true" },
+    branch = "metronome/t-ready", worktree = "/tmp/wt-ready",
+  }
+  local e_queue = {}
+  local e_ready_dispatched = false
+  local e_failed = false
+  local e_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = {
+      load = function()
+        return { tasks = { ["T-blocked"] = e_blocked, ["T-ready"] = e_ready } }
+      end,
+      transition = function(_, id, status)
+        if status == "failed" then e_failed = true end
+        if id == "T-blocked" then e_blocked.status = status end
+        if id == "T-ready" then e_ready.status = status end
+        return { id = id, status = status }
+      end,
+      set_fields = function(_, id, fields)
+        local rec = id == "T-blocked" and e_blocked or e_ready
+        for key, value in pairs(fields or {}) do rec[key] = value end
+        return rec
+      end,
+      clear_quarantine = function(_, id)
+        return id == "T-blocked" and e_blocked or e_ready
+      end,
+    },
+    implement = {
+      run = function() return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" } end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = transient_deps.review,
+    git = transient_deps.git,
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if e_ready.status == "ready" and not e_ready_dispatched then
+          e_ready_dispatched = true
+          e_ready.status = "running"
+          opts.dispatch({ id = "T-ready" })
+          return { ok = true, started = { "T-ready" } }
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn)
+      e_queue[#e_queue + 1] = fn
+      return { cancel = function() end }
+    end,
+    async = true,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = {
+      gate = function()
+        error("cannot analyse T-blocked: the sheet is unreadable")
+      end,
+    },
+    calibrate = {}, fence = {}, mode = {},
+  }
+  local rt_e = runtime.new(e_deps)
+  rt_e.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_e.run_pending()
+  local e_bg = rt_e.last_background
+  eq(e_bg and e_bg.ok, true, "a gate error does not fail the drain")
+  eq(e_ready_dispatched, true, "the drain still dispatches after a gate error")
+  eq(e_failed, false, "a gate error never marks a task failed")
+  eq(type(e_blocked.quarantine), "table", "the named task is quarantined on a gate error")
+  eq(e_blocked.quarantine and e_blocked.quarantine.reason, "analysis_gate_error",
+    "the quarantine names the gate error")
+  eq(e_blocked.quarantine and e_blocked.quarantine.rules and e_blocked.quarantine.rules[1],
+    "analysis_gate_error", "the quarantine carries its rule")
+  local e_named = false
+  for _, id in ipairs(e_bg and e_bg.quarantined or {}) do
+    if id == "T-blocked" then e_named = true end
+  end
+  eq(e_named, true, "the gate-error result names the quarantined task")
+  local e_log = maki.fs.read(maki.fs.joinpath(root, "runtime.log")) or ""
+  has(e_log, "analysis gate failed", "the gate error is logged")
+  has(e_log, "T-blocked", "the gate-error log names the quarantined task")
+  end
+  check_quarantine_drain()
+
+
   -- metronome_status exposes the resume state for every task ----------------
   -- A failed task must be readable and resumable from the status tool alone:
   -- its checkpoint, its typed last error and the action a human (or the
@@ -2759,12 +2974,21 @@ auto_deploy = false
     id = "T2", status = "failed", title = "old journal",
     failure_reason = "git commit exit 1: Sur la branche main",
   }
+  local quarantined_record = {
+    id = "T3", status = "qualifying", title = "set aside",
+    quarantine = {
+      reason = "analysis_blocked",
+      rules = { "missing_dependency", "gate_cycle" },
+      findings = { { severity = "blocking", rule = "missing_dependency", message = "m" } },
+      since = 1,
+    },
+  }
   local status_deps = {
     config = { load = function() return { project = { repo = "/tmp/repo" } } end },
     recover = recover_mod,
     state = {
       load = function()
-        return { tasks = { T1 = status_record, T2 = legacy_record } }
+        return { tasks = { T1 = status_record, T2 = legacy_record, T3 = quarantined_record } }
       end,
       checkpoint_of = function(t) return status_checkpoints.checkpoint_of(t) end,
     },
@@ -2802,6 +3026,20 @@ auto_deploy = false
     "a legacy failure_reason still reads as a typed last error")
   eq(legacy_view and legacy_view.retry_action and legacy_view.retry_action.action, "manual",
     "a legacy failure is a manual resume")
+  -- The quarantine summary: sorted by id, reasons are the named rules, sorted,
+  -- while the per-task view keeps the raw quarantine object.
+  eq(type(listed.quarantined), "table", "status exposes a top-level quarantine summary")
+  eq(#listed.quarantined, 1, "only the quarantined task is summarised")
+  local summary = listed.quarantined[1]
+  eq(summary and summary.id, "T3", "the summary names the quarantined task")
+  eq(summary and summary.reasons and summary.reasons[1], "gate_cycle",
+    "the summary reasons are the named rules, sorted")
+  eq(summary and summary.reasons and summary.reasons[2], "missing_dependency",
+    "every named rule is listed")
+  eq(listed.tasks and listed.tasks.T3 and listed.tasks.T3.quarantine
+    and listed.tasks.T3.quarantine.reason, "analysis_blocked",
+    "the per-task view still carries the raw quarantine")
+  eq(view and view.quarantine, nil, "a clean task carries no quarantine")
   local detailed = rt_status.status({ id = "T1" })
   eq(detailed and detailed.task and detailed.task.checkpoint, "def456",
     "the by-id detail exposes the checkpoint too")
