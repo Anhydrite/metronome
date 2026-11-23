@@ -11,7 +11,20 @@
 --     so init.lua loads this file with loadstring instead of require.
 
 local cwd = maki.uv.cwd()
-local results_path = maki.fs.joinpath(cwd, "tests", "lua-results.txt")
+
+-- Read an environment variable, treating an empty value as absent.
+local function env(name)
+  local value = maki.uv.os_getenv(name)
+  if value == "" then
+    return nil
+  end
+  return value
+end
+
+-- The shell harness tells us where to write the results; the fixed path is only
+-- a fallback for a bare `maki index` run outside tests/run-lua.sh.
+local results_path = env("MAKI_TEST_RESULTS")
+  or maki.fs.joinpath(cwd, "tests", "lua-results.txt")
 
 -- maki ships a small test harness; use it as the assertion layer rather than
 -- inventing a second one. It wraps each case in pcall and reports at the end.
@@ -70,6 +83,35 @@ local function has(s, needle, label)
   end
 end
 
+-- A suffix private to this process, used when no harness token is exported:
+-- pid (from /proc when readable), clock and randomness, so standalone runs stay
+-- isolated from each other too.
+local function process_suffix()
+  local pid = "0"
+  local stat = maki.fs.read("/proc/self/stat")
+  if type(stat) == "string" then
+    pid = stat:match("^(%d+)") or pid
+  end
+  local stamp = tostring(os.time()) .. tostring(os.clock()):gsub("%.", "")
+  math.randomseed(tonumber(stamp:sub(-9)) or os.time())
+  return string.format("%s-%s-%d", pid, stamp, math.random(100000, 999999))
+end
+
+local test_token = env("MAKI_TEST_TOKEN") or process_suffix()
+
+-- Workspace for one test: <state_dir>/metronome-tests/<token>/<name>. The token
+-- comes from tests/run-lua.sh, so every run owns a distinct tree; the directory
+-- is emptied and recreated so a rerun never inherits stale files.
+local function test_dir(name)
+  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", test_token)
+  local dir = maki.fs.joinpath(base, name)
+  if maki.fs.metadata(dir) then
+    maki.fs.rm(dir, { recursive = true })
+  end
+  maki.fs.mkdir(dir, { parents = true })
+  return dir
+end
+
 local function run_file(path)
   local src, err = maki.fs.read(path)
   if not src then
@@ -92,6 +134,8 @@ local function run_file(path)
     emit = emit,
     mktmpdir = helpers.mktmpdir,
     rmtree = helpers.rmtree,
+    test_dir = test_dir,
+    test_token = test_token,
   }
   setfenv(chunk, setmetatable(env, { __index = _G }))
   local okrun, body = pcall(chunk)
