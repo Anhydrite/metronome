@@ -1997,20 +1997,202 @@ function M.new(deps)
     end
   end
 
+  -- A quarantined task must leave quarantine without a new submit: the gate
+  -- re-analyses every `qualifying` sheet (cheaply, through its fingerprint
+  -- cache) but `after_questions` only runs when the scheduler is dirty, and
+  -- once the rest of the queue has drained nothing dirties it any more. So a
+  -- pass that leaves quarantine behind arms one more pass later, with a bounded
+  -- backoff so a permanently blocked sheet costs a gate pass every few minutes
+  -- instead of a spin. The timer is a one-shot host callback, not a coroutine
+  -- suspended for the life of the plugin.
+  local QUARANTINE_REPOLL_MS = 30000
+  local QUARANTINE_REPOLL_MAX_MS = 300000
+  local quarantine_passes = 0
+  local quarantine_repoll_armed = false
+
+  -- Does any task still carry a non-empty quarantine? Read errors are treated
+  -- as "nothing to re-poll": a state that cannot be loaded must not arm a timer
+  -- that would fail the same way forever.
+  local function has_quarantined_tasks(paths)
+    local called, loaded = pcall(deps.state.load, paths.root)
+    if not called or type(loaded) ~= "table" or type(loaded.tasks) ~= "table" then
+      return false
+    end
+    for _, task in pairs(loaded.tasks) do
+      if type(task) == "table" and type(task.quarantine) == "table"
+        and next(task.quarantine) ~= nil then
+        return true
+      end
+    end
+    return false
+  end
+
+  -- Arm the next re-analysis pass. Only the async path needs it: the scripted
+  -- e2e path is synchronous and driven by its own drain.
+  local function arm_quarantine_pass()
+    if not deps.async or quarantine_repoll_armed then
+      return
+    end
+    local delay = math.min(QUARANTINE_REPOLL_MS * (2 ^ quarantine_passes), QUARANTINE_REPOLL_MAX_MS)
+    if quarantine_passes < 8 then
+      quarantine_passes = quarantine_passes + 1
+    end
+    local armed = later(function()
+      quarantine_repoll_armed = false
+      scheduler_dirty = true
+      pcall(runtime.run_pending)
+    end, delay)
+    if armed ~= nil then
+      quarantine_repoll_armed = true
+    end
+  end
+
+  -- Quarantine the tasks an analysis-gate failure names, or the whole analysed
+  -- batch when it names none. The gate is not the only way a task is set aside:
+  -- a gate that raises, or reports an error/blocked verdict, must still isolate
+  -- the offending sheets and leave the rest of the queue free to drain. The
+  -- returned ids are the ones actually marked, so the caller can log and report
+  -- them without a second read of the journal.
+  local function isolate_gate_failure(paths, gate, message)
+    -- This branch exists to survive a broken analysis. A state that cannot be
+    -- read must not raise out of it either: the caller still has to drain.
+    local called, loaded = pcall(deps.state.load, paths.root)
+    if not called then
+      return {}
+    end
+    local all = type(loaded) == "table" and type(loaded.tasks) == "table" and loaded.tasks or {}
+    local batch, in_batch = {}, {}
+    for id, task in pairs(all) do
+      if type(task) == "table" and task.status == "qualifying" then
+        id = tostring(id)
+        batch[#batch + 1] = id
+        in_batch[id] = true
+      end
+    end
+    table.sort(batch)
+    if #batch == 0 then
+      return {}
+    end
+
+    local named, seen = {}, {}
+    local function name(id)
+      id = tostring(id)
+      if in_batch[id] and not seen[id] then
+        seen[id] = true
+        named[#named + 1] = id
+      end
+    end
+    if type(gate) == "table" then
+      if type(gate.quarantined) == "table" then
+        for _, id in ipairs(gate.quarantined) do
+          name(id)
+        end
+      end
+      for _, finding in ipairs(type(gate.findings) == "table" and gate.findings or {}) do
+        if type(finding) == "table" and type(finding.tasks) == "table" then
+          for _, id in ipairs(finding.tasks) do
+            name(id)
+          end
+        end
+      end
+    end
+    if #named == 0 and message ~= "" then
+      -- An unattributable failure: the raw message may still name a task.
+      for _, id in ipairs(batch) do
+        if message:find(id, 1, true) then
+          name(id)
+        end
+      end
+    end
+    local targets = #named > 0 and named or batch
+
+    local rule = "analysis_gate_error"
+    local quarantined = {}
+    for _, id in ipairs(targets) do
+      local payload = {
+        reason = "analysis_gate_error",
+        rules = { rule },
+        findings = {
+          { severity = "blocking", rule = rule,
+            message = message ~= "" and message or "analysis gate failed" },
+        },
+        since = os.time(),
+      }
+      local ok, wrote = pcall(deps.state.set_fields, paths.root, id, { quarantine = payload })
+      if ok and wrote then
+        quarantined[#quarantined + 1] = id
+      end
+    end
+    return quarantined
+  end
+
   -- The part of a run that follows qualification: the analysis gate, the
   -- scheduler loop and the optional deploy. `submit` reaches it after applying
   -- the qualified tasks; `answer` reaches it after the pending questions are
   -- answered, so answering resumes the pipeline instead of leaving the tasks
   -- stuck in `qualifying` forever.
+  --
+  -- A blocking finding never stops this function. The gate quarantines its
+  -- tasks and every pass still drains whatever is ready; a gate that raises or
+  -- reports an error/blocked verdict is caught, its tasks are quarantined and
+  -- the drain runs anyway. Every quarantine is logged with its named rules, so
+  -- a freeze is never silent.
   local function after_questions(opts, paths, cfg, runner, session)
-    local gate, gerr = deps.analyze.gate(deps.state, paths.root, {
+    local gate_called, gate, gerr = pcall(deps.analyze.gate, deps.state, paths.root, {
       tasks_dir = paths.tasks,
       repo = paths.repo,
       ref = "origin/" .. tostring(cfg.project.base_ref),
       git = deps.git,
     })
-    if not gate or not gate.ok then
-      return { ok = false, error = gerr or (gate and gate.verdict) or "analysis gate failed" }
+    if not gate_called then
+      gerr = gate
+      gate = nil
+    end
+
+    local quarantined = {}
+    local findings = type(gate) == "table" and type(gate.findings) == "table"
+      and gate.findings or {}
+    if not gate_called or type(gate) ~= "table" or gate.ok ~= true then
+      local message = tostring(gerr
+        or (type(gate) == "table" and (gate.error or gate.verdict))
+        or "analysis gate failed")
+      -- The isolation work itself must never raise out of the recovery branch:
+      -- a state or journal that fails here would escape `after_questions` and
+      -- skip the drain, which is the opposite of the contract.
+      local isolated, marked = pcall(isolate_gate_failure, paths, gate, message)
+      if not isolated then
+        log(paths, "analysis gate failure could not be isolated: " .. tostring(marked))
+        marked = {}
+      end
+      quarantined = marked or {}
+      -- Log the ids *and* the rule actually stored in their quarantine, so the
+      -- error path is as readable as the blocked one.
+      local parts = {}
+      for _, id in ipairs(quarantined) do
+        parts[#parts + 1] = tostring(id) .. " (analysis_gate_error)"
+      end
+      log(paths, "analysis gate failed (" .. message .. "); quarantined "
+        .. (#parts > 0 and table.concat(parts, "; ") or "none")
+        .. "; draining ready tasks anyway")
+    elseif type(gate.quarantined) == "table" and #gate.quarantined > 0 then
+      local blocked = type(gate.blocked) == "table" and gate.blocked or {}
+      local parts = {}
+      for _, raw_id in ipairs(gate.quarantined) do
+        local id = tostring(raw_id)
+        quarantined[#quarantined + 1] = id
+        local info = blocked[id]
+        local rules = type(info) == "table" and type(info.rules) == "table" and info.rules or {}
+        local label
+        if #rules > 0 then
+          label = table.concat(rules, ", ")
+        elseif type(info) == "table" and info.reason ~= nil then
+          label = tostring(info.reason)
+        else
+          label = "analysis_blocked"
+        end
+        parts[#parts + 1] = id .. " (" .. label .. ")"
+      end
+      log(paths, "analysis quarantined " .. table.concat(parts, "; "))
     end
 
     local results = {}
@@ -2072,7 +2254,8 @@ function M.new(deps)
         recover = recover_module(),
       })
       if not tick.ok then
-        return { ok = false, error = tick.error, results = results }
+        return { ok = false, error = tick.error, results = results,
+          quarantined = quarantined, findings = findings }
       end
       if #tick.started == 0 then
         break
@@ -2083,7 +2266,8 @@ function M.new(deps)
     -- check and the final deploy belong to the synchronous path (the scripted
     -- e2e driver), where every task has already finished by now.
     if deps.async then
-      return { ok = true, results = results, background = true }
+      return { ok = true, results = results, background = true,
+        quarantined = quarantined, findings = findings }
     end
 
     local loaded = deps.state.load(paths.root)
@@ -2096,7 +2280,11 @@ function M.new(deps)
         if M.task_base(task, cfg) == cfg.project.base_ref then
           last = task
         end
-      elseif task.status ~= "deployed" and task.status ~= "abandoned" then
+      elseif task.status ~= "deployed" and task.status ~= "abandoned"
+        and not (type(task.quarantine) == "table" and next(task.quarantine) ~= nil) then
+        -- A quarantined task stays `qualifying` on purpose: a blocking finding
+        -- parks it without stopping the workflow, so it is not an unfinished
+        -- task for the scripted drain.
         pending[#pending + 1] = task.id
       end
     end
@@ -2105,6 +2293,8 @@ function M.new(deps)
         ok = false,
         error = "tasks did not finish: " .. table.concat(pending, ", "),
         results = results,
+        quarantined = quarantined,
+        findings = findings,
       }
     end
     if last then
@@ -2127,7 +2317,8 @@ function M.new(deps)
       results[#results + 1] = deployed_result
     end
 
-    return { ok = true, results = results, deployed = deployed }
+    return { ok = true, results = results, deployed = deployed,
+      quarantined = quarantined, findings = findings }
   end
 
   -- Background scheduler -----------------------------------------------------
@@ -2672,6 +2863,10 @@ function M.new(deps)
     end
     scheduler_running = true
     local job = scheduler_job
+    -- Set when the last pass left a task quarantined: a clean pass must be
+    -- reached without a new submit, so one more pass is armed once the drain has
+    -- released `scheduler_running` (arming from inside it would be a no-op).
+    local requeue_quarantine = false
     local ok, err = pcall(function()
       while #scheduler_extra > 0 or scheduler_dirty do
         while #scheduler_extra > 0 do
@@ -2695,12 +2890,24 @@ function M.new(deps)
           scheduler_dirty = false
           runtime.last_background = after_questions(
             job.opts, job.paths, job.cfg, job.runner, job.session)
+          if has_quarantined_tasks(job.paths) then
+            requeue_quarantine = true
+          else
+            -- The queue is clean again: the next quarantine starts its backoff
+            -- from the short delay.
+            quarantine_passes = 0
+          end
         end
       end
     end)
     scheduler_running = false
     if not ok then
       log(job.paths, "background scheduler error: " .. tostring(err))
+    end
+    -- Re-analyse a still-quarantined batch until a pass finds it clean, with no
+    -- new submit needed: the fingerprint cache makes an unchanged pass free.
+    if requeue_quarantine then
+      arm_quarantine_pass()
     end
   end
 
@@ -3286,14 +3493,37 @@ function M.new(deps)
       return { ok = true, task = status_view(paths, task, opts) }
     end
     local tasks = {}
+    local quarantined = {}
     for id, task in pairs(loaded.tasks or {}) do
       if type(task) == "table" then
         tasks[id] = status_view(paths, task, opts)
+        -- A top-level, sorted summary of what the analyzer set aside, so a
+        -- freeze reads at a glance: the task id and its named rules. The raw
+        -- quarantine object stays in the per-task view above.
+        local q = task.quarantine
+        if type(q) == "table" and next(q) ~= nil then
+          local reasons = {}
+          if type(q.rules) == "table" then
+            for _, rule in ipairs(q.rules) do
+              if is_non_empty(rule) then
+                reasons[#reasons + 1] = trim(rule)
+              end
+            end
+          end
+          if #reasons == 0 and is_non_empty(q.reason) then
+            reasons[1] = trim(q.reason)
+          end
+          table.sort(reasons)
+          quarantined[#quarantined + 1] = { id = tostring(id), reasons = reasons }
+        end
       else
         tasks[id] = task
       end
     end
-    return { ok = true, tasks = tasks, events = loaded.events }
+    table.sort(quarantined, function(a, b)
+      return tostring(a.id) < tostring(b.id)
+    end)
+    return { ok = true, tasks = tasks, events = loaded.events, quarantined = quarantined }
   end
 
   function runtime.answer(input, ctx)
