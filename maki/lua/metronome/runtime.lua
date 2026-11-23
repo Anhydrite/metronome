@@ -2079,7 +2079,10 @@ function M.new(deps)
     end
     local in_flight = 0
     for _, task in ipairs(task_list(tasks)) do
-      if ACTIVE_STATUSES[task.status] and (exclude == nil or task.id ~= exclude) then
+      -- Mirror `pipeline.slots`: a parked `slot_wait` task holds no slot, even
+      -- when its original status is an active one.
+      if ACTIVE_STATUSES[task.status] and not task.slot_wait
+        and (exclude == nil or task.id ~= exclude) then
         in_flight = in_flight + 1
       end
     end
@@ -2618,6 +2621,15 @@ function M.new(deps)
           .. " skipped: the task is parked waiting for a free slot")
         return nil
       end
+      -- An automatic retry calls `run_and_handle` from this scheduler job, not
+      -- through `dispatch_one`, so it owns no spawn handle. Register one anyway:
+      -- a mid-session resume reads `task_handles` to tell a live task from an
+      -- interrupted one, and a live retry mistaken for interrupted would be
+      -- parked `slot_wait`, dropped out of the in-flight count and re-dispatched
+      -- on the same worktree — the duplicate-run/collision class this fixes.
+      -- The marker carries no `cancel`: it only proves the task is live.
+      local marker = { automatic_retry = true }
+      task_handles[task_id] = marker
       -- The legal `failed -> running` edge is the resume: it also settles the
       -- attempt deadline so the next failure counts from this attempt. The
       -- dispatch also clears any residual wait atomically with the move.
@@ -2626,13 +2638,25 @@ function M.new(deps)
         fields = { slot_wait = false },
       })
       if not moved then
+        if task_handles[task_id] == marker then
+          task_handles[task_id] = nil
+        end
         log(paths, "automatic retry of " .. tostring(task_id) .. " refused: " .. tostring(merr))
         return nil
       end
       log(paths, string.format("task %s: automatic retry (attempt %s/%s) after a %s failure",
         tostring(task_id), tostring(attempt),
         tostring(type(decision) == "table" and decision.max_attempts or "?"), cause))
-      return run_and_handle(opts, paths, cfg, runner, session, task_id)
+      local ran, result = pcall(run_and_handle, opts, paths, cfg, runner, session, task_id)
+      if task_handles[task_id] == marker then
+        task_handles[task_id] = nil
+      end
+      if not ran then
+        -- `run_and_handle` guards its own failures; re-raise anything it let
+        -- through so `run_pending` logs it instead of losing it.
+        error(result, 0)
+      end
+      return result
     end
 
     local function enqueue()
@@ -3314,6 +3338,12 @@ function M.new(deps)
     -- first, then the slot wait. Computed from the live projection, so no task
     -- field is persisted and the journal schema is untouched.
     local wait_reason, slot_wait = wait_reason_of(task, projection, max_parallel)
+    -- The persisted boolean is raw task data: the structured wait below only
+    -- reports a wait when the cap is actually full, so keep the raw flag
+    -- readable under its own key. A parked task whose drain is still pending has
+    -- `slot_wait = true` but no unmet cap — a caller must still be able to tell
+    -- it apart from a task that is not waiting at all.
+    view.slot_wait_flag = task.slot_wait and true or nil
     view.wait_reason = wait_reason
     view.slot_wait = slot_wait
     local last_error = status_last_error(task)

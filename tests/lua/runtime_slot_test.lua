@@ -109,6 +109,12 @@ return function()
         run = function(opts)
           local id = opts.task and opts.task.id or "?"
           env.calls[#env.calls + 1] = id
+          -- A case can observe or act mid-run: an in-flight automatic retry has
+          -- no dispatch handle, so a resume triggered from here is how the test
+          -- reaches the race that test guards.
+          if type(env.on_call) == "function" then
+            env.on_call(id)
+          end
           -- What the cap actually protects: how many tasks are in flight at the
           -- moment the implementer opens its turn.
           local snapshot = state.load(root)
@@ -153,7 +159,7 @@ return function()
       },
       merge = { run = function() return { ok = true } end },
       deploy = { run = function() return { ok = true } end },
-      pipeline = pipeline,
+      pipeline = env.pipeline or pipeline,
       paths = function() return paths end,
       spawn = function(fn)
         env.queue[#env.queue + 1] = fn
@@ -332,6 +338,8 @@ return function()
     "the structured wait carries the named reason")
   eq(view.slot_wait and view.slot_wait.in_flight, 1, "the structured wait counts what is in flight")
   eq(view.slot_wait and view.slot_wait.max_parallel, 1, "the structured wait names the cap")
+  eq(view.slot_wait_flag, true,
+    "the status keeps the persisted raw flag readable alongside the structured wait")
 
   -- A dependency is named before the slot: it would hold the task even with an
   -- empty pipeline.
@@ -671,4 +679,84 @@ return function()
   pump_calls(env8, 1)
   eq(#env8.calls, 1, "the idle abandoned retry is dispatched exactly once")
   eq(env8.calls[1], N, "the implementer turn belongs to the abandoned retry")
+
+  -- A running automatic retry is live even without a dispatch handle --------
+  --
+  -- An automatic retry calls `run_and_handle` from its scheduler job, never
+  -- through `dispatch_one`, so it owns no spawn handle. A `/metronome resume`
+  -- while it runs must still treat it as live: parking it `slot_wait` would
+  -- drop the in-flight run out of the count, let the drain re-dispatch the same
+  -- worktree and admit another task into its slot — the duplicate-run and
+  -- collision class this change removes.
+  reset()
+  local env9 = new_env()
+  env9.defer = {}
+  env9.fail_calls = 1
+  local rt9 = build(env9)
+  local Q = "T-20261122-0016"
+  create_failed(Q, "relance automatique en vol")
+
+  local retried9 = rt9.retry({ id = Q }, { session = "S1" })
+  eq(retried9 and retried9.ok, true, "the first retry is accepted")
+  pump_calls(env9, 1)
+  eq(#env9.calls, 1, "the retried task ran once and failed transiently")
+  eq(#env9.defer, 1, "the transient failure arms one deferred automatic retry")
+
+  -- From the second run on, the resume fires while the automatic retry is in
+  -- flight, before the implementer returns.
+  local resumed_during, parked_during = nil, nil
+  env9.on_call = function(id)
+    if id == Q and resumed_during == nil then
+      resumed_during = rt9.resume()
+      parked_during = state.load(root).tasks[Q].slot_wait
+    end
+  end
+
+  env9.defer[1].fn()
+  pump_calls(env9, 2)
+  eq(#env9.calls, 2, "the automatic retry opens the second implementer turn")
+  eq(type(resumed_during), "table", "the resume ran while the automatic retry was in flight")
+  eq(type(resumed_during and resumed_during.live), "table",
+    "the resume reports the in-flight task as live")
+  eq(#(resumed_during and resumed_during.live or {}), 1,
+    "the automatic retry is the live task")
+  eq((resumed_during and resumed_during.live or {})[1], Q,
+    "the live task is the running automatic retry")
+  eq(parked_during, nil, "the resume never parks a running automatic retry")
+  pump_all(env9)
+  eq(#env9.calls, 2, "the in-flight automatic retry is never dispatched a second time")
+  eq(env9.peak <= 1, true, "a resume never exceeds max_parallel during an automatic retry")
+
+  -- The fallback slot count skips a parked task too -------------------------
+  --
+  -- A runtime built with a minimal pipeline module has no `slots()`, so it falls
+  -- back to counting the active statuses itself. That fallback must mirror the
+  -- authoritative helper and not count a `slot_wait` task — a task interrupted
+  -- in `reviewing` keeps that status while it waits, and counting it would
+  -- charge the same task twice and wrongly report the cap full.
+  reset()
+  local env10 = new_env()
+  env10.pipeline = {
+    tick = function() return { ok = true, started = {} } end,
+    dependencies_met = function() return true end,
+  }
+  local rt10 = build(env10)
+  local R = "T-20261122-0017"
+  local S = "T-20261122-0018"
+  state.create(root, {
+    id = R,
+    title = "en attente de slot",
+    status = "reviewing",
+    phase = "review",
+    files = { "src/0017.lua" },
+    checks = { "true" },
+    slot_wait = true,
+    slot_wait_since = "2026-11-22T22:00:00Z",
+  })
+  create_failed(S, "a relancer")
+  local retried10 = rt10.retry({ id = S }, { session = "S1" })
+  eq(retried10 and retried10.ok, true, "the retry is accepted")
+  eq(retried10 and retried10.waiting, nil,
+    "a parked task does not occupy the only slot")
+  eq(state.load(root).tasks[S].slot_wait, true, "the retried task is queued for the drain")
 end
