@@ -128,7 +128,7 @@ M.COMMANDS = {
   },
   {
     name = "prune",
-    description = "Close open PRs and delete branches whose task is no longer alive.",
+    description = "Reconcile GitHub with the journal: close PRs and delete branches of abandoned tasks or of tasks gone from the journal only; failed and stalled tasks are kept intact as retryable.",
     usage = "/metronome prune",
     build = function(rest)
       return {}

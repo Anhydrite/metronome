@@ -1651,10 +1651,10 @@ function M.new(deps)
     }
   end
 
-  -- A task that will not be merged must not leave an open PR behind: the list
-  -- fills with pull requests nobody will ever look at. The branch stays, so a
-  -- retry can still resume from its checkpoints. A transient failure never
-  -- reaches this: the branch and the PR are what its retry resumes from.
+  -- Only an explicit stop or abandon closes a task's PR: both transition the
+  -- task to `abandoned`, which is the sole status whose PR and branch cleanup
+  -- belongs to the pipeline. A failure never reaches this — a failed task is
+  -- retryable, so it keeps its open PR and branch for `metronome_retry`.
   local function close_open_pr(paths, task_id)
     local loaded = deps.state.load(paths.root)
     local task = loaded and loaded.tasks and loaded.tasks[task_id]
@@ -2924,14 +2924,16 @@ function M.new(deps)
     deploying = true,
   }
 
-  -- A dead task leaves two kinds of GitHub debris: the PR the pipeline
+  -- An abandoned task leaves two kinds of GitHub debris: the PR the pipeline
   -- attached to the task, which `close_open_pr` closes, and a PR the gate
   -- opened without ever attaching it, which is only visible by branch name.
   -- Prune is the reconciler that closes the second kind and deletes both
-  -- branches. It runs after every abandon/stop, best effort: the task is
-  -- already dead, and a GitHub failure must not turn that decision into an
-  -- error.
-  local function prune_dead_task()
+  -- branches. It only cleans what the user explicitly abandoned (or what is
+  -- gone from the journal): a failed or stalled task keeps its branch and its
+  -- open PR because `metronome_retry` resumes from them. It runs after every
+  -- abandon/stop, best effort: the decision to abandon already stands, and a
+  -- GitHub failure must not turn it into an error.
+  local function prune_after_abandon()
     local called, result = pcall(runtime.prune, {})
     if not called then
       return { ok = false, error = tostring(result) }
@@ -2965,7 +2967,7 @@ function M.new(deps)
     if not moved then
       return { ok = false, error = err }
     end
-    return { ok = true, task = moved, stopped = true, prune = prune_dead_task() }
+    return { ok = true, task = moved, stopped = true, prune = prune_after_abandon() }
   end
 
   function runtime.abandon(input)
@@ -2975,7 +2977,7 @@ function M.new(deps)
     if not moved then
       return { ok = false, error = err }
     end
-    return { ok = true, task = moved, prune = prune_dead_task() }
+    return { ok = true, task = moved, prune = prune_after_abandon() }
   end
 
   function runtime.delete(input)
@@ -3033,13 +3035,18 @@ function M.new(deps)
   end
 
   -- Reconcile GitHub with the journal: an open PR or a remote branch whose
-  -- task is not alive is an orphan. Prevention (closing on failure/stop) only
-  -- covers what happens after it ships; this repairs what is already there.
+  -- task is explicitly abandoned, or gone from the journal, is an orphan.
+  -- Prevention (closing on stop/abandon/delete) only covers what happens after
+  -- it ships; this repairs what is already there.
   --
-  -- Live means the task can still reach a merge: ready, qualifying,
-  -- awaiting_answers, running, verifying, reviewing, changes_requested,
-  -- pr_open, merging, deploying. A failed, abandoned or deleted task is not.
-  local LIVE = {
+  -- A task that can still produce work is preserved whole: its remote branch,
+  -- its open PR and its checkpoints are what a retry or a resume needs. That
+  -- includes the failed and stalled statuses — they are retryable by
+  -- construction, not dead. A terminal task (merged, deployed) is left to the
+  -- merge cleanup, which is the only step that owns deleting its branch. Only
+  -- an explicitly abandoned task is cleaned, plus a branch or PR whose task is
+  -- absent from the journal (`task_deleted`).
+  local PRESERVED = {
     ready = true,
     qualifying = true,
     awaiting_answers = true,
@@ -3050,7 +3057,42 @@ function M.new(deps)
     pr_open = true,
     merging = true,
     deploying = true,
+    failed = true,
+    stalled = true,
+    merged = true,
+    deployed = true,
   }
+
+  -- Why a preserved task is preserved. The reason is part of the contract: a
+  -- human reading `metronome_prune` must see that a failed task was kept on
+  -- purpose, not that prune forgot about it.
+  local KEEP_REASON = {
+    failed = "failed (retryable)",
+    stalled = "stalled (retryable)",
+    merged = "terminal, merge owns cleanup",
+    deployed = "terminal, merge owns cleanup",
+  }
+
+  local function keep_reason(status)
+    return KEEP_REASON[status] or "in progress"
+  end
+
+  -- `git.delete_branch` returns `nil, err` on bad arguments and otherwise a
+  -- table that reports the remote and local sides separately (see git.lua).
+  -- The remote delete is what prune promises, so a raise, a nil result or a
+  -- `remote_error` all mean the remote branch is still there. A fake that only
+  -- returns `{ ok = true }` counts as success.
+  local function remote_branch_gone(res)
+    if type(res) ~= "table" then return false end
+    if res.remote_error then return false end
+    return (res.remote_deleted or res.remote_missing or res.ok) and true or false
+  end
+
+  -- `git.pr_close` returns `nil, err` on failure and `{ closed = true }` on
+  -- success. A raised error or a nil result is a close that did not happen.
+  local function pr_closed_ok(res)
+    return type(res) == "table" and res.closed == true
+  end
 
   function runtime.prune(_input)
     local paths = project_paths()
@@ -3064,15 +3106,70 @@ function M.new(deps)
     end
 
     local loaded = deps.state.load(paths.root) or { tasks = {} }
-    local live_branches = {}
+    local preserved_branches = {}
+    local preserved_by_number, preserved_by_url = {}, {}
+    local abandoned_branches = {}
+    local abandoned_by_number, abandoned_by_url = {}, {}
+    local function index_pr(by_number, by_url, pr, value)
+      if type(pr) ~= "table" then return end
+      if pr.number ~= nil then by_number[tostring(pr.number)] = value end
+      if type(pr.url) == "string" then by_url[pr.url] = value end
+    end
     for _, task in pairs(loaded.tasks or {}) do
-      if LIVE[task.status] and type(task.branch) == "string" then
-        live_branches[task.branch] = task.id
+      if task.status == "abandoned" then
+        if type(task.branch) == "string" then
+          abandoned_branches[task.branch] = task.id
+        end
+        -- A task that lost its `branch` string but still owns an open PR must
+        -- be reported as abandoned, not as gone: key the cleanup on the PR
+        -- identity too, so the reason and the task id stay accurate.
+        index_pr(abandoned_by_number, abandoned_by_url, task.pr, task.id)
+      else
+        -- Anything not explicitly abandoned is preserved: an unknown status
+        -- is not proof the task is dead, and deleting its branch is
+        -- irreversible. The known preserved statuses drive the reported
+        -- reason; a status this table does not know yet is still kept.
+        local entry = {
+          task = task.id,
+          reason = PRESERVED[task.status] and keep_reason(task.status) or "in progress",
+        }
+        if type(task.branch) == "string" then
+          preserved_branches[task.branch] = entry
+        end
+        index_pr(preserved_by_number, preserved_by_url, task.pr, entry)
       end
     end
 
     local prefix = (cfg.git and cfg.git.branch_prefix) or "metronome/"
-    local closed, deleted, kept, errors = {}, {}, {}, {}
+    local closed, deleted, kept, errors, summary = {}, {}, {}, {}, {}
+    local kept_branches = {}
+
+    local function keep_reason_text(reason)
+      -- "failed (retryable)" reads as "failed, retryable" inside the summary's
+      -- own parentheses: `kept (failed, retryable): ...`.
+      local head, inner = reason:match("^(.-) %((.-)%)$")
+      if head then return head .. ", " .. inner end
+      return reason
+    end
+
+    local function keep(branch, task, reason, number)
+      if kept_branches[branch] then
+        return
+      end
+      kept_branches[branch] = true
+      kept[#kept + 1] = { task = task, branch = branch, number = number, reason = reason }
+      summary[#summary + 1] = string.format("kept (%s): %s branch %s",
+        keep_reason_text(reason), task or "?", branch)
+    end
+
+    local function forget(branch, task, reason)
+      deleted[#deleted + 1] = { branch = branch, task = task, reason = reason }
+      if task then
+        summary[#summary + 1] = string.format("deleted (%s): %s branch %s", reason, task, branch)
+      else
+        summary[#summary + 1] = string.format("deleted (%s): branch %s", reason, branch)
+      end
+    end
 
     local prs, perr = deps.git.list_open_prs({ repo = paths.repo, gh = "gh" })
     if not prs then
@@ -3083,16 +3180,45 @@ function M.new(deps)
       local head = tostring(pr.head or "")
       if head:sub(1, #prefix) == prefix then
         pr_branches[head] = true
-        if live_branches[head] then
-          kept[#kept + 1] = { number = pr.number, branch = head, task = live_branches[head] }
+        local function by_pr(by_number, by_url)
+          local found = by_number[tostring(pr.number)]
+          if not found and type(pr.url) == "string" then
+            found = by_url[pr.url]
+          end
+          return found
+        end
+        local owner = preserved_branches[head] or by_pr(preserved_by_number, preserved_by_url)
+        if owner then
+          keep(head, owner.task, owner.reason, pr.number)
         else
-          local ok = pcall(deps.git.pr_close, pr.number, { gh = "gh", worktree = paths.repo })
+          local task = abandoned_branches[head] or by_pr(abandoned_by_number, abandoned_by_url)
+          local reason = task and "abandoned" or "gone"
+          local called, closed_res = pcall(deps.git.pr_close, pr.number, { gh = "gh", worktree = paths.repo })
+          local ok = called and pr_closed_ok(closed_res)
           if ok then
-            closed[#closed + 1] = { number = pr.number, branch = head }
-            -- A closed PR leaves a branch nobody will read: drop it too.
+            closed[#closed + 1] = { number = pr.number, branch = head, task = task, reason = reason }
+            -- Name the close decision in the summary too: a human reading the
+            -- output must see which PR was closed and why, not just which
+            -- branch went away.
+            if task then
+              summary[#summary + 1] = string.format("closed (%s): %s #%s branch %s",
+                reason, task, tostring(pr.number), head)
+            else
+              summary[#summary + 1] = string.format("closed (%s): #%s branch %s",
+                reason, tostring(pr.number), head)
+            end
+            -- A closed PR leaves a branch nobody will read: drop it too, but
+            -- only report it deleted if the delete actually succeeded.
             if type(deps.git.delete_branch) == "function" then
-              pcall(deps.git.delete_branch, paths.repo, head, { remote = "origin" })
-              deleted[#deleted + 1] = head
+              local called_del, delete_res = pcall(deps.git.delete_branch, paths.repo, head, { remote = "origin" })
+              if called_del and remote_branch_gone(delete_res) then
+                forget(head, task, reason)
+              else
+                errors[#errors + 1] = {
+                  branch = head,
+                  error = (type(delete_res) == "table" and delete_res.remote_error) or "delete failed",
+                }
+              end
             end
           else
             errors[#errors + 1] = { number = pr.number, error = "close failed" }
@@ -3103,15 +3229,23 @@ function M.new(deps)
 
     local branches, berr = deps.git.list_branches(paths.repo, "origin", { pattern = prefix .. "*" })
     if not branches then
-      return { ok = false, error = berr, closed = closed, kept = kept }
+      return { ok = false, error = berr, closed = closed, kept = kept, summary = summary }
     end
     for _, branch in ipairs(branches) do
-      if not live_branches[branch] and not pr_branches[branch] then
-        local ok = pcall(deps.git.delete_branch, paths.repo, branch, { remote = "origin" })
-        if ok then
-          deleted[#deleted + 1] = branch
+      local owner = preserved_branches[branch]
+      if owner then
+        keep(branch, owner.task, owner.reason)
+      elseif not pr_branches[branch] then
+        local task = abandoned_branches[branch]
+        local reason = task and "abandoned" or "gone"
+        local called, delete_res = pcall(deps.git.delete_branch, paths.repo, branch, { remote = "origin" })
+        if called and remote_branch_gone(delete_res) then
+          forget(branch, task, reason)
         else
-          errors[#errors + 1] = { branch = branch, error = "delete failed" }
+          errors[#errors + 1] = {
+            branch = branch,
+            error = (type(delete_res) == "table" and delete_res.remote_error) or "delete failed",
+          }
         end
       end
     end
@@ -3121,6 +3255,7 @@ function M.new(deps)
       closed = closed,
       deleted = deleted,
       kept = kept,
+      summary = summary,
       errors = errors,
     }
   end
