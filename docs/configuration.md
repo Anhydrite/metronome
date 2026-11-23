@@ -15,7 +15,7 @@ The contract is `schemas/config.schema.json`. Unknown keys are refused, every ro
 | --- | --- | --- | --- |
 | `repo` | string, absolute path | required | The git repository Metronome drives. |
 | `base_ref` | string | required | The branch every task is cut from. |
-| `max_parallel` | integer, 1–16 | `2` | How many tasks may run at once. Parallelism is bounded only by `max_parallel` and `depends_on`; two tasks sharing a declared file may run concurrently, each in its own worktree, with the conflict resolved at merge. |
+| `max_parallel` | integer, 1–16 | `2` | How many tasks may run at once. Parallelism is bounded only by `max_parallel` and `depends_on`; two tasks sharing a declared file may run concurrently, each in its own worktree, with the conflict resolved at merge. Retries and resumes count against the same cap: with no free slot a retried or resumed task is parked with the persisted `slot_wait = true` and waits for the scheduler instead of starting. |
 | `max_parallel_qualifiers` | integer, 1–16 | `4` | How many qualifier sessions may run at once when several intentions are submitted together. |
 
 ```toml
