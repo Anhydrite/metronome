@@ -56,6 +56,19 @@ local DEAD = {
   abandoned = true,
 }
 
+-- Statuses a `slot_wait` task can never be dispatched from. A parked task keeps
+-- its original status, and `failed` / `abandoned` are legitimate ones (a retried
+-- task keeps its original status while it waits), so this only refuses a task
+-- that already landed. `state.transition` clears the wait on terminal moves, so
+-- this is a second line of defence: a stale `slot_wait` on a landed task must
+-- never resurrect it on the next drain. An `abandoned` task carrying the wait
+-- is an explicit human retry — the only way to set the flag on one — so the
+-- drain must dispatch it (`abandoned -> running` is a legal transition).
+local NO_DISPATCH = {
+  merged = true,
+  deployed = true,
+}
+
 -- How a resumed task gets back to `running`, using only legal transitions.
 -- `running` is already there and stays; the path is a no-op status event.
 local RESUME_PHASE = {
@@ -354,7 +367,12 @@ function M.slots(tasks, opts)
   local exclude = opts.exclude
   local in_flight = 0
   for _, task in ipairs(M.collect(tasks)) do
-    if ACTIVE[task.status] and (exclude == nil or task.id ~= exclude) then
+    -- A `slot_wait` task is parked, not in flight, even when its original
+    -- status is an active one (a task interrupted in `reviewing` keeps that
+    -- status while it waits). Counting it would charge the same task twice and
+    -- could starve the very slot it is waiting for.
+    if ACTIVE[task.status] and not task.slot_wait
+      and (exclude == nil or task.id ~= exclude) then
       in_flight = in_flight + 1
     end
   end
@@ -685,17 +703,27 @@ function M.tick(opts)
   -- A failed but retryable task is a start candidate exactly like a ready one.
   -- Both compete for the same max_parallel budget and obey the same runs-alone
   -- rule, so a retry never wedges the drain.
+  --
+  -- A task carrying `slot_wait = true` is a candidate whatever its status: a
+  -- retry keeps the task's original status (`failed`, `stalled`, ...) and a
+  -- resume keeps the phase it was interrupted in (`reviewing`, `merging`, ...).
+  -- The field is what marks it parked, so it must be picked here — and nowhere
+  -- else — once a slot is free.
   local retries = M.retry_ready(loaded.tasks, schedule_opts)
   local retry_ids = {}
   local candidates = {}
   for _, task in ipairs(M.collect(loaded.tasks)) do
-    if task.status == "ready" then
+    if task.slot_wait and not NO_DISPATCH[task.status] then
+      candidates[#candidates + 1] = task
+    elseif task.status == "ready" then
       candidates[#candidates + 1] = task
     end
   end
   for _, task in ipairs(retries) do
-    retry_ids[task.id] = true
-    candidates[#candidates + 1] = task
+    if not task.slot_wait then
+      retry_ids[task.id] = true
+      candidates[#candidates + 1] = task
+    end
   end
 
   local started, skipped = pick(candidates, loaded.tasks, running, schedule_opts)
@@ -705,8 +733,30 @@ function M.tick(opts)
       local phase = "implement"
       if retry_ids[task.id] and type(task.failure) == "table" and is_non_empty(task.failure.phase) then
         phase = task.failure.phase
+      elseif task.slot_wait and is_non_empty(task.phase) then
+        phase = task.phase
       end
-      local moved, merr = state.transition(root, task.id, "running", { phase = phase })
+      -- A waiting task is walked back to `running` through the same legal path
+      -- a resume uses: `reviewing` and `merging` have no direct edge to
+      -- `running`, and forcing one would be the illegal transition the resume
+      -- guard exists to prevent. The slot is claimed by the final move, and the
+      -- wait is cleared in that same append.
+      local path = { "running" }
+      if task.slot_wait and task.status ~= "ready" then
+        path = RESUME_PATH[task.status] or path
+      end
+      local moved = nil
+      local merr = nil
+      for index, to in ipairs(path) do
+        local extra = { phase = phase }
+        if index == #path and task.slot_wait then
+          extra.fields = { slot_wait = false }
+        end
+        moved, merr = state.transition(root, task.id, to, extra)
+        if not moved then
+          break
+        end
+      end
       if not moved then
         -- A task that cannot move is reported, never fatal: the tick succeeded
         -- and the next one can try again.
