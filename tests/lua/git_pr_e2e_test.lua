@@ -163,7 +163,7 @@ return function()
   local logtext = read_log()
   has(logtext, "pr create --base main --head " .. branch .. " --title feat: add product list --body e2e",
     "gh was asked to create the PR for the pushed branch")
-  has(logtext, "pr view https://github.com/example/shop/pull/7 --json number,url,state",
+  has(logtext, "pr view https://github.com/example/shop/pull/7 --json number,url,state,mergeable,baseRefName",
     "gh was asked to re-read the PR")
   local create_at = logtext:find("pr create", 1, true)
   local view_at = logtext:find("pr view", 1, true)
