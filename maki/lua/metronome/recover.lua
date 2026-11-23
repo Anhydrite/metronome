@@ -135,6 +135,143 @@ local function any_of(haystack, needles)
   return false
 end
 
+-- ---------------------------------------------------------------------------
+-- Structured conflicts.
+--
+-- A merge or rebase failure does not always come with text: the runtime and
+-- `merge.run` report it as fields (`conflict = true` or the file table,
+-- `conflict_files`, `conflict_file_list`, `base`, `base_sha`,
+-- `rebase_command`). Reading only message/error/stderr left such a failure as
+-- "conflict: no error details", which a human cannot act on. These helpers
+-- gather those facts from the error and its sub-tables (bounded depth, cycles
+-- broken) so `classify` can name the files, the base and the command.
+-- ---------------------------------------------------------------------------
+
+local function non_empty_string(value)
+  return type(value) == "string" and trim(value) ~= ""
+end
+
+-- Collect file names from any shape: a comma/newline separated string, an
+-- array of names, or an array of `{ file = ... }` hunk-like tables.
+local function add_conflict_files(files, seen, value)
+  if type(value) == "string" then
+    for piece in value:gmatch("[^\n,]+") do
+      local name = trim(piece)
+      if name ~= "" and not seen[name] then
+        seen[name] = true
+        files[#files + 1] = name
+      end
+    end
+  elseif type(value) == "table" then
+    for _, item in ipairs(value) do
+      if type(item) == "table" then
+        add_conflict_files(files, seen, item.file or item.path or item.name)
+      else
+        add_conflict_files(files, seen, item)
+      end
+    end
+  end
+end
+
+local CONFLICT_FIELDS = { "error", "err", "message", "msg", "details", "result", "output", "stderr", "stdout" }
+local CONFLICT_HUNK_FIELDS = { "conflict_hunks", "hunks" }
+
+-- Walk the error graph for conflict facts. Returns nil when no conflict marker
+-- is present, so a purely textual error keeps its existing classification.
+local function conflict_facts(err)
+  if type(err) ~= "table" then
+    return nil
+  end
+  local files, seen_files = {}, {}
+  local facts = {}
+  local visited = {}
+  local function scan(node, depth)
+    if type(node) ~= "table" or depth > 3 or visited[node] then
+      return
+    end
+    visited[node] = true
+    local marked = false
+    local conflict = node.conflict
+    if conflict == true then
+      marked = true
+    elseif type(conflict) == "table" then
+      marked = true
+      add_conflict_files(files, seen_files, conflict)
+    elseif non_empty_string(conflict) then
+      marked = true
+      add_conflict_files(files, seen_files, conflict)
+    end
+    for _, key in ipairs({ "conflict_files", "conflict_file_list" }) do
+      local value = node[key]
+      if non_empty_string(value) then
+        marked = true
+        add_conflict_files(files, seen_files, value)
+      elseif type(value) == "table" then
+        marked = true
+        add_conflict_files(files, seen_files, value)
+      end
+    end
+    for _, key in ipairs(CONFLICT_HUNK_FIELDS) do
+      if type(node[key]) == "table" then
+        add_conflict_files(files, seen_files, node[key])
+      end
+    end
+    if marked then
+      facts.found = true
+    end
+    if facts.base == nil and non_empty_string(node.base) then
+      facts.base = node.base
+    end
+    if facts.base_sha == nil and non_empty_string(node.base_sha) then
+      facts.base_sha = node.base_sha
+    end
+    if facts.command == nil and non_empty_string(node.rebase_command) then
+      facts.command = node.rebase_command
+    end
+    if facts.command == nil and non_empty_string(node.command) then
+      facts.command = node.command
+    end
+    if facts.commit == nil and non_empty_string(node.conflict_commit) then
+      facts.commit = node.conflict_commit
+    end
+    if facts.commit == nil and non_empty_string(node.commit) then
+      facts.commit = node.commit
+    end
+    for _, key in ipairs(CONFLICT_FIELDS) do
+      scan(node[key], depth + 1)
+    end
+  end
+  scan(err, 0)
+  if not facts.found then
+    return nil
+  end
+  facts.files = files
+  return facts
+end
+
+-- The actionable one-line message for a structured conflict: the files, the
+-- base (with its SHA), the exact command and the commit git could not replay.
+-- It is never empty, so a detailed conflict can never degrade to the dead-end
+-- "no error details".
+local function conflict_message(facts)
+  local files = #facts.files > 0 and table.concat(facts.files, ", ") or "unknown"
+  local parts = { "merge/rebase conflict, files: " .. files }
+  local base = facts.base or facts.base_sha
+  if base ~= nil and facts.base and facts.base_sha and facts.base_sha ~= facts.base then
+    base = string.format("%s (%s)", facts.base, facts.base_sha)
+  end
+  if base ~= nil then
+    parts[#parts + 1] = "base: " .. base
+  end
+  if facts.command ~= nil then
+    parts[#parts + 1] = "command: `" .. facts.command .. "`"
+  end
+  if facts.commit ~= nil then
+    parts[#parts + 1] = "commit: " .. facts.commit
+  end
+  return table.concat(parts, "; ")
+end
+
 -- Per-cause classification rules, in priority order. The first match wins, so
 -- the specific and benign patterns come before the broad ones.
 local RULES = {
@@ -341,13 +478,30 @@ local UNKNOWN = {
   remedy = "inspect the transcript and the worktree, then retry or fix by hand.",
 }
 
+-- The conflict rule, reused for a structured conflict so its cause, remedy and
+-- transience stay identical to the textual one.
+local CONFLICT_RULE
+for _, rule in ipairs(RULES) do
+  if rule.cause == "conflict" then
+    CONFLICT_RULE = rule
+    break
+  end
+end
+
 -- Diagnose one execution error. `opts` is accepted for symmetry (a caller may
--- pass the phase or extra hints) but classification is purely textual. With a
--- nil error the result is `unknown`, never an exception.
+-- pass the phase or extra hints). Classification reads the text and, for a
+-- conflict, the structured fields the merge/rebase carries. With a nil error
+-- the result is `unknown`, never an exception.
 function M.classify(err, opts)
-  local ok, result = pcall(function()
+  local ok, rule, raw, synthesized = pcall(function()
     local raw = err_text(err)
     local lower = raw:lower()
+    -- A structured conflict wins over any text: it is unambiguous, and the
+    -- message must name its files, base and command rather than the text.
+    local facts = conflict_facts(err)
+    if facts then
+      return CONFLICT_RULE, raw, conflict_message(facts)
+    end
     for _, rule in ipairs(RULES) do
       if any_of(lower, rule.patterns) then
         return rule, raw
@@ -366,12 +520,23 @@ function M.classify(err, opts)
     return { cause = "unknown", message = "", remedy = UNKNOWN.remedy,
       transient = false, retryable = false, remediable = false }
   end
-  local rule, raw = result
   local transient = rule.transient == true
   local benign = rule.cause == "nothing_to_commit"
-  local message = one_line(raw)
-  if message == "" then
-    message = benign and "nothing to commit" or "no error details"
+  local message
+  if synthesized ~= nil then
+    -- Keep any raw text, but always append the facts. Never fall back to the
+    -- dead-end message for a conflict carrying details.
+    local rawline = one_line(raw, 0)
+    if rawline == "" or rawline == "no error details" then
+      message = synthesized
+    else
+      message = rawline .. " — " .. synthesized
+    end
+  else
+    message = one_line(raw)
+    if message == "" then
+      message = benign and "nothing to commit" or "no error details"
+    end
   end
   return {
     cause = rule.cause,
