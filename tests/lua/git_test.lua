@@ -616,6 +616,221 @@ return function()
   has(gh_text, "argv=pr view 77 --json number,url,state,mergeable,baseRefName",
     "the verification uses the recorded number and the full JSON field list")
   eq(gh_text:find("pr create", 1, true), nil, "a verified open PR is not recreated")
+  -- Single-flight fetch (T-20261122-0047) -----------------------------------
+  --
+  -- Two tasks that start at the same time both want a fresh base, and two
+  -- `git fetch` children on one clone fight over the same ref locks. The
+  -- sandbox offers neither io nor flock, so the module keeps an in-process
+  -- registry of fetches in flight instead of a lock file: callers that ask for
+  -- a fetch already running for the same key (repo + remote + args) wait for
+  -- it and reuse its result, and only the owner launches the git child.
+  --
+  -- The wrapper counts the real `git ... fetch` children per key, so "one
+  -- command" is measured, not assumed.
+
+  do
+    local real_jobstart = maki.fn.jobstart
+    local launched = {}
+    local function argv_key(argv)
+      local is_fetch = false
+      for _, arg in ipairs(argv) do
+        if arg == "fetch" then is_fetch = true end
+      end
+      return is_fetch and table.concat(argv, " ") or nil
+    end
+    maki.fn.jobstart = function(argv, opts)
+      local key = argv_key(argv)
+      if not key then
+        return real_jobstart(argv, opts)
+      end
+      -- Hold the child a moment before it runs: a local fetch is instant, and
+      -- the point here is four callers that overlap, not a fast remote. The
+      -- counted command is still the one git fetch the module asked for.
+      local slow = { "sh", "-c", 'sleep 0.6; exec "$@"', "sh" }
+      for _, arg in ipairs(argv) do
+        slow[#slow + 1] = arg
+      end
+      -- Count the children that really started: run() retries a jobstart that
+      -- has no task scope, and an attempt that raised is not a git child.
+      local job = real_jobstart(slow, opts)
+      if job then
+        launched[key] = (launched[key] or 0) + 1
+      end
+      return job
+    end
+    local function fetch_key(repo_path, remote_name)
+      return table.concat({
+        "env", "LC_ALL=C", "LANG=C", "git", "-C", repo_path, "fetch", remote_name, "--prune",
+      }, " ")
+    end
+    local origin_key = fetch_key(repo, "origin")
+
+    -- (a) Four callers, one clone, one remote: four successes, one child.
+    eq(type(maki.async and maki.async.gather), "function", "the host can run four callers at once")
+    local outcomes = maki.async.gather({
+      function() return git.fetch(repo, "origin") end,
+      function() return git.fetch(repo, "origin") end,
+      function() return git.fetch(repo, "origin") end,
+      function() return git.fetch(repo, "origin") end,
+    })
+    eq(#(outcomes or {}), 4, "four concurrent fetches answered")
+    for i = 1, 4 do
+      local outcome = (outcomes or {})[i] or {}
+      eq(outcome.ok, true, "concurrent fetch " .. i .. " succeeds: " .. tostring(outcome.err))
+      eq(outcome.value, true, "concurrent fetch " .. i .. " reuses the fetch success")
+    end
+    eq(launched[origin_key], 1, "four callers launched a single git fetch child")
+
+    -- (b) A failed fetch does not poison the registry -----------------------
+    --
+    -- The registry must be released on every path: a missing remote (a real
+    -- git failure) and a crash raised while collecting the child (pcall).
+    local nope_key = fetch_key(repo, "nope")
+    local nope1, nope1_err = git.fetch(repo, "nope")
+    eq(nope1, nil, "the first failing fetch fails")
+    eq(type(nope1_err), "string", "the first failing fetch explains itself")
+    local nope2, nope2_err = git.fetch(repo, "nope")
+    eq(nope2, nil, "an identical fetch fails again instead of hanging")
+    eq(type(nope2_err), "string", "the second failing fetch explains itself")
+    eq(launched[nope_key], 2, "the fetch after a failure launches a new child")
+
+    local real_jobwait = maki.fn.jobwait
+    local crash_next = false
+    maki.fn.jobwait = function(job, ms)
+      local result = real_jobwait(job, ms)
+      if crash_next then
+        crash_next = false
+        -- Raise only after the child exited: the point is the registry
+        -- cleanup, not an orphaned fetch that would hold a ref lock.
+        error("simulated crash while waiting on git")
+      end
+      return result
+    end
+    local before_crash = launched[origin_key] or 0
+    crash_next = true
+    local crashed, crashed_err = git.fetch(repo, "origin")
+    maki.fn.jobwait = real_jobwait
+    eq(crashed, nil, "a crash inside a fetch is reported, not raised")
+    has(crashed_err or "", "simulated crash", "the crash message survives")
+    eq(launched[origin_key], before_crash + 1, "the crashed fetch did launch one child")
+    local recovered, recovered_err = git.fetch(repo, "origin")
+    eq(recovered, true, "the fetch after a crash succeeds: " .. tostring(recovered_err))
+    eq(launched[origin_key], before_crash + 2, "the registry was released after the exception")
+
+    -- (b-bis) A concurrent failure reaches every waiter: one child, one error,
+    -- no retry behind the caller's back.
+    local function ask_failing_fetch()
+      local ok, err = git.fetch(repo, "nope")
+      return { ok = ok, err = err }
+    end
+    local failed = maki.async.gather({ ask_failing_fetch, ask_failing_fetch })
+    eq(#(failed or {}), 2, "two concurrent failing fetches answered")
+    for i = 1, 2 do
+      local outcome = (failed or {})[i] or {}
+      local answer = outcome.value or {}
+      eq(outcome.ok, true, "concurrent failure " .. i .. " is reported, not raised")
+      eq(answer.ok, nil, "concurrent failure " .. i .. " did not fetch")
+      has(tostring(answer.err), "remote_missing", "concurrent failure " .. i .. " carries the cause")
+    end
+    eq(launched[nope_key], 3, "two failing callers launched a single git fetch child")
+
+    maki.fn.jobstart = real_jobstart
+  end
+
+  -- (c) A ref lock is contention, not a failure of the command --------------
+  --
+  -- Any git command can lose a race for a ref lock (fetch, push, rebase). The
+  -- cause is dedicated and marked transient/retryable so a caller replays it
+  -- instead of failing the task; the message names the contention and the
+  -- hint names the remedy.
+  do
+    local lock_patterns = {
+      "error: cannot lock ref 'refs/remotes/origin/main': Unable to create '...lock': File exists.",
+      "error: unable to update local ref",
+      "error: failed to update ref",
+    }
+    for _, what in ipairs({ "fetch", "push", "rebase" }) do
+      for _, pattern in ipairs(lock_patterns) do
+        local label = what .. " lock: " .. pattern:sub(1, 24)
+        local diag = git.classify(what, {
+          code = 1,
+          command = "git " .. what,
+          stdout = "",
+          stderr = pattern .. "\n",
+        })
+        eq(diag.cause, "git_lock", label .. " is classified git_lock")
+        eq(diag.transient, true, label .. " is transient")
+        eq(diag.retryable, true, label .. " is retryable")
+        has(diag.message, "lock", label .. " names the contention")
+        has(diag.hint, "retry", label .. " names the remedy")
+        has(git.describe(diag), "git_lock", label .. " reads as git_lock")
+      end
+    end
+    local plain = git.classify("fetch", {
+      code = 1,
+      command = "git fetch",
+      stdout = "",
+      stderr = "fatal: the remote hung up unexpectedly\n",
+    })
+    eq(plain.cause, "git_error", "a stderr without a lock pattern stays git_error")
+    eq(plain.transient, nil, "a plain failure is not transient")
+  end
+
+  -- A real lock, through M.rebase: a leftover .lock file makes git fail with
+  -- "cannot lock ref", so the caller must see git_lock; once the lock is gone
+  -- the retry succeeds. A conflict still reports the conflict, not a lock.
+  do
+    local lock_wt = maki.fs.joinpath(base, "wt-lock")
+    local lock_branch = "metronome/T-20261122-l001"
+    local lwt, lwerr = git.worktree_add(repo, lock_wt, lock_branch, "main", { remote = "origin" })
+    eq(lwerr, nil, "lock worktree created: " .. tostring(lwerr))
+    maki.fs.write(maki.fs.joinpath(lock_wt, "locked.txt"), "locked\n")
+    local lock_sha, lock_serr = git.commit(lock_wt, "feat: work to rebase")
+    eq(lock_serr, nil, "lock worktree commit: " .. tostring(lock_serr))
+    eq(type(lock_sha), "string", "lock worktree commit returns a sha")
+
+    -- main moves on after the branch was cut, so the rebase really replays a
+    -- commit and has to update the branch ref (a no-op rebase touches no lock).
+    maki.fs.write(maki.fs.joinpath(repo, "lock-main.txt"), "main\n")
+    sh({ "git", "add", "-A" }, repo)
+    local lmcode, lmout = sh({ "git", "commit", "-m", "chore: main before the lock" }, repo)
+    eq(lmcode, 0, "main advanced for the lock: " .. lmout:sub(1, 80))
+    local lmpcode, lmpout = sh({ "git", "push", "origin", "main" }, repo)
+    eq(lmpcode, 0, "main pushed for the lock: " .. lmpout:sub(1, 80))
+    local lock_fetched, lock_fetched_err = git.fetch(repo, "origin")
+    eq(lock_fetched, true, "fetch before the locked rebase: " .. tostring(lock_fetched_err))
+
+    local lock_path = maki.fs.joinpath(repo, ".git", "refs", "heads", lock_branch .. ".lock")
+    maki.fs.mkdir(maki.fs.joinpath(repo, ".git", "refs", "heads", "metronome"), { parents = true })
+    local wrote_lock, wrote_lock_err = maki.fs.write(lock_path, "")
+    eq(wrote_lock ~= nil and wrote_lock ~= false, true, "the ref lock fixture was written: " .. tostring(wrote_lock_err))
+    local locked, locked_err, locked_diag = git.rebase(lock_wt, "origin/main")
+    eq(locked, nil, "a rebase that loses the ref lock fails")
+    eq(locked_diag and locked_diag.cause, "git_lock", "the rebase failure is classified git_lock")
+    eq(locked_diag and locked_diag.retryable, true, "the locked rebase is retryable")
+    has(tostring(locked_err), "git_lock", "the rebase error names git_lock")
+    maki.fs.rm(lock_path)
+
+    -- git's sequencer had already applied the commit to the index when the ref
+    -- update lost the lock, so the fixture restores the pre-rebase tree before
+    -- the retry: a locked ref update is a contention, not a conflict, and the
+    -- branch head itself never moved.
+    sh({ "git", "-C", lock_wt, "rebase", "--abort" }, base)
+    local lr_code, lr_out = sh({ "git", "-C", lock_wt, "reset", "--hard", lock_sha }, base)
+    eq(lr_code, 0, "the worktree is restored before the retry: " .. lr_out:sub(1, 80))
+
+    local retried, retried_err = git.rebase(lock_wt, "origin/main")
+    eq(type(retried), "string", "the retry after the lock succeeds: " .. tostring(retried_err))
+    eq(#(retried or ""), 40, "the retried rebase returns the new head")
+    git.worktree_remove(repo, lock_wt, { force = true })
+
+    local conf_again, conf_again_err, conf_diag = git.rebase(conflict_wt, "origin/main")
+    eq(conf_again, nil, "the conflicting rebase is refused again")
+    has(conf_again_err or "", "README.md", "the conflict still names the file")
+    eq(conf_diag and conf_diag.cause, "git_error", "a conflict is not a lock")
+    eq(conf_diag and conf_diag.conflict and conf_diag.conflict[1], "README.md",
+      "the conflict list survives the classification")
+  end
 
   -- Cleanup -----------------------------------------------------------------
 
