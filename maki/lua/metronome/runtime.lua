@@ -1106,53 +1106,170 @@ function M.new(deps)
         end
 
         local repaired = false
+        local impl_err = nil
         if repairs < repair_bound
           and worktree == epic_wt
           and deps.implement and type(deps.implement.run) == "function" then
-          repairs = repairs + 1
+          -- The implementer prompt, the journal note and the escalation are
+          -- built from the same facts, so the base travels with its SHA even
+          -- when `merge.run` could not resolve it: a human is never asked to
+          -- resolve a conflict on a base named "unknown".
+          local base_sha = type(deps.git.rev_parse) == "function"
+            and deps.git.rev_parse(worktree, "origin/" .. base) or nil
+          if is_non_empty(base_sha) then
+            details.base_sha = details.base_sha or base_sha
+          elseif is_non_empty(details.base_sha) then
+            -- The remote ref may be unresolvable (never fetched, or pruned from
+            -- this worktree): the SHA the merge already carried names the same
+            -- fresh base, so reset onto it instead of breaking to escalation.
+            base_sha = details.base_sha
+          end
+          details.base = details.base or base
           -- `merging` has no edge back to `running`: the repair continues the
-          -- turn, so the status and the counter are written in one patch, and
-          -- a reload resumes in implement with the conflict already journalled.
+          -- turn, so the status and the phase are written before the
+          -- implementer runs, and a reload resumes in implement with the
+          -- conflict already journalled.
           pcall(state.set_fields, paths.root, task_id, {
             status = "running",
             phase = "implement",
-            conflict_retried = true,
-            conflict_retries = repairs,
           })
-          local impl = deps.implement.run({
-            task = task,
-            repo = paths.repo,
-            state = state,
-            root = paths.root,
-            git = deps.git,
-            worktree_root = paths.worktrees,
-            tasks_dir = paths.tasks,
-            remote = "origin",
-            base_ref = base,
-            runner = runner,
-            session_opts = session.implementer,
-            state_root = paths.runs,
-            ctx = opts.ctx,
-            max_attempts = 1,
-            deadline_secs = opts.deadline_secs,
-            conflict = details,
-          })
-          if impl and impl.ok then
-            -- The PR is the same PR: the repaired branch is pushed onto it, so
-            -- no second PR is opened. The repairable note is written only now:
-            -- the implementer has actually redone the branch, so a "will be
-            -- redone" note can never be followed by a `failed` on the same
-            -- turn.
-            if type(deps.git.push) == "function" then
-              pcall(deps.git.push, impl.ctx and impl.ctx.worktree or worktree,
-                branch, { remote = "origin", force = true })
+          -- The epic has no implementation of its own: the branch itself is
+          -- the work. Each attempt puts the conflicted branch back on the
+          -- fresh base — the SHA of `origin/<base>`, never its own remote tip
+          -- — so the implementer redoes it on a clean history instead of
+          -- replaying the same conflicting one, with the conflict facts as
+          -- data.
+          --
+          -- The reset stays local: the remote is pushed only after the
+          -- implementer has actually redone the branch (below). A turn that
+          -- fails, is interrupted or commits nothing therefore leaves the work
+          -- its subtasks merged untouched on `origin` — a human is never asked
+          -- to resolve a conflict on a branch whose content has already been
+          -- wiped, and the prompt can tell the implementer to recover that work
+          -- from `origin/<branch>`.
+          --
+          -- Under the bound a failed or no-op turn re-enters the cycle instead
+          -- of failing the epic: only an exhausted budget escalates. Each
+          -- attempt spends one unit of the persisted budget, whether or not it
+          -- redid the branch, so a reload — or a loop of no-op turns — cannot
+          -- restart it. The merge is relaunched only for an attempt that
+          -- actually moved the branch off the fresh base: relaunching it on an
+          -- unchanged branch would merge the bare base and deploy the epic
+          -- without the work its subtasks merged.
+          while repairs < repair_bound and not repaired do
+            local fresh = false
+            local reset_err
+            if is_non_empty(base_sha) and type(deps.git.reset_hard) == "function" then
+              local reset
+              reset, reset_err = deps.git.reset_hard(epic_wt, base_sha)
+              fresh = reset and true or false
+            elseif is_non_empty(base_sha) then
+              reset_err = "no reset_hard available"
+            else
+              reset_err = "cannot resolve origin/" .. tostring(base)
             end
-            journal_conflict(state, paths.root, task_id, details,
-              "merge conflict (repairable): " .. conflict_note(details))
-            log(paths, "epic " .. task_id .. " conflicted on "
-              .. (#details.files > 0 and table.concat(details.files, ", ") or "unknown")
-              .. "; the implementer redid the branch and the merge is retried")
-            repaired = true
+            if not fresh then
+              -- The branch cannot even be put on the fresh base: no
+              -- implementer turn can redo it, so retrying would only spin.
+              log(paths, "epic " .. task_id .. ": cannot put " .. branch
+                .. " on origin/" .. tostring(base) .. ": " .. tostring(reset_err))
+              impl_err = reset_err
+              break
+            end
+            local impl = deps.implement.run({
+              task = task,
+              repo = paths.repo,
+              state = state,
+              root = paths.root,
+              git = deps.git,
+              worktree_root = paths.worktrees,
+              tasks_dir = paths.tasks,
+              remote = "origin",
+              base_ref = base,
+              runner = runner,
+              session_opts = session.implementer,
+              state_root = paths.runs,
+              ctx = opts.ctx,
+              max_attempts = 1,
+              deadline_secs = opts.deadline_secs,
+              conflict = details,
+              -- The branch must not be pushed by the implementer yet: right
+              -- after the reset it is still on the fresh base, and `run_impl`
+              -- pushes even a no-op turn, which would force `origin/<branch>`
+              -- back to the base and wipe the work the subtasks merged. The
+              -- runtime pushes once the turn has actually redone the branch.
+              push = false,
+            }) or nil
+            repairs = repairs + 1
+            -- The attempt is spent now, and persisted with the boolean
+            -- fallback so a reload continues from the same count.
+            pcall(state.set_fields, paths.root, task_id, {
+              conflict_retried = true,
+              conflict_retries = repairs,
+            })
+            if impl and impl.ok then
+              -- A turn that makes no commit is not a repair: `run_impl`
+              -- returns `ok = true, no_changes = true` when the tree was
+              -- already clean, and right after the reset the local branch sits
+              -- exactly on `origin/<base>`. The head must differ from the
+              -- fresh base before the merge is relaunched.
+              local impl_wt = impl.ctx and impl.ctx.worktree or epic_wt
+              local head = is_non_empty(impl.sha) and impl.sha or nil
+              if not head and type(deps.git.head_sha) == "function" then
+                head = deps.git.head_sha(impl_wt)
+              end
+              if not head and type(deps.git.rev_parse) == "function" then
+                head = deps.git.rev_parse(impl_wt, branch)
+              end
+              local redone = not impl.no_changes
+                and is_non_empty(head) and head ~= base_sha
+              if redone then
+                -- The PR is the same PR: the repaired branch is pushed onto
+                -- it, so no second PR is opened. The repairable note is
+                -- written only now: the implementer has actually redone the
+                -- branch, so a "will be redone" note can never be followed by
+                -- a `failed` on the same turn.
+                local pushed, push_err = true, nil
+                if type(deps.git.push) == "function" then
+                  pushed, push_err = deps.git.push(impl_wt, branch, { remote = "origin", force = true })
+                else
+                  pushed, push_err = false, "no push available"
+                end
+                if pushed then
+                  journal_conflict(state, paths.root, task_id, details,
+                    "merge conflict (repairable): " .. conflict_note(details))
+                  log(paths, "epic " .. task_id .. " conflicted on "
+                    .. (#details.files > 0 and table.concat(details.files, ", ") or "unknown")
+                    .. "; the implementer redid the branch and the merge is retried")
+                  repaired = true
+                else
+                  -- The redone branch never reached `origin`: relaunching the
+                  -- merge would replay the old conflicting tip. Retry under
+                  -- the bound with the push failure as the reason.
+                  impl_err = "cannot push the redone epic branch: " .. tostring(push_err)
+                  log(paths, "epic " .. task_id .. ": repair attempt "
+                    .. tostring(repairs) .. " could not push " .. branch .. ": "
+                    .. tostring(push_err))
+                end
+              else
+                impl_err = string.format(
+                  "the implementer made no commit on %s; the branch is still at the fresh base %s",
+                  tostring(branch), tostring(base_sha))
+                log(paths, "epic " .. task_id .. ": repair attempt "
+                  .. tostring(repairs) .. " made no commit on " .. branch)
+              end
+            else
+              -- The implementer could not redo the branch: the attempt is
+              -- spent, and the cycle re-enters while the bound has room. Only
+              -- an exhausted budget escalates, with the reason attached.
+              if type(impl) == "table" then
+                impl_err = impl.error or impl.reason
+              else
+                impl_err = reset_err
+              end
+              log(paths, "epic " .. task_id .. ": repair attempt "
+                .. tostring(repairs) .. " failed: " .. tostring(impl_err))
+            end
           end
         end
 
@@ -1168,6 +1285,17 @@ function M.new(deps)
           -- human gets the means to act: the files, the base with its SHA and
           -- the exact command — never a failure without a message.
           local message = conflict_escalation(details)
+          local diagnosis = conflict_diagnosis(message)
+          if is_non_empty(impl_err) then
+            -- When the repair turn itself failed under the bound, the human
+            -- must know why no repair happened. The reason goes into the
+            -- remedy rather than the message: the failure line caps each field
+            -- separately, and appending to the message would truncate the
+            -- files, the base SHA or the command away.
+            diagnosis.remedy = string.format(
+              "%s (the implementer could not redo the branch: %s)",
+              diagnosis.remedy, tostring(impl_err))
+          end
           journal_conflict(state, paths.root, task_id, details, message)
           if worktree == epic_wt and type(deps.git.worktree_remove) == "function" then
             pcall(deps.git.worktree_remove, paths.repo, epic_wt, { force = true })
@@ -1175,7 +1303,7 @@ function M.new(deps)
           return {
             ok = false,
             error = message,
-            diagnosis = conflict_diagnosis(message),
+            diagnosis = diagnosis,
             phase = "merge",
             task_id = task_id,
             epic = true,
