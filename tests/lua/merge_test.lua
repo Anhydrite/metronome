@@ -65,18 +65,56 @@ return function()
 
   -- The fake `gh`: it logs every argv, merges unless a failure file exists, and
   -- always answers `pr view` with a MERGED PR. The failure file lets a test pick
-  -- the exact `gh` complaint without writing a script per mode.
+  -- the exact `gh` complaint without writing a script per mode. The view file
+  -- holds one JSON answer per line (the last line repeats), so a test can make
+  -- `pr view` answer UNKNOWN first and MERGEABLE next; a line starting with `!`
+  -- is an error, printed on stderr.
   local gh = maki.fs.joinpath(scripts, "gh")
+  local viewfile = maki.fs.joinpath(base, "gh-view")
+  local viewcount = maki.fs.joinpath(base, "gh-view-count")
+  local failcount = maki.fs.joinpath(base, "gh-fail-count")
+  local mergecount = maki.fs.joinpath(base, "gh-merge-count")
   maki.fs.write(gh, table.concat({
     "#!/usr/bin/env bash",
     "LOG=" .. quote(log),
     "FAIL=" .. quote(failfile),
+    "FAILN=" .. quote(failcount),
+    "MCOUNT=" .. quote(mergecount),
+    "VIEW=" .. quote(viewfile),
+    "VIEWN=" .. quote(viewcount),
     "printf '%s\\n' \"$*\" >> \"$LOG\"",
     "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"merge\" ]; then",
-    "  if [ -f \"$FAIL\" ]; then cat \"$FAIL\" >&2; exit 1; fi",
+    "  if [ -f \"$FAIL\" ]; then",
+    "    n=0",
+    "    [ -f \"$FAILN\" ] && n=$(cat \"$FAILN\")",
+    "    if [ \"$n\" -gt 0 ]; then",
+    "      m=0",
+    "      [ -f \"$MCOUNT\" ] && m=$(cat \"$MCOUNT\")",
+    "      m=$((m + 1))",
+    "      printf '%s' \"$m\" > \"$MCOUNT\"",
+    "      if [ $m -le $n ]; then cat \"$FAIL\" >&2; exit 1; fi",
+    "    else",
+    "      cat \"$FAIL\" >&2; exit 1",
+    "    fi",
+    "  fi",
     "  exit 0",
     "fi",
     "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then",
+    "  if [ -f \"$VIEW\" ]; then",
+    "    n=0",
+    "    [ -f \"$VIEWN\" ] && n=$(cat \"$VIEWN\")",
+    "    n=$((n + 1))",
+    "    printf '%s' \"$n\" > \"$VIEWN\"",
+    "    total=$(wc -l < \"$VIEW\" | tr -d ' ')",
+    "    idx=$n",
+    "    [ $idx -gt $total ] && idx=$total",
+    "    line=$(sed -n \"${idx}p\" \"$VIEW\")",
+    "    case \"$line\" in",
+    "      '!'*) printf '%s\\n' \"${line#!}\" >&2; exit 1 ;;",
+    "    esac",
+    "    printf '%s\\n' \"$line\"",
+    "    exit 0",
+    "  fi",
     "  echo '{\"number\":42,\"url\":\"https://github.com/example/shop/pull/42\",\"state\":\"MERGED\"}'",
     "  exit 0",
     "fi",
@@ -86,6 +124,62 @@ return function()
   }, "\n"))
   code, out = sh({ "chmod", "+x", gh })
   eq(code, 0, "fake gh is executable: " .. out:sub(1, 80))
+
+  -- The fake `pr view` answers from the view file, one line per call. A test
+  -- that injects its own sleep also proves no real second went by; these
+  -- helpers only shape the answers.
+  local function set_views(list)
+    maki.fs.rm(viewcount)
+    maki.fs.write(viewfile, table.concat(list, "\n") .. "\n")
+  end
+
+  local function clear_views()
+    maki.fs.rm(viewfile)
+    maki.fs.rm(viewcount)
+  end
+
+  -- Make the next `times` merge commands fail with `message`; 0 means every
+  -- merge fails until the failure file is removed.
+  local function fail_merges(message, times)
+    maki.fs.rm(mergecount)
+    maki.fs.write(failfile, message .. "\n")
+    if times then
+      maki.fs.write(failcount, tostring(times))
+    else
+      maki.fs.rm(failcount)
+    end
+  end
+
+  local function clear_failures()
+    maki.fs.rm(failfile)
+    maki.fs.rm(failcount)
+    maki.fs.rm(mergecount)
+  end
+
+  local function count_log(needle)
+    local n = 0
+    for line in read_log():gmatch("[^\n]+") do
+      if line:find(needle, 1, true) then
+        n = n + 1
+      end
+    end
+    return n
+  end
+
+  local function view_json(state, mergeable, base_ref)
+    local parts = {
+      '"number":42',
+      '"url":"https://github.com/example/shop/pull/42"',
+      '"state":"' .. state .. '"',
+    }
+    if mergeable then
+      parts[#parts + 1] = '"mergeable":"' .. mergeable .. '"'
+    end
+    if base_ref then
+      parts[#parts + 1] = '"baseRefName":"' .. base_ref .. '"'
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+  end
 
   -- Helpers -------------------------------------------------------------------
 
@@ -247,6 +341,84 @@ return function()
   has(nmerr, "cannot be merged", "not-mergeable message is readable")
   maki.fs.rm(failfile)
 
+  -- merge_pr: not mergeable on a CONFLICTING PR is a repairable conflict ------
+
+  -- GitHub answers "not mergeable" for a real conflict; the classifier alone
+  -- cannot tell it from a closed PR. The PR is re-read, and CONFLICTING becomes
+  -- the conflict shape the rebase path already produces (conflict=true, base,
+  -- upstream, rebase_command), never the opaque classified failure.
+  maki.fs.write(log, "")
+  fail_merges("Pull request is not mergeable")
+  set_views({ view_json("OPEN", "CONFLICTING", "main") })
+
+  local cf, cferr, cfdetails = merge.merge_pr({ git = git, gh = gh, pr = 42, worktree = wt1 })
+  eq(cf, nil, "a conflicting PR is not reported as merged")
+  eq(type(cfdetails), "table", "a conflicting PR returns conflict details")
+  eq(cfdetails and cfdetails.conflict, true, "the details flag the conflict")
+  eq(cfdetails and cfdetails.base, "main", "the conflict names the base")
+  eq(cfdetails and cfdetails.upstream, "origin/main", "the conflict names the upstream")
+  eq(cfdetails and cfdetails.rebase_command, "git rebase origin/main",
+    "the conflict names the command")
+  eq(cfdetails and cfdetails.pr, 42, "the conflict names the PR")
+  eq(type(cferr), "string", "the conflict explains itself")
+  has(cferr, "#42", "the message names the PR")
+  has(cferr, "main", "the message names the base")
+  has(cferr, "git rebase origin/main", "the message names the command")
+  eq(cferr:find("not_mergeable", 1, true), nil,
+    "the conflict message is not the classified failure")
+  eq(count_log("pr view 42 --json number,url,state,mergeable,baseRefName"), 1,
+    "the PR was re-read with mergeable and base before concluding")
+  clear_failures()
+  clear_views()
+
+  -- merge_pr: an UNKNOWN PR waits a bounded number of times -------------------
+
+  maki.fs.write(log, "")
+  fail_merges("Pull request is not mergeable")
+  set_views({ view_json("OPEN", "UNKNOWN", "main") })
+
+  local sleeps = {}
+  local un, unerr = merge.merge_pr({
+    git = git, gh = gh, pr = 42, worktree = wt1,
+    mergeable_attempts = 2,
+    mergeable_delay_ms = 1234,
+    sleep = function(ms) sleeps[#sleeps + 1] = ms end,
+  })
+  eq(un, nil, "an UNKNOWN PR is not merged")
+  eq(type(unerr), "string", "an UNKNOWN PR explains itself")
+  has(unerr, "UNKNOWN", "the failure names UNKNOWN explicitly")
+  has(unerr, "2 re-reads", "the failure counts the bounded re-reads")
+  eq(#sleeps, 1, "two re-reads mean one bounded wait")
+  eq(sleeps[1], 1234, "the injected delay is used, not a hard-coded one")
+  eq(count_log("pr view"), 2, "the PR was re-read exactly the injected bound")
+  clear_failures()
+  clear_views()
+
+  -- merge_pr: UNKNOWN then MERGEABLE succeeds without a conflict --------------
+
+  maki.fs.write(log, "")
+  fail_merges("Pull request is not mergeable", 1)
+  set_views({
+    view_json("OPEN", "UNKNOWN", "main"),
+    view_json("OPEN", "MERGEABLE", "main"),
+    view_json("MERGED", nil, "main"),
+  })
+
+  local sleeps2 = {}
+  local dn, dnerr = merge.merge_pr({
+    git = git, gh = gh, pr = 42, worktree = wt1,
+    mergeable_attempts = 3,
+    sleep = function(ms) sleeps2[#sleeps2 + 1] = ms end,
+  })
+  eq(dnerr, nil, "an UNKNOWN-then-mergeable PR has no error: " .. tostring(dnerr))
+  eq(dn and dn.ok, true, "the retried merge is ok")
+  eq(dn and dn.state, "merged", "the retried merge reports merged")
+  eq(dn and dn.conflict, nil, "the retried merge is not a conflict")
+  eq(#sleeps2, 1, "one wait before the merge could be retried")
+  eq(count_log("pr merge 42"), 2, "the merge was retried exactly once")
+  clear_failures()
+  clear_views()
+
   -- verify_after_merge --------------------------------------------------------
 
   local temp = maki.fs.joinpath(root, "merge-check", id1)
@@ -401,6 +573,87 @@ return function()
   eq(note_found, true, "journal note records the merge failure")
   eq(state.deploy_pending(root).base, "keepme", "a failed merge does not overwrite the pending base")
   maki.fs.rm(failfile)
+
+  -- run: a CONFLICTING PR is a repairable conflict, not a failure -------------
+
+  -- `gh pr merge` answering "not mergeable" on a PR that is really conflicting
+  -- used to write `failed` and lose the diagnosis. The PR is re-read, the
+  -- branch is rebased once for diagnostics only (git.rebase aborts it, leaving
+  -- the worktree clean) to recover the files and hunks, and the status stays
+  -- `merging` for the bounded repair.
+  local wt9, id9 = seed_branch()
+  local task9 = seed_task(id9, wt9)
+  maki.fs.write(maki.fs.joinpath(wt9, "README.md"), "# branch edit for a closed PR\n")
+  local csha9, cserr9 = git.commit(wt9, "feat: branch edit for a closed PR")
+  eq(cserr9, nil, "conflict branch commit: " .. tostring(cserr9))
+  eq(type(csha9), "string", "conflict branch commit returns a sha")
+  local pr9_main_sha = advance_main("README.md", "# main edit for a closed PR\n")
+
+  maki.fs.write(log, "")
+  fail_merges("Pull request is not mergeable")
+  set_views({ view_json("OPEN", "CONFLICTING", "main") })
+
+  local res9 = merge.run({
+    task = task9,
+    repo = repo,
+    worktree = wt9,
+    root = root,
+    git = git,
+    state = state,
+    gh = gh,
+    checks = checks,
+    commands = { "true" },
+    pr = 42,
+    base = "main",
+    remote = "origin",
+    -- The branch already conflicts on rebase: skip the pre-merge rebase so the
+    -- failure really comes from `gh pr merge`, as on a closed/conflicting PR.
+    auto_rebase = false,
+  })
+  eq(res9 and res9.ok, false, "a conflicting PR is not a success")
+  eq(res9 and res9.conflict, true, "a conflicting PR is flagged as a conflict")
+  has(res9 and res9.conflict_files, "README.md",
+    "the conflict files come from the diagnostic rebase")
+  eq(type(res9 and res9.conflict_file_list), "table", "conflict_file_list is the raw list")
+  eq(res9 and res9.conflict_file_list and res9.conflict_file_list[1], "README.md",
+    "conflict_file_list names the file")
+  eq(type(res9 and res9.conflict_hunks), "table", "the diagnostic rebase brings the hunks")
+  eq(type(res9 and res9.conflict_commit), "string", "the diagnostic rebase brings the commit")
+  eq(res9 and res9.base, "main", "the conflict names the base")
+  eq(res9 and res9.base_sha, pr9_main_sha, "the conflict carries the base SHA")
+  eq(res9 and res9.upstream, "origin/main", "the conflict names the upstream")
+  eq(res9 and res9.rebase_command, "git rebase origin/main",
+    "the conflict names the exact command")
+  eq(type(res9 and res9.escalation), "string", "an escalation message is produced")
+  has(res9 and res9.escalation, "README.md", "the escalation names the files")
+  has(res9 and res9.escalation, "origin/main", "the escalation names the base")
+  has(res9 and res9.escalation, "git rebase origin/main",
+    "the escalation names the command")
+
+  -- No `failed` write: the runtime sends the task back to implement with the
+  -- files in hand, and the conflict is journaled once, as repairable.
+  local after9 = state.load(root).tasks[id9]
+  eq(after9 and after9.status, "merging", "a conflicting PR leaves the status merging")
+  local failed_note9, repairable_notes9 = false, 0
+  for _, note in ipairs(after9 and after9.notes or {}) do
+    if type(note) == "string" then
+      if note:find("merge failed", 1, true) then failed_note9 = true end
+      if note:find("merge conflict (repairable):", 1, true) then
+        repairable_notes9 = repairable_notes9 + 1
+        has(note, "README.md", "the repairable note names the files")
+        has(note, "origin/main", "the repairable note names the base")
+        has(note, "git rebase origin/main", "the repairable note names the command")
+      end
+    end
+  end
+  eq(failed_note9, false, "a conflicting PR writes no failure note")
+  eq(repairable_notes9, 1, "the repairable note is written exactly once")
+  -- The diagnostic rebase aborted: the worktree is left clean for the repair.
+  local status9, status_out9 = sh({ "git", "-C", wt9, "status", "--porcelain" })
+  eq(status9, 0, "status ran after the diagnostic rebase")
+  eq((status_out9:gsub("%s+$", "")), "", "the worktree is clean after the diagnostic rebase")
+  clear_failures()
+  clear_views()
 
   -- run: post-merge checks red ------------------------------------------------
 
