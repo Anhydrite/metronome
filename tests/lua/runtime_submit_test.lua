@@ -8,211 +8,17 @@
 -- positional ctx wins, `input.ctx` is a fallback, and a missing ctx does not
 -- crash the run.
 
-return function()
-  local runtime = load_module("runtime")
+-- The cases below live in top-level functions rather than in one body:
+-- Lua 5.1 caps a function at 200 locals, and the single `return function()`
+-- that used to hold every case had grown past it (each epic added fixtures).
+-- Each case takes the shared fixtures it reads through `env`, so the body the
+-- harness calls keeps a small, stable local count and the next epic has
+-- headroom. Nothing is skipped: the returned function still calls every case,
+-- in the original order.
 
-  local root = mktmpdir("metronome-runtime-submit")
-  local config = maki.fs.joinpath(root, "config.toml")
-  maki.fs.write(config, "[project]\nrepo = \"/tmp/repo\"\n")
-
-  local paths = {
-    repo = "/tmp/repo",
-    root = root,
-    tasks = maki.fs.joinpath(root, "tasks"),
-    worktrees = maki.fs.joinpath(root, "worktrees"),
-    runs = maki.fs.joinpath(root, "runs"),
-    prompts = maki.fs.joinpath(root, "prompts"),
-    config = config,
-  }
-
-  local captured
-  local captured_answer
-  local ticked = false
-  local deps = {
-    config = {
-      load = function()
-        return { project = { repo = "/tmp/repo", base_ref = "main" } }
-      end,
-    },
-    roles = {
-      session_opts = function()
-        return { system = "", model_spec = "test/model", thinking = "low", tools = {} }
-      end,
-    },
-    qualify = {
-      run = function(opts)
-        captured = opts
-        return { ok = false, error = "stop after capture" }
-      end,
-    },
-    paths = function()
-      return paths
-    end,
-    spawn = function(fn)
-      fn()
-    end,
-    wait_turn_end = false,
-    questions = {
-      answer = function(_, _, answers, opts)
-        captured_answer = { answers = answers, opts = opts }
-        return { applied = 1, answered = 1, tasks = { "T-20261114-0001" } }
-      end,
-    },
-    analyze = {
-      gate = function()
-        return { ok = true }
-      end,
-    },
-    pipeline = {
-      tick = function()
-        ticked = true
-        return { ok = true, started = {} }
-      end,
-    },
-    state = {
-      load = function()
-        return { tasks = {} }
-      end,
-    },
-    runner = {}, git = {}, checks = {}, converge = {}, review = {}, merge = {},
-    deploy = {}, calibrate = {}, fence = {}, mode = {},
-    -- The real slugger: the epic branch is named after the intention.
-    implement = { slug = function(text, max)
-      local out = tostring(text):lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
-      if max and #out > max then out = out:sub(1, max):gsub("%-+$", "") end
-      return out
-    end },
-  }
-
-  local rt = runtime.new(deps)
-  eq(type(rt), "table", "runtime wires with injected deps")
-
-  -- Positional ctx (the tools.lua path) -------------------------------------
-
-  local ctx = { marker = "positional" }
-  captured = nil
-  local res = rt.submit({ intention = "add an icon", fast = false }, ctx)
-  eq(type(res), "table", "submit returns a result table")
-  eq(res and res.error, "stop after capture",
-    "submit waits for qualification and returns its result")
-  eq(type(captured), "table", "qualify.run was called")
-  eq(captured and captured.ctx, ctx, "submit forwards the positional ctx to qualify")
-
-  -- Each qualification gets its own run directory: two concurrent qualifiers
-  -- must not share runs/qualify/qualify/1.
-  local first_key = captured and captured.task_id
-  eq(type(first_key), "string", "the qualifier receives a run key")
-  rt.submit({ intention = "add another icon", fast = false }, ctx)
-  eq(captured and captured.task_id ~= first_key, true,
-    "each qualification gets its own run key")
-
-  -- Fast lane: a short, unambiguous intention skips the qualifier ----------
-
-  local fast_applied
-  deps.qualify.next_id = function()
-    return "T-fast"
-  end
-  deps.qualify.apply = function(_, _, result)
-    fast_applied = result
-    return { ok = true, tasks = { { id = "T-fast", title = result.tasks[1].title } } }
-  end
-  captured = nil
-  local fast = rt.submit({ intention = "add a red button" }, ctx)
-  eq(fast and fast.fast, true, "short intention uses the fast lane")
-  eq(captured, nil, "fast lane does not call the qualifier")
-  eq(fast_applied and fast_applied.tasks and #fast_applied.tasks, 1, "fast lane creates one task")
-  eq(fast_applied and fast_applied.tasks[1].files and #fast_applied.tasks[1].files, 0,
-    "fast task declares no files, the implementer chooses them")
-  eq(fast_applied and fast_applied.tasks[1].checks and #fast_applied.tasks[1].checks, 0,
-    "fast task uses the project default checks")
-
-  -- The fast lane declares the files the intention names, so the scheduler can
-  -- prove two tasks disjoint instead of running them one at a time.
-  local listed_ref = nil
-  deps.git.ls_tree = function(_, ref)
-    listed_ref = ref
-    return { "public/styles.css", "README.md" }
-  end
-  local inferred_text, inferred_files = nil, nil
-  deps.qualify.infer_files = function(text, files)
-    inferred_text, inferred_files = text, files
-    return { "public/styles.css" }
-  end
-  local fast_files = rt.submit({ intention = "change public/styles.css to red" }, ctx)
-  eq(fast_files and fast_files.fast, true, "a short intention still takes the fast lane")
-  eq(listed_ref, "origin/main", "the fast lane reads the base ref")
-  eq(inferred_text, "change public/styles.css to red", "infer_files receives the intention")
-  eq(type(inferred_files), "table", "infer_files receives the base tree")
-  eq(fast_applied and fast_applied.tasks[1].files and fast_applied.tasks[1].files[1],
-    "public/styles.css", "the fast task declares the file the intention names")
-
-  -- complexity: the caller's judgement overrides the wording heuristic ------
-  captured = nil
-  local forced_full = rt.submit({ intention = "add a red button", complexity = "full" }, ctx)
-  eq(type(captured), "table", "complexity=full calls the qualifier")
-  eq(forced_full and forced_full.fast, nil, "complexity=full does not take the fast lane")
-
-  captured = nil
-  local forced_fast = rt.submit({ intention = "redesign the whole checkout flow. also rework the cart", complexity = "fast" }, ctx)
-  eq(captured, nil, "complexity=fast skips the qualifier even for a long intention")
-  eq(forced_fast and forced_fast.fast, true, "complexity=fast takes the fast lane")
-
-  local bad = rt.submit({ intention = "x", complexity = "weird" }, ctx)
-  eq(bad and bad.ok, false, "an unknown complexity is refused")
-  has(tostring(bad and bad.error), "unknown complexity", "the refusal names the problem")
-
-  -- wait = false returns at once with queued = true -------------------------
-
-  captured = nil
-  local queued = rt.submit({ intention = "add an icon", wait = false, fast = false }, ctx)
-  eq(queued and queued.queued, true, "wait=false returns at once with queued=true")
-
-  -- input.ctx fallback ------------------------------------------------------
-
-  local input_ctx = { marker = "input" }
-  captured = nil
-  rt.submit({ intention = "add an icon", ctx = input_ctx, fast = false })
-  eq(captured and captured.ctx, input_ctx, "submit falls back to input.ctx")
-
-  -- No ctx at all must not crash -------------------------------------------
-
-  captured = nil
-  local bare = rt.submit({ intention = "add an icon", fast = false })
-  eq(type(bare), "table", "submit without a ctx returns a result table")
-  eq(rt.last_submit and rt.last_submit.error, "stop after capture",
-    "submit without a ctx still reaches the qualifier")
-
-  -- resolve_ctx is the pure seam -------------------------------------------
-
-  eq(type(runtime.resolve_ctx), "function", "runtime exposes resolve_ctx")
-  eq(runtime.resolve_ctx({}, ctx), ctx, "resolve_ctx prefers the positional ctx")
-  eq(runtime.resolve_ctx({ ctx = input_ctx }), input_ctx, "resolve_ctx reads input.ctx")
-
-  -- Answering resumes the pipeline -----------------------------------------
-
-  local ans = rt.answer({ answers = { q1 = "yes" } }, ctx)
-  rt.run_pending()
-  eq(ans and ans.ok, true, "answer resumes the pipeline")
-  eq(ans and ans.applied and ans.applied.applied, 1, "answer reports the applied count")
-  eq(ticked, true, "answer runs the scheduler instead of leaving tasks in qualifying")
-  eq(captured_answer and captured_answer.opts and captured_answer.opts.tasks_dir, paths.tasks,
-    "answer hands questions.answer the project tasks directory")
-  eq(captured_answer and captured_answer.opts and captured_answer.opts.qualify, deps.qualify,
-    "answer hands questions.answer the qualify module")
-
-  -- A sheet rewrite failure fails metronome_answer --------------------------
-
-  local real_answer = deps.questions.answer
-  deps.questions.answer = function()
-    return nil, "cannot write sheet for T-20261114-0001: read-only file system"
-  end
-  local failed_answer = rt.answer({ answers = { q1 = "yes" } }, ctx)
-  eq(failed_answer and failed_answer.ok, false, "a sheet write failure fails the answer")
-  eq(failed_answer and failed_answer.error,
-    "cannot write sheet for T-20261114-0001: read-only file system",
-    "the answer error names the task whose sheet failed")
-  deps.questions.answer = real_answer
-
+local function case_qualify_remap(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Qualification remaps dependency titles to task ids ---------------------
 
   local set_fields = {}
@@ -321,7 +127,11 @@ return function()
   eq(epic_opts and epic_opts.branch, created_branch and created_branch.name,
     "qualify.apply receives the epic branch")
   eq(epic_opts and epic_opts.base, "main", "qualify.apply receives the project base")
+end
 
+local function case_qualify_positions(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Qualification remaps dependency batch positions to task ids ------------
 
   local set_fields_idx = {}
@@ -406,8 +216,11 @@ return function()
   eq(set_fields_idx["T-2"] and set_fields_idx["T-2"].depends_on
     and set_fields_idx["T-2"].depends_on[1], "T-2",
     "dependency batch positions are remapped to task ids")
+end
 
-
+local function case_retry_dispatch(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Retry re-dispatches the task -------------------------------------------
 
   local implemented = false
@@ -455,7 +268,11 @@ return function()
   eq(rt3.last_background and rt3.last_background.error, "stop after dispatch",
     "retry reports the dispatch result on the background record")
   eq(implemented, true, "retry re-dispatches the task instead of only moving its status")
+end
 
+local function case_background_ctx(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- The role runner receives the background ctx of the task it runs ---------
   --
   -- Regression: `real_runner` was built once in `prepare`, before
@@ -520,7 +337,11 @@ return function()
   rt4.retry({ id = "T1" }, { session = "S1" })
   rt4.run_pending()
   eq(type(runner_ctx), "table", "retry re-dispatches an abandoned task")
+end
 
+local function case_auto_deploy(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Auto-deploy: the merger redeploys right after a green merge -------------
   local deploy_called = false
   local merge_called = false
@@ -637,6 +458,11 @@ return function()
   rt6.run_pending()
   eq(merge_called, false, "auto_merge off does not merge the pull request")
   eq(deploy_called, false, "auto_merge off does not deploy")
+end
+
+local function case_parallelism(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Parallelism: the drain starts every selected task, up to max_parallel ----
   local tick_parallel = nil
   local dispatched = 0
@@ -712,6 +538,11 @@ return function()
   eq(tick_parallel, 3,
     "the drain ticks with the configured max_parallel, not a hardcoded 1")
   eq(ticks >= 2, true, "the drain stops once nothing else is ready")
+end
+
+local function case_stop_and_delete(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Stop: cancels the spawn and parks the task as abandoned -----------------
   local cancelled = 0
   local stop_status = "running"
@@ -809,6 +640,11 @@ return function()
   local archive_list = rt9.archive({})
   eq(archive_list and archive_list.ok, true, "archive lists the snapshots")
   eq(archive_list and archive_list.count, 1, "archive counts the snapshots")
+end
+
+local function case_resume(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Resume drains the queue even when nothing was active --------------------
   -- A task that was `ready` when the host died has no session to revive; it
   -- must still start, without waiting for the next submit.
@@ -858,6 +694,14 @@ return function()
   local resumed_ok = rt9.resume()
   eq(resumed_ok and resumed_ok.ok, true, "resume succeeds with only a queued task")
   eq(ticked, true, "resume drains the queue even when no task was active")
+end
+
+local function case_merge_conflict(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
+  -- The pipeline tick dispatches the task once; this counter used to be
+  -- shared with the parallelism case above, in the same flat scope.
+  local ticks = 0
   -- Merge conflict: the branch goes back to the fresh base and the work is
   -- redone once, without a human ------------------------------------------
   local record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
@@ -945,8 +789,11 @@ return function()
   eq(merge_calls, 2, "the merge is attempted again after the repair")
   eq(record.conflict_retried, true, "the repair is recorded on the task")
   eq(record.status, "merged", "the repaired task merges")
+end
 
-  do
+local function case_conflict_repair(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- A merge conflict is a real implementation cycle, not a merge relaunch ----
   --
   -- `merge.run` returns a conflict (as it does after a failed rebase): the
@@ -1694,8 +1541,11 @@ exit 1
   eq(rendered_config:find("%[merge%]%s*auto_merge") ~= nil, true, "the config has a merge section")
   eq(rendered_config:find("max_conflict_retries = 2", 1, true) ~= nil, true,
     "render_config emits max_conflict_retries")
-  end
+end
 
+local function case_prune(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Prune: an open PR or a branch whose task is dead is an orphan -----------
   local prune_closed, prune_deleted = {}, {}
   local prune_repo = nil
@@ -1810,7 +1660,11 @@ exit 1
   eq(abandoned.prune and abandoned.prune.ok, true, "abandon prunes automatically")
   has(table.concat(auto_closed, ","), "22", "abandon closes the orphan PR")
   has(table.concat(auto_deleted, ","), "metronome/abandonme", "abandon deletes the dead branch")
+end
 
+local function case_config_base(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- config: a base branch that does not exist on origin is refused ----------
   local cfg_root = test_dir("runtime-config")
   local cfg_path = maki.fs.joinpath(cfg_root, "config.toml")
@@ -1870,7 +1724,11 @@ auto_deploy = false
   eq(bad_base and bad_base.ok, false, "a base branch missing on origin is refused")
   has(tostring(bad_base and bad_base.error), "nope", "the refusal names the branch")
   eq(asked_pattern, "nope", "the branch is checked against origin")
+end
 
+local function case_review_loop(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- A review that asks for changes is the next round's work ---------------
   --
   -- The runtime must call the bounded review loop with a fix callback, hand
@@ -1968,7 +1826,11 @@ auto_deploy = false
     end
   end
   eq(saw_running, true, "a fix round moves the task back to running")
+end
 
+local function case_rebase_push(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- A rebase before the checks rewrites the branch: it must be pushed -------
   --
   -- The remote would otherwise keep the pre-rebase commits while the review
@@ -2057,7 +1919,11 @@ auto_deploy = false
   eq(push_calls[1] and push_calls[1].branch, "b", "the push names the task branch")
   eq(order[1], "push", "the push happens before the checks")
   eq(order[2], "checks", "the checks run on the pushed branch")
+end
 
+local function case_rebase_conflict(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- A rebase conflict on the fresh base is repaired, not fatal -------------
   --
   -- The base moved and the same lines changed. The branch is reset to the
@@ -2150,7 +2016,11 @@ auto_deploy = false
   eq(resets, 2, "each rebase conflict resets the branch to the fresh base")
   eq(impl_attempts, 3, "the work is redone after each conflict")
   eq(rebase_attempts, 3, "the rebase is retried after each reset")
+end
 
+local function case_second_conflict(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- A task that already repaired one conflict can repair the next ----------
   --
   -- The base can move more than once (several PRs merging), so the bound is a
@@ -2239,6 +2109,11 @@ auto_deploy = false
   eq(second_resets, 1, "a task with one earlier repair still repairs the next conflict")
   eq(second_impl, 2, "the work is redone on the fresh base")
   eq(second_task.conflict_retries, 2, "the repair counter grows")
+end
+
+local function case_epic_subtask(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Epic branches ----------------------------------------------------------
   --
   -- The base a task is cut from, merged into and diffed against is per task:
@@ -2342,7 +2217,11 @@ auto_deploy = false
     "a subtask does not mark the epic branch as a deployable base")
   eq(subtask_deploy, false, "a subtask never deploys")
   eq(subtask.status, "merged", "a subtask stops at merged")
+end
 
+local function case_epic_task(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- An epic task skips implement, converge and review: it pushes the branch,
   -- opens the single PR to the project base, merges it and deploys.
   local epic_record = {
@@ -2452,7 +2331,11 @@ auto_deploy = false
   eq(epic_merge_opts and epic_merge_opts.auto_rebase, true, "the epic honours the configured auto_rebase")
   eq(epic_seen.deploy, 1, "the epic deploys after its merge")
   eq(epic_record.status, "deployed", "the epic ends deployed")
+end
 
+local function case_failure_policy(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
   -- Failure policy and unblockable drain ------------------------------------
   --
   -- A failed task and a stopped workflow are the worst outcomes: every failure
@@ -3757,5 +3640,240 @@ auto_deploy = false
 
   maki.session.notify = saved_notify
   maki.session.prompt = saved_prompt
+
+end
+
+return function()
+  local runtime = load_module("runtime")
+
+  local root = mktmpdir("metronome-runtime-submit")
+  local config = maki.fs.joinpath(root, "config.toml")
+  maki.fs.write(config, "[project]\nrepo = \"/tmp/repo\"\n")
+
+  local paths = {
+    repo = "/tmp/repo",
+    root = root,
+    tasks = maki.fs.joinpath(root, "tasks"),
+    worktrees = maki.fs.joinpath(root, "worktrees"),
+    runs = maki.fs.joinpath(root, "runs"),
+    prompts = maki.fs.joinpath(root, "prompts"),
+    config = config,
+  }
+
+  local captured
+  local captured_answer
+  local ticked = false
+  local deps = {
+    config = {
+      load = function()
+        return { project = { repo = "/tmp/repo", base_ref = "main" } }
+      end,
+    },
+    roles = {
+      session_opts = function()
+        return { system = "", model_spec = "test/model", thinking = "low", tools = {} }
+      end,
+    },
+    qualify = {
+      run = function(opts)
+        captured = opts
+        return { ok = false, error = "stop after capture" }
+      end,
+    },
+    paths = function()
+      return paths
+    end,
+    spawn = function(fn)
+      fn()
+    end,
+    wait_turn_end = false,
+    questions = {
+      answer = function(_, _, answers, opts)
+        captured_answer = { answers = answers, opts = opts }
+        return { applied = 1, answered = 1, tasks = { "T-20261114-0001" } }
+      end,
+    },
+    analyze = {
+      gate = function()
+        return { ok = true }
+      end,
+    },
+    pipeline = {
+      tick = function()
+        ticked = true
+        return { ok = true, started = {} }
+      end,
+    },
+    state = {
+      load = function()
+        return { tasks = {} }
+      end,
+    },
+    runner = {}, git = {}, checks = {}, converge = {}, review = {}, merge = {},
+    deploy = {}, calibrate = {}, fence = {}, mode = {},
+    -- The real slugger: the epic branch is named after the intention.
+    implement = { slug = function(text, max)
+      local out = tostring(text):lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+      if max and #out > max then out = out:sub(1, max):gsub("%-+$", "") end
+      return out
+    end },
+  }
+
+  local rt = runtime.new(deps)
+  eq(type(rt), "table", "runtime wires with injected deps")
+
+  -- Positional ctx (the tools.lua path) -------------------------------------
+
+  local ctx = { marker = "positional" }
+  captured = nil
+  local res = rt.submit({ intention = "add an icon", fast = false }, ctx)
+  eq(type(res), "table", "submit returns a result table")
+  eq(res and res.error, "stop after capture",
+    "submit waits for qualification and returns its result")
+  eq(type(captured), "table", "qualify.run was called")
+  eq(captured and captured.ctx, ctx, "submit forwards the positional ctx to qualify")
+
+  -- Each qualification gets its own run directory: two concurrent qualifiers
+  -- must not share runs/qualify/qualify/1.
+  local first_key = captured and captured.task_id
+  eq(type(first_key), "string", "the qualifier receives a run key")
+  rt.submit({ intention = "add another icon", fast = false }, ctx)
+  eq(captured and captured.task_id ~= first_key, true,
+    "each qualification gets its own run key")
+
+  -- Fast lane: a short, unambiguous intention skips the qualifier ----------
+
+  local fast_applied
+  deps.qualify.next_id = function()
+    return "T-fast"
+  end
+  deps.qualify.apply = function(_, _, result)
+    fast_applied = result
+    return { ok = true, tasks = { { id = "T-fast", title = result.tasks[1].title } } }
+  end
+  captured = nil
+  local fast = rt.submit({ intention = "add a red button" }, ctx)
+  eq(fast and fast.fast, true, "short intention uses the fast lane")
+  eq(captured, nil, "fast lane does not call the qualifier")
+  eq(fast_applied and fast_applied.tasks and #fast_applied.tasks, 1, "fast lane creates one task")
+  eq(fast_applied and fast_applied.tasks[1].files and #fast_applied.tasks[1].files, 0,
+    "fast task declares no files, the implementer chooses them")
+  eq(fast_applied and fast_applied.tasks[1].checks and #fast_applied.tasks[1].checks, 0,
+    "fast task uses the project default checks")
+
+  -- The fast lane declares the files the intention names, so the scheduler can
+  -- prove two tasks disjoint instead of running them one at a time.
+  local listed_ref = nil
+  deps.git.ls_tree = function(_, ref)
+    listed_ref = ref
+    return { "public/styles.css", "README.md" }
+  end
+  local inferred_text, inferred_files = nil, nil
+  deps.qualify.infer_files = function(text, files)
+    inferred_text, inferred_files = text, files
+    return { "public/styles.css" }
+  end
+  local fast_files = rt.submit({ intention = "change public/styles.css to red" }, ctx)
+  eq(fast_files and fast_files.fast, true, "a short intention still takes the fast lane")
+  eq(listed_ref, "origin/main", "the fast lane reads the base ref")
+  eq(inferred_text, "change public/styles.css to red", "infer_files receives the intention")
+  eq(type(inferred_files), "table", "infer_files receives the base tree")
+  eq(fast_applied and fast_applied.tasks[1].files and fast_applied.tasks[1].files[1],
+    "public/styles.css", "the fast task declares the file the intention names")
+
+  -- complexity: the caller's judgement overrides the wording heuristic ------
+  captured = nil
+  local forced_full = rt.submit({ intention = "add a red button", complexity = "full" }, ctx)
+  eq(type(captured), "table", "complexity=full calls the qualifier")
+  eq(forced_full and forced_full.fast, nil, "complexity=full does not take the fast lane")
+
+  captured = nil
+  local forced_fast = rt.submit({ intention = "redesign the whole checkout flow. also rework the cart", complexity = "fast" }, ctx)
+  eq(captured, nil, "complexity=fast skips the qualifier even for a long intention")
+  eq(forced_fast and forced_fast.fast, true, "complexity=fast takes the fast lane")
+
+  local bad = rt.submit({ intention = "x", complexity = "weird" }, ctx)
+  eq(bad and bad.ok, false, "an unknown complexity is refused")
+  has(tostring(bad and bad.error), "unknown complexity", "the refusal names the problem")
+
+  -- wait = false returns at once with queued = true -------------------------
+
+  captured = nil
+  local queued = rt.submit({ intention = "add an icon", wait = false, fast = false }, ctx)
+  eq(queued and queued.queued, true, "wait=false returns at once with queued=true")
+
+  -- input.ctx fallback ------------------------------------------------------
+
+  local input_ctx = { marker = "input" }
+  captured = nil
+  rt.submit({ intention = "add an icon", ctx = input_ctx, fast = false })
+  eq(captured and captured.ctx, input_ctx, "submit falls back to input.ctx")
+
+  -- No ctx at all must not crash -------------------------------------------
+
+  captured = nil
+  local bare = rt.submit({ intention = "add an icon", fast = false })
+  eq(type(bare), "table", "submit without a ctx returns a result table")
+  eq(rt.last_submit and rt.last_submit.error, "stop after capture",
+    "submit without a ctx still reaches the qualifier")
+
+  -- resolve_ctx is the pure seam -------------------------------------------
+
+  eq(type(runtime.resolve_ctx), "function", "runtime exposes resolve_ctx")
+  eq(runtime.resolve_ctx({}, ctx), ctx, "resolve_ctx prefers the positional ctx")
+  eq(runtime.resolve_ctx({ ctx = input_ctx }), input_ctx, "resolve_ctx reads input.ctx")
+
+  -- Answering resumes the pipeline -----------------------------------------
+
+  local ans = rt.answer({ answers = { q1 = "yes" } }, ctx)
+  rt.run_pending()
+  eq(ans and ans.ok, true, "answer resumes the pipeline")
+  eq(ans and ans.applied and ans.applied.applied, 1, "answer reports the applied count")
+  eq(ticked, true, "answer runs the scheduler instead of leaving tasks in qualifying")
+  eq(captured_answer and captured_answer.opts and captured_answer.opts.tasks_dir, paths.tasks,
+    "answer hands questions.answer the project tasks directory")
+  eq(captured_answer and captured_answer.opts and captured_answer.opts.qualify, deps.qualify,
+    "answer hands questions.answer the qualify module")
+
+  -- A sheet rewrite failure fails metronome_answer --------------------------
+
+  local real_answer = deps.questions.answer
+  deps.questions.answer = function()
+    return nil, "cannot write sheet for T-20261114-0001: read-only file system"
+  end
+  local failed_answer = rt.answer({ answers = { q1 = "yes" } }, ctx)
+  eq(failed_answer and failed_answer.ok, false, "a sheet write failure fails the answer")
+  eq(failed_answer and failed_answer.error,
+    "cannot write sheet for T-20261114-0001: read-only file system",
+    "the answer error names the task whose sheet failed")
+  deps.questions.answer = real_answer
+
+
+  -- The fixtures the case functions read. Passing them explicitly keeps this
+  -- function well under the Lua 5.1 limit of 200 locals.
+  local env = {
+    runtime = runtime, root = root, config = config, paths = paths,
+    deps = deps, ctx = ctx,
+  }
+
+  case_qualify_remap(env)
+  case_qualify_positions(env)
+  case_retry_dispatch(env)
+  case_background_ctx(env)
+  case_auto_deploy(env)
+  case_parallelism(env)
+  case_stop_and_delete(env)
+  case_resume(env)
+  case_merge_conflict(env)
+  case_conflict_repair(env)
+  case_prune(env)
+  case_config_base(env)
+  case_review_loop(env)
+  case_rebase_push(env)
+  case_rebase_conflict(env)
+  case_second_conflict(env)
+  case_epic_subtask(env)
+  case_epic_task(env)
+  case_failure_policy(env)
 
 end
