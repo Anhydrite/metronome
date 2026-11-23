@@ -431,12 +431,13 @@ return function()
   eq(#dead_tick.started, 0, "an abandoned task is never a dispatch candidate")
   eq(#dead_dispatched, 0, "an abandoned task is never resurrected")
 
-  -- Even a stale flag cannot revive a dead task: the candidate loop refuses
-  -- terminal statuses outright, so a bad journal write stays inert.
+  -- An `abandoned` task carrying the wait is an explicit human retry, so the
+  -- drain must dispatch it. `metronome_retry` accepts `abandoned` and is the only
+  -- writer that sets the flag on one; the cancel paths clear it as shown above.
   state.set_fields(dead_root, "T-20261122-x001", {
     slot_wait = true, slot_wait_since = "2026-11-22T22:00:04Z",
   })
-  local stale_tick = pipeline.run({
+  local revived_tick = pipeline.run({
     state = state,
     root = dead_root,
     max_parallel = 1,
@@ -445,9 +446,12 @@ return function()
       dead_dispatched[#dead_dispatched + 1] = t.id
     end,
   })
-  eq(stale_tick.ok, true, "a tick over a stale parked dead task succeeds")
-  eq(#stale_tick.started, 0, "a stale slot_wait on an abandoned task admits no dispatch")
-  eq(#dead_dispatched, 0, "a stale slot_wait never resurrects an abandoned task")
+  eq(revived_tick.ok, true, "a tick over a retried abandoned task succeeds")
+  eq(#revived_tick.started, 1, "a retried abandoned task is a dispatch candidate")
+  eq(dead_dispatched[1], "T-20261122-x001",
+    "the retried abandoned task is the one dispatched")
+  eq(state.load(dead_root).tasks["T-20261122-x001"].slot_wait, nil,
+    "the dispatch clears the abandoned task's wait")
 
   -- Integration: dependency in the state -----------------------------------
 

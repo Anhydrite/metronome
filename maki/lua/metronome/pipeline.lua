@@ -57,15 +57,16 @@ local DEAD = {
 }
 
 -- Statuses a `slot_wait` task can never be dispatched from. A parked task keeps
--- its original status, and `failed` is a legitimate one (a retried task stays
--- failed while it waits), so this is narrower than `DEAD`: only a task that is
--- cancelled or already landed is refused. `state.transition` clears the wait on
--- these moves, so this is a second line of defence: a stale `slot_wait` on a
--- terminal task must never resurrect it on the next drain.
+-- its original status, and `failed` / `abandoned` are legitimate ones (a retried
+-- task keeps its original status while it waits), so this only refuses a task
+-- that already landed. `state.transition` clears the wait on terminal moves, so
+-- this is a second line of defence: a stale `slot_wait` on a landed task must
+-- never resurrect it on the next drain. An `abandoned` task carrying the wait
+-- is an explicit human retry — the only way to set the flag on one — so the
+-- drain must dispatch it (`abandoned -> running` is a legal transition).
 local NO_DISPATCH = {
   merged = true,
   deployed = true,
-  abandoned = true,
 }
 
 -- How a resumed task gets back to `running`, using only legal transitions.

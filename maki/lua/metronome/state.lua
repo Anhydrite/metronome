@@ -677,8 +677,14 @@ function M.transition(root, task_id, to, extra)
   -- treat the cancelled task as a dispatch candidate — `abandoned -> running` is
   -- a legal transition — and resurrect it on the very slot its cancellation
   -- freed. A dead task is never waiting for a slot.
+  --
+  -- Only a task that actually carries the wait emits the clearing event: an
+  -- ordinary move into an active or terminal status has nothing to clear, and
+  -- appending an empty `slot_wait = false` to every journal move would grow the
+  -- journal (and the projection write) for no state change.
   local fields = type(extra.fields) == "table" and extra.fields or nil
-  if (ACTIVE[to] or TERMINAL[to]) and not (fields and fields.slot_wait ~= nil) then
+  if (ACTIVE[to] or TERMINAL[to]) and task.slot_wait
+    and not (fields and fields.slot_wait ~= nil) then
     local merged = {}
     for key, value in pairs(fields or {}) do
       merged[key] = value

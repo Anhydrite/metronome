@@ -255,6 +255,22 @@ return function()
     return task
   end
 
+  local function create_abandoned(id, title)
+    local task, err = state.create(root, {
+      id = id,
+      title = title,
+      status = "abandoned",
+      phase = "implement",
+      files = { "src/" .. id:sub(-4) .. ".lua" },
+      checks = { "true" },
+      branch = "metronome/" .. id,
+      worktree = "/tmp/wt-" .. id,
+      failure_reason = "abandoned by the user",
+    })
+    eq(task ~= nil, true, "an abandoned task is seeded: " .. tostring(err))
+    return task
+  end
+
   -- A retry while another task is in flight waits for the slot --------------
   --
   -- The reproduction: one task running, one retried, `max_parallel = 1`. The
@@ -599,4 +615,60 @@ return function()
   local dispatched5 = state.load(root).tasks[I]
   eq(dispatched5.slot_wait, nil, "the dispatch clears slot_wait")
   eq(dispatched5.slot_wait_since, nil, "the dispatch clears slot_wait_since")
+
+  -- A retried abandoned task reaches the slot through the real drain ---------
+  --
+  -- `abandoned` is a status `metronome_retry` accepts, so it must reach
+  -- `implement.run` through the same drain as every other retry. The task keeps
+  -- its original status while it waits; the drain dispatches it once a slot is
+  -- free (`abandoned -> running` is legal) and clears both wait fields in that
+  -- transition. The earlier runtime test stubbed `pipeline.tick`, which hid the
+  -- production path; this case uses the real scheduler module.
+  reset()
+  local env7 = new_env()
+  local rt7 = build(env7)
+  local L = "T-20261122-0012"
+  local M = "T-20261122-0013"
+  create_running(M, "occupe le seul slot")
+  create_abandoned(L, "abandonnee puis relancee")
+
+  local revived = rt7.retry({ id = L }, { session = "S1" })
+  eq(revived and revived.ok, true, "retry accepts an abandoned task")
+  eq(revived and revived.waiting, true, "the abandoned retry waits for the slot")
+  eq(#env7.calls, 0, "the abandoned retry opens no implementer turn on its own")
+  local abandoned_queued = state.load(root).tasks[L]
+  eq(abandoned_queued.status, "abandoned",
+    "the abandoned retry keeps its original status while it waits")
+  eq(abandoned_queued.slot_wait, true, "the abandoned retry carries the persisted wait")
+
+  pump_all(env7)
+  eq(#env7.calls, 0, "a drain with no free slot leaves the abandoned task waiting")
+  eq(state.load(root).tasks[L].status, "abandoned",
+    "the abandoned task still waits with its original status")
+
+  -- The slot frees: the real drain dispatches the abandoned retry exactly once.
+  state.transition(root, M, "abandoned", { reason = "termine" })
+  local revived_resume = rt7.resume()
+  eq(revived_resume and revived_resume.ok, true, "the resume drains the queue")
+  pump_calls(env7, 1)
+  eq(#env7.calls, 1, "the freed slot dispatches the abandoned retry exactly once")
+  eq(env7.calls[1], L, "the implementer turn belongs to the abandoned retry")
+  local revived_after = state.load(root).tasks[L]
+  eq(revived_after.status ~= "abandoned", true,
+    "the dispatch moves the abandoned task out of its terminal status")
+  eq(revived_after.slot_wait, nil, "the dispatch clears slot_wait on an abandoned retry")
+  eq(revived_after.slot_wait_since, nil, "the dispatch clears slot_wait_since")
+
+  -- An abandoned retry with nothing active starts on the drain it triggers.
+  reset()
+  local env8 = new_env()
+  local rt8 = build(env8)
+  local N = "T-20261122-0014"
+  create_abandoned(N, "seule abandonnee")
+  local alone_abandoned = rt8.retry({ id = N }, { session = "S1" })
+  eq(alone_abandoned and alone_abandoned.ok, true, "the idle abandoned retry is accepted")
+  eq(#env8.calls, 0, "the idle abandoned retry does not start the task itself")
+  pump_calls(env8, 1)
+  eq(#env8.calls, 1, "the idle abandoned retry is dispatched exactly once")
+  eq(env8.calls[1], N, "the implementer turn belongs to the abandoned retry")
 end
