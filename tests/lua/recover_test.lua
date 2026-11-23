@@ -105,6 +105,94 @@ return function()
   eq(cause_of({ stderr = "sh: gh: command not found" }), "binary_missing",
     "a stderr field is classified")
 
+  -- Structured conflicts carry their details in fields, not in text ----------
+  --
+  -- The real incident: a merge failure carried `conflict = true` plus the file
+  -- list, the base and the rebase command, but no human-readable message, so
+  -- classify fell back to "conflict: no error details". Every shape of a
+  -- repairable conflict must be recognised, and the message must name the
+  -- actionable facts.
+
+  local structured = {
+    conflict = true,
+    conflict_files = { "maki/lua/metronome/runtime.lua", "maki/lua/metronome/merge.lua" },
+    base = "origin/master",
+    base_sha = "b9150c4",
+    rebase_command = "git rebase origin/master",
+  }
+  local sc = recover.classify(structured)
+  eq(sc.cause, "conflict", "a structured conflict is classified as conflict")
+  eq(sc.message:find("runtime.lua", 1, true) ~= nil, true, "the message names the first file")
+  eq(sc.message:find("merge.lua", 1, true) ~= nil, true, "the message names the second file")
+  eq(sc.message:find("b9150c4", 1, true) ~= nil, true, "the message names the base sha")
+  eq(sc.message:find("origin/master", 1, true) ~= nil, true, "the message names the base")
+  eq(sc.message:find("git rebase origin/master", 1, true) ~= nil, true, "the message names the command")
+  eq(sc.message:find("no error details", 1, true), nil, "a detailed conflict never says 'no error details'")
+  eq(sc.transient, false, "a structured conflict is not transient")
+  eq(sc.retryable, false, "a structured conflict is not retryable")
+  eq(sc.remediable, true, "a structured conflict is remediable")
+  eq(recover.decide(recover.record(structured, nil, { now = 0 })).action, "human",
+    "a structured conflict escalates to a human")
+
+  -- `conflict` as the bare file table (no conflict_files field).
+  local as_table = recover.classify({
+    conflict = { "a.txt", "b.txt" },
+    base = "origin/main",
+    command = "git rebase origin/main",
+  })
+  eq(as_table.cause, "conflict", "conflict as a file table is classified as conflict")
+  eq(as_table.message:find("a.txt", 1, true) ~= nil, true, "the table conflict names a.txt")
+  eq(as_table.message:find("b.txt", 1, true) ~= nil, true, "the table conflict names b.txt")
+  eq(as_table.message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the table conflict names the command")
+
+  -- `conflict_files` alone, with a joined string.
+  local files_only = recover.classify({
+    conflict_files = "one.lua, two.lua",
+    base_sha = "deadbee",
+  })
+  eq(files_only.cause, "conflict", "conflict_files alone is classified as conflict")
+  eq(files_only.message:find("one.lua", 1, true) ~= nil, true, "the string list names one.lua")
+  eq(files_only.message:find("two.lua", 1, true) ~= nil, true, "the string list names two.lua")
+  eq(files_only.message:find("deadbee", 1, true) ~= nil, true, "a lone base_sha is named")
+
+  -- `conflict_file_list` alone.
+  eq(cause_of({ conflict_file_list = { "x.lua" } }), "conflict",
+    "conflict_file_list alone is classified as conflict")
+
+  -- A bare `conflict = true` without files still names the cause, never the
+  -- dead-end message.
+  local bare = recover.classify({ conflict = true })
+  eq(bare.cause, "conflict", "a bare conflict=true is classified as conflict")
+  eq(bare.message:find("no error details", 1, true), nil, "a bare conflict never says 'no error details'")
+
+  -- Details nested under `error` (or any sub-table) are found too.
+  local nested = recover.classify({ error = structured })
+  eq(nested.cause, "conflict", "a conflict nested under error is classified as conflict")
+  eq(nested.message:find("runtime.lua", 1, true) ~= nil, true, "a nested conflict names its files")
+
+  -- No conflict carrying details anywhere yields the dead-end message.
+  for _, err in ipairs({ structured, as_table, files_only, bare, nested }) do
+    local c = recover.classify(err)
+    eq(c.cause, "conflict", "every structured conflict keeps the conflict cause")
+    eq(c.message:find("no error details", 1, true), nil,
+      "no structured conflict renders 'no error details'")
+  end
+
+  -- The pure-text conflict path is unchanged.
+  local text = recover.classify("CONFLICT (content): Merge conflict in maki/init.lua")
+  eq(text.cause, "conflict", "the text conflict cause is unchanged")
+  eq(text.message, "CONFLICT (content): Merge conflict in maki/init.lua",
+    "the text conflict message is unchanged")
+
+  -- A deep or cyclic table never raises and still classifies.
+  local cyclic = { conflict = true, message = "deep" }
+  cyclic.self = cyclic
+  cyclic.error = cyclic
+  local cyc = recover.classify(cyclic)
+  eq(cyc.cause, "conflict", "a cyclic conflict table is classified")
+  eq(cyc.message:find("deep", 1, true) ~= nil, true, "a cyclic conflict keeps its text")
+
   -- Nil and hostile inputs never raise --------------------------------------
 
   local nilc, nilerr = recover.classify(nil)

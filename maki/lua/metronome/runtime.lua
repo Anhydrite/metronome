@@ -809,6 +809,16 @@ function M.new(deps)
         end
       end
     end
+    -- `conflict = true` names no file: the hunks git reported do.
+    if #out == 0 then
+      local hunks = type(result.conflict_hunks) == "table" and result.conflict_hunks
+        or (type(result.hunks) == "table" and result.hunks or nil)
+      for _, hunk in ipairs(hunks or {}) do
+        if type(hunk) == "table" and is_non_empty(hunk.file) then
+          out[#out + 1] = hunk.file
+        end
+      end
+    end
     return out
   end
 
@@ -876,6 +886,21 @@ function M.new(deps)
       parts[#parts + 1] = "commit: " .. details.commit
     end
     return table.concat(parts, "; ")
+  end
+
+  -- The typed facts of a conflict failure. A conflict that reaches a human is
+  -- never rendered as "no error details": the cause says what it is and the
+  -- message carries the files, the base and the command verbatim, so neither
+  -- the journal nor the panel can lose them.
+  local function conflict_diagnosis(message)
+    return {
+      cause = "conflict",
+      message = message,
+      remedy = "resolve the merge/rebase conflict in the worktree, then retry.",
+      transient = false,
+      retryable = false,
+      remediable = true,
+    }
   end
 
   -- Journal the conflict as a `note` event: files, hunks, base and the faulty
@@ -1007,38 +1032,287 @@ function M.new(deps)
         auto_rebase = false
       end
 
-      local merge_err
-      merged, merge_err = with_merge_gate(function()
-        return deps.merge.run({
-          task = task_id,
-          -- The PR this run just read back from gh, never a PR supposed from
-          -- the state loaded at the start of the run.
-          pr = type(pr) == "table" and (pr.number or pr.url) or pr,
-          worktree = worktree,
-          repo = paths.repo,
-          git = deps.git,
-          state = state,
-          root = paths.root,
-          remote = "origin",
-          base = base,
-          checks = deps.checks,
-          gh = "gh",
-          method = cfg.merge.method,
-          auto_rebase = auto_rebase,
-          verify = cfg.checks.re_run_after_merge ~= false,
-          commands = task.checks or cfg.checks.default,
-        })
-      end)
-      if not merged then
-        return { ok = false, error = tostring(merge_err or "epic merge failed") }
-      end
-      if not merged.ok then
-        -- A red base or a refused merge is a real failure: there is no
-        -- implementer to bounce back to, the subtasks are already merged.
-        if worktree == epic_wt and type(deps.git.worktree_remove) == "function" then
-          pcall(deps.git.worktree_remove, paths.repo, epic_wt, { force = true })
+      -- A conflict on the epic branch is repaired exactly like one on a task
+      -- branch: an implementer turn on that branch, with the conflict facts as
+      -- data, then the same PR is updated and the merge is retried. An epic
+      -- has no implementation of its own, but it has a branch to reconcile, and
+      -- that is the work the implementer does here. Bounded by
+      -- `merge.max_conflict_retries` and counted in the persisted counter, so a
+      -- reload cannot restart the budget.
+      local repairs = conflict_repairs(task)
+      local repair_bound = conflict_retry_bound(cfg)
+      while true do
+        local merge_err
+        merged, merge_err = with_merge_gate(function()
+          return deps.merge.run({
+            task = task_id,
+            -- The PR this run just read back from gh, never a PR supposed from
+            -- the state loaded at the start of the run.
+            pr = type(pr) == "table" and (pr.number or pr.url) or pr,
+            worktree = worktree,
+            repo = paths.repo,
+            git = deps.git,
+            state = state,
+            root = paths.root,
+            remote = "origin",
+            base = base,
+            checks = deps.checks,
+            gh = "gh",
+            method = cfg.merge.method,
+            auto_rebase = auto_rebase,
+            verify = cfg.checks.re_run_after_merge ~= false,
+            commands = task.checks or cfg.checks.default,
+          })
+        end)
+        if not merged then
+          return { ok = false, error = tostring(merge_err or "epic merge failed") }
         end
-        return merged
+        if merged.ok then
+          break
+        end
+
+        -- Any of the three shapes flags a repairable conflict: `conflict =
+        -- true`, `conflict` as the file list, or `conflict_files` alone.
+        local details = (merged.conflict or merged.conflict_files)
+          and conflict_details(merged, base) or nil
+        if not details then
+          -- A red base or a refused merge is a real failure: there is no
+          -- conflict to reconcile, and the failure keeps its own message.
+          if worktree == epic_wt and type(deps.git.worktree_remove) == "function" then
+            pcall(deps.git.worktree_remove, paths.repo, epic_wt, { force = true })
+          end
+          if not is_non_empty(merged.error) and not is_non_empty(merged.reason) then
+            local message = string.format(
+              "epic merge failed without details on origin/%s; command: `git rebase origin/%s`",
+              tostring(base), tostring(base))
+            journal_conflict(state, paths.root, task_id, conflict_details(merged, base), message)
+            return {
+              ok = false,
+              error = message,
+              diagnosis = {
+                cause = "unknown",
+                message = message,
+                remedy = "inspect the transcript and the worktree, then retry.",
+                transient = false,
+                retryable = false,
+                remediable = true,
+              },
+              phase = "merge",
+              task_id = task_id,
+              epic = true,
+            }
+          end
+          return merged
+        end
+
+        local repaired = false
+        local impl_err = nil
+        if repairs < repair_bound
+          and worktree == epic_wt
+          and deps.implement and type(deps.implement.run) == "function" then
+          -- The implementer prompt, the journal note and the escalation are
+          -- built from the same facts, so the base travels with its SHA even
+          -- when `merge.run` could not resolve it: a human is never asked to
+          -- resolve a conflict on a base named "unknown".
+          local base_sha = type(deps.git.rev_parse) == "function"
+            and deps.git.rev_parse(worktree, "origin/" .. base) or nil
+          if is_non_empty(base_sha) then
+            details.base_sha = details.base_sha or base_sha
+          elseif is_non_empty(details.base_sha) then
+            -- The remote ref may be unresolvable (never fetched, or pruned from
+            -- this worktree): the SHA the merge already carried names the same
+            -- fresh base, so reset onto it instead of breaking to escalation.
+            base_sha = details.base_sha
+          end
+          details.base = details.base or base
+          -- `merging` has no edge back to `running`: the repair continues the
+          -- turn, so the status and the phase are written before the
+          -- implementer runs, and a reload resumes in implement with the
+          -- conflict already journalled.
+          pcall(state.set_fields, paths.root, task_id, {
+            status = "running",
+            phase = "implement",
+          })
+          -- The epic has no implementation of its own: the branch itself is
+          -- the work. Each attempt puts the conflicted branch back on the
+          -- fresh base — the SHA of `origin/<base>`, never its own remote tip
+          -- — so the implementer redoes it on a clean history instead of
+          -- replaying the same conflicting one, with the conflict facts as
+          -- data.
+          --
+          -- The reset stays local: the remote is pushed only after the
+          -- implementer has actually redone the branch (below). A turn that
+          -- fails, is interrupted or commits nothing therefore leaves the work
+          -- its subtasks merged untouched on `origin` — a human is never asked
+          -- to resolve a conflict on a branch whose content has already been
+          -- wiped, and the prompt can tell the implementer to recover that work
+          -- from `origin/<branch>`.
+          --
+          -- Under the bound a failed or no-op turn re-enters the cycle instead
+          -- of failing the epic: only an exhausted budget escalates. Each
+          -- attempt spends one unit of the persisted budget, whether or not it
+          -- redid the branch, so a reload — or a loop of no-op turns — cannot
+          -- restart it. The merge is relaunched only for an attempt that
+          -- actually moved the branch off the fresh base: relaunching it on an
+          -- unchanged branch would merge the bare base and deploy the epic
+          -- without the work its subtasks merged.
+          while repairs < repair_bound and not repaired do
+            local fresh = false
+            local reset_err
+            if is_non_empty(base_sha) and type(deps.git.reset_hard) == "function" then
+              local reset
+              reset, reset_err = deps.git.reset_hard(epic_wt, base_sha)
+              fresh = reset and true or false
+            elseif is_non_empty(base_sha) then
+              reset_err = "no reset_hard available"
+            else
+              reset_err = "cannot resolve origin/" .. tostring(base)
+            end
+            if not fresh then
+              -- The branch cannot even be put on the fresh base: no
+              -- implementer turn can redo it, so retrying would only spin.
+              log(paths, "epic " .. task_id .. ": cannot put " .. branch
+                .. " on origin/" .. tostring(base) .. ": " .. tostring(reset_err))
+              impl_err = reset_err
+              break
+            end
+            local impl = deps.implement.run({
+              task = task,
+              repo = paths.repo,
+              state = state,
+              root = paths.root,
+              git = deps.git,
+              worktree_root = paths.worktrees,
+              tasks_dir = paths.tasks,
+              remote = "origin",
+              base_ref = base,
+              runner = runner,
+              session_opts = session.implementer,
+              state_root = paths.runs,
+              ctx = opts.ctx,
+              max_attempts = 1,
+              deadline_secs = opts.deadline_secs,
+              conflict = details,
+              -- The branch must not be pushed by the implementer yet: right
+              -- after the reset it is still on the fresh base, and `run_impl`
+              -- pushes even a no-op turn, which would force `origin/<branch>`
+              -- back to the base and wipe the work the subtasks merged. The
+              -- runtime pushes once the turn has actually redone the branch.
+              push = false,
+            }) or nil
+            repairs = repairs + 1
+            -- The attempt is spent now, and persisted with the boolean
+            -- fallback so a reload continues from the same count.
+            pcall(state.set_fields, paths.root, task_id, {
+              conflict_retried = true,
+              conflict_retries = repairs,
+            })
+            if impl and impl.ok then
+              -- A turn that makes no commit is not a repair: `run_impl`
+              -- returns `ok = true, no_changes = true` when the tree was
+              -- already clean, and right after the reset the local branch sits
+              -- exactly on `origin/<base>`. The head must differ from the
+              -- fresh base before the merge is relaunched.
+              local impl_wt = impl.ctx and impl.ctx.worktree or epic_wt
+              local head = is_non_empty(impl.sha) and impl.sha or nil
+              if not head and type(deps.git.head_sha) == "function" then
+                head = deps.git.head_sha(impl_wt)
+              end
+              if not head and type(deps.git.rev_parse) == "function" then
+                head = deps.git.rev_parse(impl_wt, branch)
+              end
+              local redone = not impl.no_changes
+                and is_non_empty(head) and head ~= base_sha
+              if redone then
+                -- The PR is the same PR: the repaired branch is pushed onto
+                -- it, so no second PR is opened. The repairable note is
+                -- written only now: the implementer has actually redone the
+                -- branch, so a "will be redone" note can never be followed by
+                -- a `failed` on the same turn.
+                local pushed, push_err = true, nil
+                if type(deps.git.push) == "function" then
+                  pushed, push_err = deps.git.push(impl_wt, branch, { remote = "origin", force = true })
+                else
+                  pushed, push_err = false, "no push available"
+                end
+                if pushed then
+                  journal_conflict(state, paths.root, task_id, details,
+                    "merge conflict (repairable): " .. conflict_note(details))
+                  log(paths, "epic " .. task_id .. " conflicted on "
+                    .. (#details.files > 0 and table.concat(details.files, ", ") or "unknown")
+                    .. "; the implementer redid the branch and the merge is retried")
+                  repaired = true
+                else
+                  -- The redone branch never reached `origin`: relaunching the
+                  -- merge would replay the old conflicting tip. Retry under
+                  -- the bound with the push failure as the reason.
+                  impl_err = "cannot push the redone epic branch: " .. tostring(push_err)
+                  log(paths, "epic " .. task_id .. ": repair attempt "
+                    .. tostring(repairs) .. " could not push " .. branch .. ": "
+                    .. tostring(push_err))
+                end
+              else
+                impl_err = string.format(
+                  "the implementer made no commit on %s; the branch is still at the fresh base %s",
+                  tostring(branch), tostring(base_sha))
+                log(paths, "epic " .. task_id .. ": repair attempt "
+                  .. tostring(repairs) .. " made no commit on " .. branch)
+              end
+            else
+              -- The implementer could not redo the branch: the attempt is
+              -- spent, and the cycle re-enters while the bound has room. Only
+              -- an exhausted budget escalates, with the reason attached.
+              if type(impl) == "table" then
+                impl_err = impl.error or impl.reason
+              else
+                impl_err = reset_err
+              end
+              log(paths, "epic " .. task_id .. ": repair attempt "
+                .. tostring(repairs) .. " failed: " .. tostring(impl_err))
+            end
+          end
+        end
+
+        if repaired then
+          -- The implementer resolved the branch: the retry re-enters the epic
+          -- merge path from the status it left (`running`).
+          local moved, moerr = state.transition(paths.root, task_id, "pr_open", { phase = "merge" })
+          if not moved then
+            return { ok = false, error = moerr or "cannot mark the epic pr_open after the repair" }
+          end
+        else
+          -- Beyond the bound (or with no implementer to hand the branch to) the
+          -- human gets the means to act: the files, the base with its SHA and
+          -- the exact command — never a failure without a message.
+          local message = conflict_escalation(details)
+          local diagnosis = conflict_diagnosis(message)
+          if is_non_empty(impl_err) then
+            -- When the repair turn itself failed under the bound, the human
+            -- must know why no repair happened. The reason goes into the
+            -- remedy rather than the message: the failure line caps each field
+            -- separately, and appending to the message would truncate the
+            -- files, the base SHA or the command away.
+            diagnosis.remedy = string.format(
+              "%s (the implementer could not redo the branch: %s)",
+              diagnosis.remedy, tostring(impl_err))
+          end
+          journal_conflict(state, paths.root, task_id, details, message)
+          if worktree == epic_wt and type(deps.git.worktree_remove) == "function" then
+            pcall(deps.git.worktree_remove, paths.repo, epic_wt, { force = true })
+          end
+          return {
+            ok = false,
+            error = message,
+            diagnosis = diagnosis,
+            phase = "merge",
+            task_id = task_id,
+            epic = true,
+            conflict = true,
+            -- `conflict_details` exposes the file names under `files`: derive
+            -- the caller-facing field from it, never from a key it lacks.
+            conflict_files = (#details.files > 0) and details.files or nil,
+          }
+        end
       end
     end
 
@@ -1229,7 +1503,12 @@ function M.new(deps)
           git = deps.git,
         })
         if not rebased then
-          if type(rebase_diag) == "table" and rebase_diag.conflict then
+          -- A rebase diagnostic flags a conflict three ways: `conflict = true`,
+          -- `conflict` as the file list, or `conflict_files` alone. They are
+          -- the same repairable situation, so none of them may be missed.
+          local rebase_conflict = type(rebase_diag) == "table"
+            and (rebase_diag.conflict or rebase_diag.conflict_files) or nil
+          if rebase_conflict then
             -- The base moved under the branch and the same lines changed.
             -- That is repairable without a human: move the branch back to the
             -- fresh base and redo the work there, with the conflict facts in
@@ -1249,7 +1528,8 @@ function M.new(deps)
                   details.base_sha = details.base_sha or base_sha
                 end
                 log(paths, "task " .. task_id .. " conflicted with the fresh base on "
-                  .. tostring(rebase_diag.conflict) .. "; redoing it on the fresh base")
+                  .. (#details.files > 0 and table.concat(details.files, ", ") or "unknown")
+                  .. "; redoing it on the fresh base")
                 repairs = repairs + 1
                 -- The task is already running: the repair continues the turn,
                 -- it is not a failure. Persist the counter and the phase so a
@@ -1269,11 +1549,13 @@ function M.new(deps)
                 return implement_and_verify(feedback, details)
               end
             end
+            local message = conflict_escalation(details)
             return nil, {
               ok = false,
               conflict = true,
               phase = "implement",
-              error = conflict_escalation(details),
+              error = message,
+              diagnosis = conflict_diagnosis(message),
             }
           end
           -- The rebase never started: it is the fetch that failed. A remote or
@@ -1648,7 +1930,11 @@ function M.new(deps)
       -- caller no longer relaunches the merge, which would replay the same
       -- commit on the same base. The bound counts real repairs, comes from the
       -- project's config, and is persisted with the counter.
-      local details = merged.conflict and conflict_details(merged, base) or nil
+      --
+      -- A conflict may be flagged by `conflict = true`, by `conflict` as the
+      -- file list, or by `conflict_files` alone. The detection must not depend
+      -- on a single field: any of the three is the same repairable conflict.
+      local details = (merged.conflict or merged.conflict_files) and conflict_details(merged, base) or nil
       local repaired = false
       if details and repairs < repair_bound then
         local base_sha = type(deps.git.rev_parse) == "function"
@@ -1660,20 +1946,25 @@ function M.new(deps)
             details.base_sha = details.base_sha or base_sha
           end
           log(paths, "task " .. task_id .. " hit a merge conflict on "
-            .. tostring(merged.conflict_files) .. "; redoing it on the fresh base")
+            .. (#details.files > 0 and table.concat(details.files, ", ") or "unknown")
+            .. "; redoing it on the fresh base")
           repairs = repairs + 1
           -- `merging` has no edge back to `running`: the repair is a
           -- continuation of the turn, not a failure, so status, phase and
           -- counter are written together. A reload then resumes in implement
-          -- with the conflict already journalled. The note itself is written
-          -- once, by `merge.run` (the repairable branch it returns from), so
-          -- the runtime does not duplicate it: one conflict, one note.
+          -- with the conflict already journalled. The note is written here, not
+          -- by `merge.run`: the runtime only announces a repair it has
+          -- committed to (the branch is back on the fresh base), so a
+          -- "will be redone" note can never coexist with a failure on the same
+          -- turn — one conflict, one note, and only when it is true.
           pcall(state.set_fields, paths.root, task_id, {
             status = "running",
             phase = "implement",
             conflict_retried = true,
             conflict_retries = repairs,
           })
+          journal_conflict(state, paths.root, task_id, details,
+            "merge conflict (repairable): " .. (merged.repair_note or conflict_note(details)))
           -- The branch is back on the fresh base: the PR is the same PR, so the
           -- push leases it and no second PR is opened.
           if type(deps.git.push) == "function" then
@@ -1689,7 +1980,43 @@ function M.new(deps)
           -- base and the exact command — not git's raw "rebase failed".
           local message = conflict_escalation(details)
           journal_conflict(state, paths.root, task_id, details, message)
-          return { ok = false, error = message, phase = "merge", task_id = task_id }
+          return {
+            ok = false,
+            error = message,
+            diagnosis = conflict_diagnosis(message),
+            phase = "merge",
+            task_id = task_id,
+            conflict = true,
+            -- The escalation is a conflict failure: carry its files so a caller
+            -- reading the result does not have to parse the message.
+            conflict_files = (#details.files > 0) and details.files or nil,
+          }
+        end
+        -- A failure must always say why: `recover` turns a blank error into
+        -- "no error details", the exact escalation this task removes. If the
+        -- step failed without a message, one is synthesised from the base and
+        -- the command, and journalled like any other failure.
+        if not is_non_empty(merged.error) and not is_non_empty(merged.reason) then
+          local facts = conflict_details(merged, base)
+          local message = string.format(
+            "merge failed without details on %s; command: `%s`",
+            tostring(facts.upstream), tostring(facts.command))
+          journal_conflict(state, paths.root, task_id, facts, message)
+          return {
+            ok = false,
+            error = message,
+            diagnosis = {
+              cause = "unknown",
+              message = message,
+              remedy = "inspect the transcript and the worktree, then retry.",
+              transient = false,
+              retryable = false,
+              remediable = true,
+            },
+            phase = "merge",
+            task_id = task_id,
+            merged = merged,
+          }
         end
         return merged
       end
@@ -2830,13 +3157,8 @@ function M.new(deps)
     local attempt_prior = { attempts = streak, phase = phase }
 
     local failure
-    local decision
     if recover and type(recover.record) == "function" then
       failure = recover.record(message, attempt_prior, ropts)
-      failure = typed_failure(failure, diagnosis, ropts)
-      if type(recover.decide) == "function" then
-        decision = recover.decide(failure, ropts)
-      end
     end
     if type(failure) ~= "table" then
       -- Without the policy module the task still gets a readable record, so the
@@ -2850,6 +3172,16 @@ function M.new(deps)
         at = os.time(),
         phase = phase,
       }
+    end
+    -- A step that diagnosed its own failure (`result.diagnosis`) keeps that
+    -- typing and message verbatim: a conflict with files must never reach the
+    -- journal as "no error details", whatever the generic classifier makes of
+    -- the string. Applied before the decision so the decision reads the record
+    -- that will actually be persisted.
+    failure = typed_failure(failure, diagnosis, ropts)
+    local decision
+    if recover and type(recover.decide) == "function" then
+      decision = recover.decide(failure, ropts)
     end
     if type(decision) ~= "table" then
       decision = { action = "human", delay_secs = 0, max_attempts = 1, phase = phase }

@@ -1021,8 +1021,10 @@ local function case_conflict_repair(env)
 
   -- `conflicts` conflicts are returned before the merge succeeds; `math.huge`
   -- keeps conflicting. `initial` is what a reload would hand back from the
-  -- journal (`status`, `phase`, `conflict_retries`).
-  local function conflict_deps(max_retries, conflicts, initial)
+  -- journal (`status`, `phase`, `conflict_retries`). `payload_fn` lets a test
+  -- choose the shape of the conflict (a flag, a file list, `conflict_files`
+  -- alone, with or without `error`).
+  local function conflict_deps(max_retries, conflicts, initial, payload_fn)
     local record = { id = "T1", status = "ready", title = "t", checks = { "true" } }
     for key, value in pairs(initial or {}) do
       record[key] = value
@@ -1101,18 +1103,11 @@ local function case_conflict_repair(env)
         run = function()
           merge_calls = merge_calls + 1
           if merge_calls <= conflicts then
-            local conflict = conflict_payload()
-            -- Emulate the dependency's contract: `merge.run` journals the
-            -- repairable conflict once. The runtime must not write a second
-            -- note for the same conflict.
-            deps.state.append(paths.root, {
-              kind = "note",
-              task_id = "T1",
-              text = "merge conflict (repairable): files: docs/configuration.md"
-                .. "; command: `git rebase origin/main`; commit: 59738f2\n"
-                .. "--- docs/configuration.md:12\n"
-                .. conflict.conflict_hunks[1].text,
-            })
+            local conflict = (payload_fn or conflict_payload)()
+            -- `merge.run` returns the conflict and the repairable wording but
+            -- does not journal it: only the runtime, once it has committed to
+            -- the repair, announces it. The note count assertions below prove
+            -- the runtime journals it exactly once per conflict.
             return conflict
           end
           record.status = "merged"
@@ -1695,6 +1690,201 @@ exit 1
     eq(count_gh("pr create"), 0, "the repair reuses the open PR")
   end
 
+  do
+  -- Every shape of a repairable conflict is repaired -------------------------
+  --
+  -- The runtime used to read `conflict` alone. A result that carried only
+  -- `conflict_files`, or a bare `conflict = true` with no `error`, fell through
+  -- to a failure with "no error details": the journal said repairable, the task
+  -- ended failed. All three shapes are the same conflict and must go back to
+  -- implement, their files handed over as data.
+  local function payload_without_error(mutate)
+    local payload = conflict_payload()
+    payload.error = nil
+    mutate(payload)
+    return payload
+  end
+
+  local shapes = {
+    {
+      name = "conflict = true with conflict_files as a table",
+      mutate = function(payload)
+        payload.conflict = true
+        payload.conflict_files = { "docs/configuration.md" }
+        payload.conflict_file_list = nil
+      end,
+    },
+    {
+      name = "conflict as a file list alone",
+      mutate = function(payload)
+        payload.conflict = { "docs/configuration.md" }
+        payload.conflict_files = nil
+        payload.conflict_file_list = nil
+      end,
+    },
+    {
+      name = "conflict_files alone",
+      mutate = function(payload)
+        payload.conflict = nil
+        payload.conflict_file_list = nil
+      end,
+    },
+  }
+  for _, shape in ipairs(shapes) do
+    local case = conflict_deps(2, 1, nil, function()
+      return payload_without_error(shape.mutate)
+    end)
+    local rt_shape = runtime.new(case.deps)
+    rt_shape.submit({ intention = "x", fast = false }, { session = "S1" })
+    rt_shape.run_pending()
+    eq(case.record.status, "merged",
+      shape.name .. ": the conflict is repaired, not fatal")
+    eq(case.record.conflict_retries, 1,
+      shape.name .. ": the repair is counted on the task")
+    eq(#failed_transitions(case.events), 0,
+      shape.name .. ": no failed transition under the bound")
+    eq(case.impl_calls(), 2, shape.name .. ": the work is redone once")
+    eq(#case.impl_conflicts, 1, shape.name .. ": the repair turn receives the conflict")
+    eq(case.impl_conflicts[1] and case.impl_conflicts[1].files
+      and case.impl_conflicts[1].files[1], "docs/configuration.md",
+      shape.name .. ": the repair turn receives the conflicting file")
+    eq(case.pr_opens(), 1, shape.name .. ": the repair reuses the open PR")
+    -- (e) Coherence: no party announces "will be redone on the fresh base"
+    -- until the runtime has committed to the repair. merge.run only returns the
+    -- wording; the runtime journals it exactly once, when the reset has
+    -- actually happened, so a "will be redone" note can never coexist with a
+    -- `failed` on the same turn under the bound.
+    local repairable_notes = repair_notes(case.events, "will be redone on the fresh base")
+    eq(#repairable_notes, 1, shape.name .. ": the runtime journals the repair once")
+    eq(#failed_transitions(case.events), 0,
+      shape.name .. ": a 'will be redone' note never coexists with a failed task")
+  end
+
+  -- (e) Under the bound but unable to repair, nothing announces a repair: if
+  -- the fresh base cannot be materialised (`reset_hard` missing or refusing),
+  -- the turn never claims "will be redone" and does not fail without a message
+  -- — the escalation names the files and the command instead.
+  local no_reset_payload = conflict_payload()
+  no_reset_payload.error = nil
+  local no_reset = conflict_deps(2, math.huge, nil, function() return no_reset_payload end)
+  no_reset.deps.git.reset_hard = nil
+  local rt_no_reset = runtime.new(no_reset.deps)
+  rt_no_reset.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_no_reset.run_pending()
+  eq(#repair_notes(no_reset.events, "will be redone on the fresh base"), 0,
+    "no 'will be redone' note is written when the repair cannot be committed")
+  local no_reset_failures = failed_transitions(no_reset.events)
+  eq(#no_reset_failures, 1, "an unrepairable conflict still ends the turn once")
+  local no_reset_message = tostring(no_reset_failures[1] and no_reset_failures[1].reason or "")
+  eq(no_reset_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the unrepairable conflict names the files")
+  eq(no_reset_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the unrepairable conflict names the exact command")
+  eq(no_reset_message:find("no error details", 1, true), nil,
+    "the unrepairable conflict is never 'no error details'")
+  eq(no_reset.impl_conflicts and #no_reset.impl_conflicts, 0,
+    "no implementer turn is announced for a repair that did not happen")
+
+  local reset_refused = conflict_deps(2, math.huge, nil, function()
+    return no_reset_payload
+  end)
+  reset_refused.deps.git.reset_hard = function() return nil, "reset refused" end
+  local rt_reset_refused = runtime.new(reset_refused.deps)
+  rt_reset_refused.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_reset_refused.run_pending()
+  eq(#repair_notes(reset_refused.events, "will be redone on the fresh base"), 0,
+    "a refused reset writes no 'will be redone' note")
+  eq(#failed_transitions(reset_refused.events), 1,
+    "a refused reset escalates with the conflict facts, once")
+  local refused_message = tostring(failed_transitions(reset_refused.events)[1]
+    and failed_transitions(reset_refused.events)[1].reason or "")
+  eq(refused_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the refused-reset escalation names the files")
+  eq(refused_message:find("no error details", 1, true), nil,
+    "the refused-reset escalation is never 'no error details'")
+
+  -- (d)/(f) Beyond the bound, the escalation names the files, the base with its
+  -- SHA and the exact command, and a result carrying conflict files never
+  -- produces a failure without a message — even when `error` is absent.
+  local escalated_shape = conflict_deps(1, math.huge, nil, function()
+    return payload_without_error(function(payload)
+      payload.conflict = nil
+      payload.conflict_file_list = nil
+      payload.conflict_files = "docs/configuration.md"
+    end)
+  end)
+  local rt_escalated_shape = runtime.new(escalated_shape.deps)
+  rt_escalated_shape.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_escalated_shape.run_pending()
+  eq(escalated_shape.record.status, "failed",
+    "a conflict beyond the bound still fails the task")
+  local shape_failures = failed_transitions(escalated_shape.events)
+  eq(#shape_failures, 1, "the escalation is a single failed transition")
+  local shape_message = tostring(shape_failures[1] and shape_failures[1].reason or "")
+  eq(shape_message ~= "", true, "a conflict failure is never written without a message")
+  eq(shape_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the escalation names the conflicting files")
+  eq(shape_message:find("origin/main", 1, true) ~= nil, true,
+    "the escalation names the base")
+  eq(shape_message:find("base123", 1, true) ~= nil, true,
+    "the escalation names the base SHA")
+  eq(shape_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the escalation names the exact command")
+  eq(shape_message:find("no error details", 1, true), nil,
+    "the escalation is never 'no error details'")
+  -- The runtime hands the failure policy a typed conflict diagnosis (cause
+  -- conflict, the escalation verbatim), so the persisted record keeps the
+  -- files, the base and the command instead of degrading to "no error details".
+  local failure_events = events_matching(escalated_shape.events, function(event)
+    return event.kind == "field" and event.fields and event.fields.failure ~= nil
+  end)
+  eq(#failure_events, 1, "the conflict failure is persisted once")
+  local persisted = failure_events[1] and failure_events[1].fields.failure or {}
+  eq(persisted.cause, "conflict", "the persisted failure is typed as a conflict")
+  local persisted_message = tostring(persisted.message or "")
+  eq(persisted_message ~= "", true, "the persisted conflict failure carries a message")
+  eq(persisted_message:find("no error details", 1, true), nil,
+    "the persisted conflict failure is never 'no error details'")
+  eq(persisted_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the persisted conflict failure names the files")
+  eq(persisted_message:find("base123", 1, true) ~= nil, true,
+    "the persisted conflict failure names the base SHA")
+  eq(persisted_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the persisted conflict failure names the exact command")
+
+  -- The implement-side rebase diagnostic is read the same way: `conflict_files`
+  -- alone, with no `conflict` field, is the same repairable conflict.
+  local rebasing_files = conflict_deps(2, 0)
+  local rebase_file_calls = 0
+  rebasing_files.deps.merge.rebase = function()
+    rebase_file_calls = rebase_file_calls + 1
+    if rebase_file_calls == 1 then
+      return nil, "could not apply 59738f2", {
+        conflict_files = { "docs/configuration.md" },
+        hunks = {
+          { file = "docs/configuration.md", start = 12,
+            text = "<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> 59738f2" },
+        },
+        commit = "59738f2",
+        upstream = "origin/main",
+        command = "git rebase origin/main",
+      }
+    end
+    return { ok = true, base = "origin/main", sha = "sha" }
+  end
+  local rt_rebase_files = runtime.new(rebasing_files.deps)
+  rt_rebase_files.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_rebase_files.run_pending()
+  eq(rebasing_files.record.status, "merged",
+    "an implement-side conflict flagged only by conflict_files is repaired")
+  eq(rebasing_files.record.conflict_retries, 1,
+    "the implement-side repair is counted")
+  eq(#failed_transitions(rebasing_files.events), 0,
+    "the implement-side conflict never fails the task under the bound")
+  eq(#rebasing_files.impl_conflicts, 1,
+    "the implement-side repair hands the conflict over")
+  end
+
   -- The prompt and the config carry the conflict contract -------------------
   local implement = load_module("implement")
   local conflict_prompt = implement.render_prompt(
@@ -1714,6 +1904,36 @@ exit 1
     "the prompt says the conflict facts are data")
   eq(conflict_prompt:find("git rebase origin/main", 1, true) ~= nil, true,
     "the prompt names the exact command")
+  eq(conflict_prompt:find("This is the epic branch", 1, true), nil,
+    "a subtask repair turn is not described as an epic branch")
+  local epic_conflict_prompt = implement.render_prompt(
+    { id = "E1", title = "epic", kind = "epic", files = {}, checks = { "true" } },
+    "sheet",
+    { repo = "/tmp/repo", worktree = "/tmp/wt", branch = "b", base_ref = "main" },
+    { conflict = { files = { "docs/configuration.md" }, base = "main",
+      base_sha = "base123", command = "git rebase origin/main" } })
+  eq(epic_conflict_prompt:find("This is the epic branch", 1, true) ~= nil, true,
+    "an epic repair turn says the branch itself is the work")
+  eq(epic_conflict_prompt:find("base123", 1, true) ~= nil, true,
+    "an epic repair turn carries the base with its SHA")
+  eq(epic_conflict_prompt:find("reset onto the fresh base", 1, true) ~= nil, true,
+    "an epic repair turn says the worktree was reset onto the fresh base")
+  eq(epic_conflict_prompt:find("origin/b", 1, true) ~= nil, true,
+    "an epic repair turn says to recover the branch content from origin/<branch>")
+  eq(epic_conflict_prompt:find("origin/main", 1, true) ~= nil, true,
+    "an epic repair turn says to compare against origin/<base>")
+  -- The runtime passes `push = false` for the epic turn and pushes the branch
+  -- itself once the redo is verified: a prompt that still told the implementer
+  -- to push could force origin/<branch> back onto the fresh base.
+  eq(epic_conflict_prompt:find("Do not push", 1, true) ~= nil, true,
+    "an epic repair turn tells the implementer not to push")
+  eq(epic_conflict_prompt:find("Commit the reconciliation and leave the push to the runtime",
+    1, true) ~= nil, true,
+    "an epic repair turn says the runtime does the push")
+  eq(epic_conflict_prompt:find("commit and push again", 1, true), nil,
+    "an epic repair turn does not tell the implementer to push")
+  eq(conflict_prompt:find("commit and push again", 1, true) ~= nil, true,
+    "a subtask repair turn still tells the implementer to push")
   local plain_prompt = implement.render_prompt(
     { id = "T1", title = "t", files = {}, checks = {} }, "sheet",
     { repo = "/tmp/repo", worktree = "/tmp/wt", branch = "b", base_ref = "main" }, {})
@@ -2525,9 +2745,478 @@ local function case_epic_task(env)
   eq(epic_record.status, "deployed", "the epic ends deployed")
 end
 
+local function case_epic_conflict(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
+  -- An epic conflict is repaired like a task conflict -----------------------
+  --
+  local function epic_events(events, fn)
+    local out = {}
+    for _, event in ipairs(events) do
+      if fn(event) then
+        out[#out + 1] = event
+      end
+    end
+    return out
+  end
+  local function epic_failed(events)
+    return epic_events(events, function(event)
+      return event.kind == "transition" and event.status == "failed"
+    end)
+  end
+  local function epic_notes(events, label)
+    return epic_events(events, function(event)
+      return event.kind == "note"
+        and tostring(event.text):find(label, 1, true) ~= nil
+    end)
+  end
+  --
+  -- An epic has no implementation of its own, but the epic branch is a branch
+  -- to reconcile: an implementer turn on that branch, with the conflict facts
+  -- as data, resolves it; the existing PR is updated (no second PR) and the
+  -- merge is retried, bounded by `merge.max_conflict_retries`. Beyond the bound
+  -- the escalation names the files, the base with its SHA and the command
+  -- instead of failing without a message.
+  local function epic_conflict_deps(max_retries, conflicts, opts)
+    opts = type(opts) == "table" and opts or {}
+    local record = {
+      id = "T1", status = "ready", title = "epic: two things", kind = "epic",
+      branch = "metronome/epic/demo-0001", base_ref = "main", checks = { "true" },
+    }
+    local events = {}
+    local pr_opens = 0
+    local impl_conflicts = {}
+    local impl_calls = 0
+    local impl_push_flags = {}
+    local merge_calls = 0
+    local resets = {}
+    local pushes = {}
+    local rev_parses = {}
+    -- The order the repair actually happens in: the branch is put back on a
+    -- clean state before the implementer works, and the PR is reused after.
+    local order = {}
+    local dispatched = false
+    local deps
+    deps = {
+      config = {
+        load = function()
+          return {
+            project = { repo = "/tmp/repo", base_ref = "main" },
+            checks = { default = { "true" }, timeout_secs = 10 },
+            merge = { method = "squash", auto_merge = true, auto_rebase = true,
+              max_conflict_retries = max_retries },
+            deploy = { auto_deploy = true, plan_file = "deploy.md" },
+          }
+        end,
+      },
+      roles = { session_opts = function() return { system = "", model_spec = "m", thinking = "low", tools = {} } end },
+      state = {
+        load = function() return { tasks = { T1 = record } } end,
+        transition = function(_, id, status, fields)
+          events[#events + 1] = {
+            kind = "transition",
+            status = status,
+            phase = fields and fields.phase,
+            reason = fields and fields.reason,
+          }
+          record.status = status
+          return { id = id, status = status }
+        end,
+        set_fields = function(_, _, fields)
+          events[#events + 1] = { kind = "field", fields = fields }
+          for k, v in pairs(fields or {}) do record[k] = v end
+          return true
+        end,
+        append = function(_, event)
+          events[#events + 1] = event
+          return true
+        end,
+      },
+      implement = {
+        run = function(o)
+          impl_calls = impl_calls + 1
+          local call = impl_calls
+          impl_push_flags[#impl_push_flags + 1] = o.push
+          order[#order + 1] = "implement"
+          if o.conflict ~= nil then
+            impl_conflicts[#impl_conflicts + 1] = o.conflict
+          end
+          if opts.impl_ok == false
+            or (opts.impl_fail_times and call <= opts.impl_fail_times) then
+            return { ok = false, error = opts.impl_error or "implementer crashed" }
+          end
+          if opts.impl_no_changes
+            or (opts.impl_no_op_times and call <= opts.impl_no_op_times) then
+            -- `run_impl` reports a benign turn that committed nothing this
+            -- way: `ok = true` with the head still on the fresh base.
+            return {
+              ok = true,
+              no_changes = true,
+              sha = opts.impl_sha or "base123",
+              ctx = { worktree = "/tmp/wt", branch = "metronome/epic/demo-0001" },
+            }
+          end
+          return {
+            ok = true,
+            -- A real repair commits: the branch head moves off the fresh base.
+            sha = opts.impl_sha or "repaired1",
+            ctx = { worktree = "/tmp/wt", branch = "metronome/epic/demo-0001" },
+          }
+        end,
+        read_sheet = function() return {} end,
+      },
+      checks = { verify = function() return { ok = true } end, write_report = function() end },
+      converge = { run = function() return { ok = true } end },
+      review = { review = function() return { ok = true, approved = true } end },
+      git = {
+        fetch = function() return true end,
+        rev_parse = function(_, ref)
+          rev_parses[#rev_parses + 1] = ref
+          -- Each ref resolves to its own SHA, and the epic branch tip differs
+          -- from the fresh base on purpose: a reset onto the wrong ref would
+          -- be visible in the test instead of passing by accident.
+          local shas = opts.shas or {
+            ["origin/main"] = "base123",
+            ["origin/metronome/epic/demo-0001"] = "tip999",
+          }
+          return shas[ref]
+        end,
+        branch_reset = function() return true end,
+        reset_hard = function(worktree, sha)
+          resets[#resets + 1] = { worktree = worktree, sha = sha }
+          order[#order + 1] = "reset"
+          return sha
+        end,
+        push_branch = function() return true end,
+        push = function(_, name)
+          pushes[#pushes + 1] = name
+          order[#order + 1] = "push"
+          return true
+        end,
+        pr_open = function()
+          pr_opens = pr_opens + 1
+          return { number = 7, url = "https://example.test/pr/7", state = "open" }
+        end,
+        worktree_add = function(_, wt) return wt end,
+        worktree_remove = function() return true end,
+      },
+      merge = {
+        run = function()
+          merge_calls = merge_calls + 1
+          order[#order + 1] = "merge"
+          if merge_calls <= conflicts then
+            -- `conflict = true` with `conflict_files` as a table, and no
+            -- `error`: the runtime must repair it without inventing a failure.
+            return (opts.payload or function()
+              return {
+                ok = false,
+                conflict = true,
+                conflict_files = { "docs/configuration.md" },
+                conflict_hunks = {
+                  { file = "docs/configuration.md", start = 12,
+                    text = "<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> 59738f2" },
+                },
+                conflict_commit = "59738f2",
+                base = "main",
+                base_sha = "base123",
+                upstream = "origin/main",
+                rebase_command = "git rebase origin/main",
+              }
+            end)()
+          end
+          return { ok = true }
+        end,
+      },
+      deploy = {
+        run = function()
+          record.status = "deployed"
+          return { ok = true, deployed = true }
+        end,
+      },
+      pipeline = {
+        tick = function(tick_opts)
+          if not dispatched then
+            dispatched = true
+            tick_opts.dispatch({ id = "T1" })
+          end
+          return { ok = true, started = {} }
+        end,
+      },
+      paths = function() return paths end,
+      spawn = function(fn) fn() end,
+      wait_turn_end = false,
+      runner = {},
+      qualify = {
+        run = function() return { ok = true, tasks = {} } end,
+        next_id = function() return "T1" end,
+        apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+      },
+      questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+      analyze = { gate = function() return { ok = true } end },
+      calibrate = {}, fence = {}, mode = {},
+    }
+    return {
+      deps = deps,
+      record = record,
+      events = events,
+      impl_conflicts = impl_conflicts,
+      impl_calls = function() return impl_calls end,
+      impl_push_flags = impl_push_flags,
+      pr_opens = function() return pr_opens end,
+      merge_calls = function() return merge_calls end,
+      resets = resets,
+      pushes = pushes,
+      rev_parses = rev_parses,
+      order = order,
+    }
+  end
+
+  local epic_repair = epic_conflict_deps(2, 1)
+  local rt_epic_repair = runtime.new(epic_repair.deps)
+  rt_epic_repair.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_repair.run_pending()
+  eq(epic_repair.merge_calls(), 2, "the epic merge is retried after the repair")
+  eq(epic_repair.pr_opens(), 1, "the repaired epic reuses its single PR")
+  eq(epic_repair.impl_calls(), 1, "the epic repair runs one implementer turn")
+  eq(epic_repair.impl_push_flags[1], false,
+    "the implementer must not push the epic branch: the runtime pushes it after the redo")
+  eq(#epic_repair.impl_conflicts, 1, "the epic repair hands the conflict over")
+  eq(epic_repair.impl_conflicts[1] and epic_repair.impl_conflicts[1].files
+    and epic_repair.impl_conflicts[1].files[1], "docs/configuration.md",
+    "the epic repair turn receives the conflicting file")
+  eq(epic_repair.impl_conflicts[1] and epic_repair.impl_conflicts[1].commit, "59738f2",
+    "the epic repair turn receives the commit git could not replay")
+  eq(epic_repair.impl_conflicts[1] and epic_repair.impl_conflicts[1].base_sha, "base123",
+    "the epic repair turn receives the base with its SHA")
+  eq(epic_repair.impl_conflicts[1] and epic_repair.impl_conflicts[1].command,
+    "git rebase origin/main", "the epic repair turn receives the exact command")
+  -- The branch is put back on the fresh base before the implementer works:
+  -- its SHA comes from `origin/<base>`, not from the epic branch's own remote
+  -- tip, and the rewritten branch is pushed before the merge is relaunched.
+  eq(#epic_repair.resets, 1, "the epic branch is put back on a fresh state once")
+  eq(epic_repair.resets[1] and epic_repair.resets[1].worktree,
+    maki.fs.joinpath(paths.worktrees, "T1"),
+    "the reset targets the epic worktree, not the project checkout")
+  eq(epic_repair.resets[1] and epic_repair.resets[1].sha, "base123",
+    "the reset uses the SHA of origin/<base>, never the epic branch tip")
+  eq(epic_repair.resets[1] and epic_repair.resets[1].sha ~= "tip999", true,
+    "the reset is distinguished from a reset onto origin/<branch>")
+  local saw_main = false
+  for _, ref in ipairs(epic_repair.rev_parses) do
+    if ref == "origin/main" then saw_main = true end
+  end
+  eq(saw_main, true, "the repair resolves the fresh base it reconciles onto")
+  -- The push follows the implementer: the reset itself stays local, so a
+  -- failed or interrupted turn cannot wipe on `origin` the work the subtasks
+  -- merged. Only a branch the implementer has actually redone is pushed, and
+  -- that push precedes the relaunched merge.
+  local reset_at, impl_at, first_push_after_reset, last_merge_at = nil, nil, nil, nil
+  for i, step in ipairs(epic_repair.order) do
+    if step == "reset" and not reset_at then reset_at = i end
+    if step == "implement" and not impl_at then impl_at = i end
+    if step == "push" and reset_at and not first_push_after_reset then
+      first_push_after_reset = i
+    end
+    if step == "merge" then last_merge_at = i end
+  end
+  eq(#epic_repair.pushes >= 1, true, "the redone epic branch is pushed")
+  eq(reset_at ~= nil and first_push_after_reset ~= nil
+    and first_push_after_reset > reset_at, true,
+    "the push happens after the reset onto the fresh base")
+  eq(impl_at ~= nil and first_push_after_reset ~= nil
+    and first_push_after_reset > impl_at, true,
+    "the epic branch is not pushed before the implementer has redone it")
+  eq(first_push_after_reset ~= nil and last_merge_at ~= nil
+    and first_push_after_reset < last_merge_at, true,
+    "the push happens before the merge is relaunched")
+  eq(epic_repair.order[1], "merge", "the first merge comes before any repair")
+  eq(epic_repair.order[reset_at + 1], "implement",
+    "the fresh reset is immediately followed by the implementer turn")
+  eq(epic_repair.order[reset_at + 2], "push",
+    "the push follows the implementer turn, never the reset")
+  for i, step in ipairs(epic_repair.order) do
+    if step == "push" then
+      eq(i > impl_at, true, "no push happens before the implementer redoes the branch")
+    end
+  end
+  eq(epic_repair.record.conflict_retries, 1, "the epic repair is counted")
+  eq(epic_repair.record.status, "deployed", "the repaired epic deploys")
+  eq(#epic_failed(epic_repair.events), 0,
+    "the repaired epic is never marked failed")
+  eq(#epic_notes(epic_repair.events, "will be redone on the fresh base"), 1,
+    "the epic conflict is journalled as repairable once")
+
+  -- A conflict whose payload carries no `base_sha` still names the base with
+  -- its SHA: the runtime resolves it from `origin/<base>` rather than handing
+  -- the implementer (or the human) a base named "unknown".
+  local epic_no_sha = epic_conflict_deps(2, 1, {
+    shas = { ["origin/main"] = "fed321", ["origin/metronome/epic/demo-0001"] = "tip999" },
+    payload = function()
+      return {
+        ok = false,
+        conflict = { "maki/lua/metronome/runtime.lua" },
+        base = "main",
+        upstream = "origin/main",
+        rebase_command = "git rebase origin/main",
+      }
+    end,
+  })
+  local rt_epic_no_sha = runtime.new(epic_no_sha.deps)
+  rt_epic_no_sha.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_no_sha.run_pending()
+  eq(epic_no_sha.pr_opens(), 1, "a conflict with `conflict` as a table reuses the PR")
+  eq(epic_no_sha.impl_calls(), 1, "a conflict with `conflict` as a table is repaired")
+  eq(epic_no_sha.impl_conflicts[1] and epic_no_sha.impl_conflicts[1].files
+    and epic_no_sha.impl_conflicts[1].files[1], "maki/lua/metronome/runtime.lua",
+    "the table form of `conflict` names the files in the repair turn")
+  eq(epic_no_sha.impl_conflicts[1] and epic_no_sha.impl_conflicts[1].base_sha, "fed321",
+    "the repair turn receives the base SHA resolved by the runtime")
+  eq(epic_no_sha.record.conflict_retries, 1, "the table form is counted like any conflict")
+  eq(epic_no_sha.resets[1] and epic_no_sha.resets[1].sha, "fed321",
+    "the reset follows the base SHA the runtime resolved, not the branch tip")
+
+  -- When `origin/<base>` cannot be resolved but the merge result already
+  -- carried a usable `base_sha`, the repair still proceeds on that SHA instead
+  -- of breaking to escalation on a base it could have reset onto.
+  local epic_sha_fallback = epic_conflict_deps(2, 1, {
+    shas = { ["origin/metronome/epic/demo-0001"] = "tip999" },
+  })
+  local rt_epic_sha_fallback = runtime.new(epic_sha_fallback.deps)
+  rt_epic_sha_fallback.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_sha_fallback.run_pending()
+  eq(epic_sha_fallback.resets[1] and epic_sha_fallback.resets[1].sha, "base123",
+    "an unresolvable origin/<base> falls back to the base SHA the merge carried")
+  eq(epic_sha_fallback.impl_calls(), 1,
+    "the repair turn runs when the base SHA comes from the merge result")
+  eq(epic_sha_fallback.merge_calls(), 2, "the merge is retried after the fallback repair")
+  eq(epic_sha_fallback.pr_opens(), 1, "the fallback repair reuses the single PR")
+  eq(epic_sha_fallback.record.status, "deployed",
+    "a repair on the carried base SHA does not escalate the epic")
+
+  -- A repair turn that keeps failing re-enters the cycle under the bound: the
+  -- epic is not failed after the first failed turn, and the merge is never
+  -- relaunched on a branch that was not redone. Only the exhausted budget
+  -- escalates, naming the facts plus the reason the repair did not happen.
+  local epic_impl_failed = epic_conflict_deps(2, 1, {
+    impl_ok = false, impl_error = "implementer turn aborted",
+  })
+  local rt_epic_impl_failed = runtime.new(epic_impl_failed.deps)
+  rt_epic_impl_failed.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_impl_failed.run_pending()
+  eq(epic_impl_failed.impl_calls(), 2,
+    "a failed repair turn re-enters the cycle until the bound is spent")
+  eq(epic_impl_failed.merge_calls(), 1,
+    "the merge is not relaunched after a repair that did not happen")
+  eq(epic_impl_failed.pr_opens(), 1, "a failed repair opens no second PR")
+  eq(epic_impl_failed.record.conflict_retries, 2,
+    "the failed attempts spend the persisted budget, never more than the bound")
+  eq(epic_impl_failed.record.conflict_retried, true,
+    "the boolean fallback is set so a reload continues the same budget")
+  eq(epic_impl_failed.record.status, "failed",
+    "the epic escalates only once the repair bound is exhausted")
+  local impl_failures = epic_failed(epic_impl_failed.events)
+  eq(#impl_failures, 1, "the epic is failed exactly once, at the bound")
+  local impl_message = tostring(impl_failures[1] and impl_failures[1].reason or "")
+  eq(impl_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the escalation still names the conflicting files")
+  eq(impl_message:find("base123", 1, true) ~= nil, true,
+    "the escalation still names the base SHA")
+  eq(impl_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the escalation still names the exact command")
+  eq(impl_message:find("implementer turn aborted", 1, true) ~= nil, true,
+    "the escalation says why no repair happened")
+  eq(#epic_impl_failed.pushes, 0,
+    "a failed repair turn never pushes: the epic branch on origin keeps its work")
+
+  -- A failed turn is not final under the bound: when the next turn redoes the
+  -- branch, the epic repairs and deploys without ever being marked failed.
+  local epic_flaky = epic_conflict_deps(2, 1, {
+    impl_fail_times = 1, impl_error = "transient implementer crash",
+  })
+  local rt_epic_flaky = runtime.new(epic_flaky.deps)
+  rt_epic_flaky.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_flaky.run_pending()
+  eq(epic_flaky.impl_calls(), 2, "a failed turn is retried instead of failing the epic")
+  eq(epic_flaky.merge_calls(), 2, "the merge is relaunched once the branch is redone")
+  eq(epic_flaky.pr_opens(), 1, "the retried repair reuses the single PR")
+  eq(epic_flaky.record.status, "deployed", "a flaky repair still deploys the epic")
+  eq(#epic_failed(epic_flaky.events), 0,
+    "no failed is journaled on the conflict turn while the bound has room")
+
+  -- A turn that commits nothing is not a repair. `run_impl` reports
+  -- `ok = true, no_changes = true` when the tree was already clean; right
+  -- after the reset the branch sits on the fresh base, so relaunching the
+  -- merge would succeed trivially and the epic would deploy without the work
+  -- its subtasks merged. The attempt is retried under the bound and the merge
+  -- is never relaunched on the unchanged branch.
+  local epic_no_op = epic_conflict_deps(2, 1, { impl_no_changes = true })
+  local rt_epic_no_op = runtime.new(epic_no_op.deps)
+  rt_epic_no_op.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_no_op.run_pending()
+  eq(epic_no_op.impl_calls(), 2,
+    "a no-op repair turn re-enters the cycle until the bound is spent")
+  eq(epic_no_op.merge_calls(), 1,
+    "the merge is not relaunched when the branch was not redone")
+  eq(epic_no_op.pr_opens(), 1, "a no-op repair opens no second PR")
+  eq(epic_no_op.record.conflict_retries, 2,
+    "the no-op attempts spend the persisted budget up to the bound")
+  eq(epic_no_op.record.status, "failed",
+    "an epic whose branch was never redone escalates once the bound is spent")
+  eq(#epic_no_op.pushes, 0, "an unchanged epic branch is never pushed")
+  eq(epic_no_op.impl_push_flags[1], false,
+    "the implementer never pushes the epic branch during a repair attempt")
+  local noop_failures = epic_failed(epic_no_op.events)
+  local noop_message = tostring(noop_failures[1] and noop_failures[1].reason or "")
+  eq(noop_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the no-op escalation names the conflicting files")
+  eq(noop_message:find("base123", 1, true) ~= nil, true,
+    "the no-op escalation names the base SHA")
+  eq(noop_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the no-op escalation names the exact command")
+  eq(noop_message:find("no commit", 1, true) ~= nil, true,
+    "the no-op escalation says the branch was not redone")
+
+  -- A no-op first turn followed by a real repair: the epic must deploy, not
+  -- silently merge the bare base.
+  local epic_noop_then_redone = epic_conflict_deps(2, 1, { impl_no_op_times = 1 })
+  local rt_epic_noop_then_redone = runtime.new(epic_noop_then_redone.deps)
+  rt_epic_noop_then_redone.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_noop_then_redone.run_pending()
+  eq(epic_noop_then_redone.impl_calls(), 2,
+    "a no-op turn is retried rather than failing the epic")
+  eq(epic_noop_then_redone.merge_calls(), 2,
+    "the merge follows the turn that actually redid the branch")
+  eq(epic_noop_then_redone.record.status, "deployed",
+    "the epic deploys only after a real repair")
+  eq(#epic_failed(epic_noop_then_redone.events), 0,
+    "a no-op turn under the bound is never a failed turn")
+
+  local epic_escalated = epic_conflict_deps(0, math.huge)
+  local rt_epic_escalated = runtime.new(epic_escalated.deps)
+  rt_epic_escalated.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_escalated.run_pending()
+  eq(epic_escalated.record.status, "failed",
+    "an epic conflict beyond the bound escalates to a human")
+  eq(epic_escalated.impl_calls(), 0,
+    "no repair is attempted once the epic bound is reached")
+  local epic_failures = epic_failed(epic_escalated.events)
+  local epic_message = tostring(epic_failures[1] and epic_failures[1].reason or "")
+  eq(epic_message ~= "", true, "the epic escalation carries a message")
+  eq(epic_message:find("docs/configuration.md", 1, true) ~= nil, true,
+    "the epic escalation names the conflicting files")
+  eq(epic_message:find("base123", 1, true) ~= nil, true,
+    "the epic escalation names the base SHA")
+  eq(epic_message:find("git rebase origin/main", 1, true) ~= nil, true,
+    "the epic escalation names the exact command")
+  eq(epic_message:find("no error details", 1, true), nil,
+    "the epic escalation is never 'no error details'")
+end
+
 local function case_failure_policy(env)
   local runtime, root, config, paths, deps, ctx =
     env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
+
+
   -- Failure policy and unblockable drain ------------------------------------
   --
   -- A failed task and a stopped workflow are the worst outcomes: every failure
@@ -4137,6 +4826,7 @@ return function()
   case_second_conflict(env)
   case_epic_subtask(env)
   case_epic_task(env)
+  case_epic_conflict(env)
   case_failure_policy(env)
 
   -- status: the named skip reason of the scheduler is exposed ----------------
