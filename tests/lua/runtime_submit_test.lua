@@ -1516,6 +1516,12 @@ return function()
     "an epic repair turn says the branch itself is the work")
   eq(epic_conflict_prompt:find("base123", 1, true) ~= nil, true,
     "an epic repair turn carries the base with its SHA")
+  eq(epic_conflict_prompt:find("reset onto the fresh base", 1, true) ~= nil, true,
+    "an epic repair turn says the worktree was reset onto the fresh base")
+  eq(epic_conflict_prompt:find("origin/b", 1, true) ~= nil, true,
+    "an epic repair turn says to recover the branch content from origin/<branch>")
+  eq(epic_conflict_prompt:find("origin/main", 1, true) ~= nil, true,
+    "an epic repair turn says to compare against origin/<base>")
   local plain_prompt = implement.render_prompt(
     { id = "T1", title = "t", files = {}, checks = {} }, "sheet",
     { repo = "/tmp/repo", worktree = "/tmp/wt", branch = "b", base_ref = "main" }, {})
@@ -2336,6 +2342,7 @@ auto_deploy = false
     local pr_opens = 0
     local impl_conflicts = {}
     local impl_calls = 0
+    local impl_push_flags = {}
     local merge_calls = 0
     local resets = {}
     local pushes = {}
@@ -2383,14 +2390,18 @@ auto_deploy = false
       implement = {
         run = function(o)
           impl_calls = impl_calls + 1
+          local call = impl_calls
+          impl_push_flags[#impl_push_flags + 1] = o.push
           order[#order + 1] = "implement"
           if o.conflict ~= nil then
             impl_conflicts[#impl_conflicts + 1] = o.conflict
           end
-          if opts.impl_ok == false then
+          if opts.impl_ok == false
+            or (opts.impl_fail_times and call <= opts.impl_fail_times) then
             return { ok = false, error = opts.impl_error or "implementer crashed" }
           end
-          if opts.impl_no_changes then
+          if opts.impl_no_changes
+            or (opts.impl_no_op_times and call <= opts.impl_no_op_times) then
             -- `run_impl` reports a benign turn that committed nothing this
             -- way: `ok = true` with the head still on the fresh base.
             return {
@@ -2505,6 +2516,7 @@ auto_deploy = false
       events = events,
       impl_conflicts = impl_conflicts,
       impl_calls = function() return impl_calls end,
+      impl_push_flags = impl_push_flags,
       pr_opens = function() return pr_opens end,
       merge_calls = function() return merge_calls end,
       resets = resets,
@@ -2521,6 +2533,8 @@ auto_deploy = false
   eq(epic_repair.merge_calls(), 2, "the epic merge is retried after the repair")
   eq(epic_repair.pr_opens(), 1, "the repaired epic reuses its single PR")
   eq(epic_repair.impl_calls(), 1, "the epic repair runs one implementer turn")
+  eq(epic_repair.impl_push_flags[1], false,
+    "the implementer must not push the epic branch: the runtime pushes it after the redo")
   eq(#epic_repair.impl_conflicts, 1, "the epic repair hands the conflict over")
   eq(epic_repair.impl_conflicts[1] and epic_repair.impl_conflicts[1].files
     and epic_repair.impl_conflicts[1].files[1], "docs/configuration.md",
@@ -2616,25 +2630,29 @@ auto_deploy = false
   eq(epic_no_sha.resets[1] and epic_no_sha.resets[1].sha, "fed321",
     "the reset follows the base SHA the runtime resolved, not the branch tip")
 
-  -- A repair turn that fails is not a repair: the budget is untouched, the
-  -- merge is not relaunched, and the escalation names the facts plus the
-  -- reason the repair did not happen.
+  -- A repair turn that keeps failing re-enters the cycle under the bound: the
+  -- epic is not failed after the first failed turn, and the merge is never
+  -- relaunched on a branch that was not redone. Only the exhausted budget
+  -- escalates, naming the facts plus the reason the repair did not happen.
   local epic_impl_failed = epic_conflict_deps(2, 1, {
     impl_ok = false, impl_error = "implementer turn aborted",
   })
   local rt_epic_impl_failed = runtime.new(epic_impl_failed.deps)
   rt_epic_impl_failed.submit({ intention = "x", fast = false }, { session = "S1" })
   rt_epic_impl_failed.run_pending()
-  eq(epic_impl_failed.impl_calls(), 1, "the failing repair turn is attempted once")
+  eq(epic_impl_failed.impl_calls(), 2,
+    "a failed repair turn re-enters the cycle until the bound is spent")
   eq(epic_impl_failed.merge_calls(), 1,
     "the merge is not relaunched after a repair that did not happen")
   eq(epic_impl_failed.pr_opens(), 1, "a failed repair opens no second PR")
-  eq(epic_impl_failed.record.conflict_retries, nil,
-    "a repair that did not happen does not spend the budget")
-  eq(epic_impl_failed.record.conflict_retried, nil,
-    "a failed repair never sets the boolean fallback that would spend the budget")
-  eq(epic_impl_failed.record.status, "failed", "an unrepairable epic fails")
+  eq(epic_impl_failed.record.conflict_retries, 2,
+    "the failed attempts spend the persisted budget, never more than the bound")
+  eq(epic_impl_failed.record.conflict_retried, true,
+    "the boolean fallback is set so a reload continues the same budget")
+  eq(epic_impl_failed.record.status, "failed",
+    "the epic escalates only once the repair bound is exhausted")
   local impl_failures = epic_failed(epic_impl_failed.events)
+  eq(#impl_failures, 1, "the epic is failed exactly once, at the bound")
   local impl_message = tostring(impl_failures[1] and impl_failures[1].reason or "")
   eq(impl_message:find("docs/configuration.md", 1, true) ~= nil, true,
     "the escalation still names the conflicting files")
@@ -2647,24 +2665,43 @@ auto_deploy = false
   eq(#epic_impl_failed.pushes, 0,
     "a failed repair turn never pushes: the epic branch on origin keeps its work")
 
-  -- A turn that commits nothing is not a repair either. `run_impl` reports
+  -- A failed turn is not final under the bound: when the next turn redoes the
+  -- branch, the epic repairs and deploys without ever being marked failed.
+  local epic_flaky = epic_conflict_deps(2, 1, {
+    impl_fail_times = 1, impl_error = "transient implementer crash",
+  })
+  local rt_epic_flaky = runtime.new(epic_flaky.deps)
+  rt_epic_flaky.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_flaky.run_pending()
+  eq(epic_flaky.impl_calls(), 2, "a failed turn is retried instead of failing the epic")
+  eq(epic_flaky.merge_calls(), 2, "the merge is relaunched once the branch is redone")
+  eq(epic_flaky.pr_opens(), 1, "the retried repair reuses the single PR")
+  eq(epic_flaky.record.status, "deployed", "a flaky repair still deploys the epic")
+  eq(#epic_failed(epic_flaky.events), 0,
+    "no failed is journaled on the conflict turn while the bound has room")
+
+  -- A turn that commits nothing is not a repair. `run_impl` reports
   -- `ok = true, no_changes = true` when the tree was already clean; right
   -- after the reset the branch sits on the fresh base, so relaunching the
   -- merge would succeed trivially and the epic would deploy without the work
-  -- its subtasks merged. The budget is untouched and the epic escalates.
+  -- its subtasks merged. The attempt is retried under the bound and the merge
+  -- is never relaunched on the unchanged branch.
   local epic_no_op = epic_conflict_deps(2, 1, { impl_no_changes = true })
   local rt_epic_no_op = runtime.new(epic_no_op.deps)
   rt_epic_no_op.submit({ intention = "x", fast = false }, { session = "S1" })
   rt_epic_no_op.run_pending()
-  eq(epic_no_op.impl_calls(), 1, "the no-op repair turn is attempted once")
+  eq(epic_no_op.impl_calls(), 2,
+    "a no-op repair turn re-enters the cycle until the bound is spent")
   eq(epic_no_op.merge_calls(), 1,
     "the merge is not relaunched when the branch was not redone")
   eq(epic_no_op.pr_opens(), 1, "a no-op repair opens no second PR")
-  eq(epic_no_op.record.conflict_retries, nil,
-    "a turn that made no commit does not spend the budget")
+  eq(epic_no_op.record.conflict_retries, 2,
+    "the no-op attempts spend the persisted budget up to the bound")
   eq(epic_no_op.record.status, "failed",
-    "an epic whose branch was not redone does not deploy")
+    "an epic whose branch was never redone escalates once the bound is spent")
   eq(#epic_no_op.pushes, 0, "an unchanged epic branch is never pushed")
+  eq(epic_no_op.impl_push_flags[1], false,
+    "the implementer never pushes the epic branch during a repair attempt")
   local noop_failures = epic_failed(epic_no_op.events)
   local noop_message = tostring(noop_failures[1] and noop_failures[1].reason or "")
   eq(noop_message:find("docs/configuration.md", 1, true) ~= nil, true,
@@ -2675,6 +2712,21 @@ auto_deploy = false
     "the no-op escalation names the exact command")
   eq(noop_message:find("no commit", 1, true) ~= nil, true,
     "the no-op escalation says the branch was not redone")
+
+  -- A no-op first turn followed by a real repair: the epic must deploy, not
+  -- silently merge the bare base.
+  local epic_noop_then_redone = epic_conflict_deps(2, 1, { impl_no_op_times = 1 })
+  local rt_epic_noop_then_redone = runtime.new(epic_noop_then_redone.deps)
+  rt_epic_noop_then_redone.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_noop_then_redone.run_pending()
+  eq(epic_noop_then_redone.impl_calls(), 2,
+    "a no-op turn is retried rather than failing the epic")
+  eq(epic_noop_then_redone.merge_calls(), 2,
+    "the merge follows the turn that actually redid the branch")
+  eq(epic_noop_then_redone.record.status, "deployed",
+    "the epic deploys only after a real repair")
+  eq(#epic_failed(epic_noop_then_redone.events), 0,
+    "a no-op turn under the bound is never a failed turn")
 
   local epic_escalated = epic_conflict_deps(0, math.huge)
   local rt_epic_escalated = runtime.new(epic_escalated.deps)

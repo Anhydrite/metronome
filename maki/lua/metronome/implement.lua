@@ -197,11 +197,22 @@ function M.render_prompt(task, sheet, ctx, opts)
     line("instructions.")
     if tostring(task.kind or "") == "epic" then
       -- An epic has no implementation of its own, so the usual "redo the task"
-      -- does not apply: the reconciliation of its branch is the work.
-      line("This is the epic branch: it carries the work its subtasks already")
-      line("merged. Reconcile it onto the base without reverting that work —")
-      line("that reconciliation is the task, there is no other implementation")
-      line("to redo here.")
+      -- does not apply: the reconciliation of its branch is the work. The
+      -- runtime reset the worktree hard to the fresh base before this turn, so
+      -- the local branch no longer holds what the subtasks merged: the prompt
+      -- must say where that work lives, or the implementer would replay an
+      -- empty branch.
+      local epic_branch = tostring(ctx.branch or "")
+      local epic_base = tostring(ctx.base_ref or "")
+      local remote_epic = epic_branch ~= "" and ("origin/" .. epic_branch) or "the remote branch"
+      local remote_base = epic_base ~= "" and ("origin/" .. epic_base) or "the remote base"
+      line("This is the epic branch: its content is the work its subtasks already")
+      line("merged. The worktree was reset onto the fresh base before this turn,")
+      line("so the local branch no longer carries that work: recover it from")
+      line(remote_epic .. " (compare `git log` and `git diff " .. remote_base
+        .. "..." .. remote_epic .. "`) and replay it onto the fresh base,")
+      line("resolving the conflict below without reverting any of it. That")
+      line("reconciliation is the task; there is no other implementation to redo.")
     end
     line("")
     line("- Files: " .. (#conflicted > 0 and join_list(conflicted) or "unknown"))
