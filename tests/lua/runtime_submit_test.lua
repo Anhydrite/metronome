@@ -218,6 +218,143 @@ local function case_qualify_positions(env)
     "dependency batch positions are remapped to task ids")
 end
 
+local function case_qualify_t_form(env)
+  local runtime, root, config, paths, deps, ctx =
+    env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
+  -- Qualification remaps « T<n> » dependency forms to task ids -------------
+
+  -- The qualifier emits "T<n>" references (T1, T3, ...) that are neither real
+  -- ids, nor bare indices, nor titles; they must resolve to the n-th applied
+  -- task or the scheduler blocks those tasks forever.
+  local remap_deps = function(applied_tasks, sink)
+    return {
+      config = {
+        load = function()
+          return { project = { repo = "/tmp/repo", base_ref = "main" } }
+        end,
+      },
+      roles = {
+        session_opts = function()
+          return { system = "", model_spec = "test/model", thinking = "low", tools = {} }
+        end,
+      },
+      qualify = {
+        run = function()
+          return { ok = true, tasks = applied_tasks }
+        end,
+        next_id = function()
+          return applied_tasks[1] and applied_tasks[1].id or "T-1"
+        end,
+        apply = function()
+          return { ok = true, tasks = applied_tasks }
+        end,
+      },
+      questions = {
+        round = function()
+          return nil
+        end,
+      },
+      analyze = {
+        gate = function()
+          return { ok = true }
+        end,
+      },
+      pipeline = {
+        tick = function()
+          return { ok = true, started = {} }
+        end,
+      },
+      state = {
+        load = function()
+          return { tasks = {} }
+        end,
+        set_fields = function(_, id, fields)
+          sink[id] = fields
+          return { id = id }
+        end,
+      },
+      paths = function()
+        return paths
+      end,
+      spawn = function(fn)
+        fn()
+      end,
+      wait_turn_end = false,
+      runner = {}, checks = {}, converge = {}, review = {}, merge = {},
+      deploy = {}, calibrate = {}, fence = {}, mode = {},
+      git = {
+        branch_create = function(_, name)
+          return { ok = true, branch = name, created = true }
+        end,
+        push_branch = function()
+          return true
+        end,
+      },
+      implement = { slug = function(text, max)
+        local out = tostring(text):lower():gsub("[^%w]+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+        if max and #out > max then out = out:sub(1, max):gsub("%-+$", "") end
+        return out
+      end },
+    }
+  end
+
+  local set_fields_t = {}
+  local rt2t = runtime.new(remap_deps({
+    { id = "T-1", title = "Alpha" },
+    { id = "T-2", title = "Beta", depends_on = { "T1" } },
+  }, set_fields_t))
+  rt2t.submit({ intention = "x", fast = false }, ctx)
+  rt2t.run_pending()
+  eq(set_fields_t["T-2"] and set_fields_t["T-2"].depends_on
+    and set_fields_t["T-2"].depends_on[1], "T-1",
+    "« T<n> » dependencies are remapped to task ids")
+
+  -- A title that looks like "T2" must never win over the positional form.
+  local set_fields_t2 = {}
+  local rt2t2 = runtime.new(remap_deps({
+    { id = "T-1", title = "T2" },
+    { id = "T-2", title = "Beta" },
+    { id = "T-3", title = "Gamma", depends_on = { "T2" } },
+  }, set_fields_t2))
+  rt2t2.submit({ intention = "x", fast = false }, ctx)
+  rt2t2.run_pending()
+  eq(set_fields_t2["T-3"] and set_fields_t2["T-3"].depends_on
+    and set_fields_t2["T-3"].depends_on[1], "T-2",
+    "« T<n> » wins over a title spelled like it")
+
+  -- Precedence: an applied id that literally reads "T2" wins over position 2.
+  local set_fields_prec = {}
+  local rt2p = runtime.new(remap_deps({
+    { id = "T2", title = "Zed" },
+    { id = "T-9", title = "Yankee" },
+    { id = "T-3", title = "Xray", depends_on = { "T2", "Yankee" } },
+  }, set_fields_prec))
+  rt2p.submit({ intention = "x", fast = false }, ctx)
+  rt2p.run_pending()
+  eq(set_fields_prec["T-3"] and set_fields_prec["T-3"].depends_on
+    and set_fields_prec["T-3"].depends_on[1], "T2",
+    "an exact applied id wins over a « T<n> » batch position")
+  eq(set_fields_prec["T-3"] and set_fields_prec["T-3"].depends_on
+    and set_fields_prec["T-3"].depends_on[2], "T-9",
+    "titles still resolve when no positional form matches")
+
+  -- An unknown reference stays verbatim; the analysis gate blocks it later.
+  local set_fields_ghost = {}
+  local rt2g = runtime.new(remap_deps({
+    { id = "T-1", title = "Alpha" },
+    { id = "T-2", title = "Beta", depends_on = { "ghost", "Alpha" } },
+  }, set_fields_ghost))
+  rt2g.submit({ intention = "x", fast = false }, ctx)
+  rt2g.run_pending()
+  eq(set_fields_ghost["T-2"] and set_fields_ghost["T-2"].depends_on
+    and set_fields_ghost["T-2"].depends_on[1], "ghost",
+    "an unknown dependency reference stays verbatim")
+  eq(set_fields_ghost["T-2"] and set_fields_ghost["T-2"].depends_on
+    and set_fields_ghost["T-2"].depends_on[2], "T-1",
+    "known references are still remapped next to an unknown one")
+end
+
+
 local function case_retry_dispatch(env)
   local runtime, root, config, paths, deps, ctx =
     env.runtime, env.root, env.config, env.paths, env.deps, env.ctx
@@ -3983,6 +4120,7 @@ return function()
 
   case_qualify_remap(env)
   case_qualify_positions(env)
+  case_qualify_t_form(env)
   case_retry_dispatch(env)
   case_background_ctx(env)
   case_auto_deploy(env)
@@ -4000,5 +4138,80 @@ return function()
   case_epic_subtask(env)
   case_epic_task(env)
   case_failure_policy(env)
+
+  -- status: the named skip reason of the scheduler is exposed ----------------
+  --
+  -- A ready task is not necessarily dispatchable: an unknown dependency or a
+  -- dependency still in draft keeps it out of the queue forever. `status` used
+  -- to return the raw tasks, so such a task looked ready and nothing said why
+  -- it never started.
+  local status_root = mktmpdir("metronome-runtime-status")
+  local status_paths = {
+    repo = "/tmp/repo",
+    root = status_root,
+    config = maki.fs.joinpath(status_root, "config.toml"),
+    -- The status view derives the worktree it would use for a task, so the
+    -- fixture must carry the directory the real paths table always has.
+    worktrees = maki.fs.joinpath(status_root, "worktrees"),
+    runs = maki.fs.joinpath(status_root, "runs"),
+  }
+  local status_tasks = {
+    T1 = { id = "T1", title = "ghost", status = "ready", files = { "a" },
+      depends_on = { "T-nope" } },
+    T2 = { id = "T2", title = "drafty", status = "ready", files = { "b" },
+      depends_on = { "T3" } },
+    T3 = { id = "T3", title = "draft dep", status = "draft", files = { "c" } },
+    T4 = { id = "T4", title = "free", status = "ready", files = { "d" } },
+  }
+  local status_rt = runtime.new({
+    config = {
+      load = function()
+        return { project = { repo = "/tmp/repo", base_ref = "main", max_parallel = 2 } }
+      end,
+    },
+    state = {
+      load = function() return { tasks = status_tasks, events = {} } end,
+    },
+    pipeline = load_module("pipeline"),
+    paths = function() return status_paths end,
+    roles = {}, runner = {}, git = {}, qualify = {}, questions = {},
+    analyze = {}, checks = {}, converge = {}, review = {}, merge = {},
+    deploy = {}, calibrate = {}, fence = {}, mode = {}, implement = {},
+  })
+  local status_result = status_rt.status({})
+  eq(status_result.ok, true, "status reads the state")
+  eq(#status_result.waiting, 2, "the two blocked ready tasks are named")
+  eq(status_result.waiting[1].id, "T1", "waiting is sorted by id (1)")
+  eq(status_result.waiting[1].reason:find("missing dependency: T-nope", 1, true) ~= nil, true,
+    "the missing dependency is named")
+  eq(status_result.waiting[2].id, "T2", "waiting is sorted by id (2)")
+  eq(status_result.waiting[2].reason:find("waiting on T3 (draft)", 1, true) ~= nil, true,
+    "the draft dependency is named")
+  eq(status_result.tasks.T1.waiting_reason:find("missing dependency", 1, true) ~= nil, true,
+    "the blocked task carries its reason")
+  eq(status_result.tasks.T2.waiting_reason:find("waiting on T3", 1, true) ~= nil, true,
+    "the waiting task carries its reason")
+  eq(status_result.tasks.T4.waiting_reason, nil, "a dispatchable task carries no reason")
+
+  -- A config that cannot be read must not fail status: the scheduler default
+  -- applies and the reasons still come out.
+  local broken_rt = runtime.new({
+    config = {
+      load = function()
+        error("unreadable config")
+      end,
+    },
+    state = {
+      load = function() return { tasks = status_tasks, events = {} } end,
+    },
+    pipeline = load_module("pipeline"),
+    paths = function() return status_paths end,
+    roles = {}, runner = {}, git = {}, qualify = {}, questions = {},
+    analyze = {}, checks = {}, converge = {}, review = {}, merge = {},
+    deploy = {}, calibrate = {}, fence = {}, mode = {}, implement = {},
+  })
+  local broken_result = broken_rt.status({})
+  eq(broken_result.ok, true, "an invalid config does not fail status")
+  eq(#broken_result.waiting, 2, "the reasons still come out without a config")
 
 end
