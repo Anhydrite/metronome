@@ -407,6 +407,10 @@ function M.verify_after_merge(opts)
   local result, cerr = checks.run(opts.commands or {}, {
     worktree = temp,
     timeout_ms = opts.timeout_ms,
+    -- The post-merge checks belong to the task being merged: give them the
+    -- same private XDG_STATE_HOME as its in-worktree checks.
+    root = opts.root,
+    task_id = opts.task_id,
   })
 
   -- The temp worktree is removed whatever the verdict: a red base must not
