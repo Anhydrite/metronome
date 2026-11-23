@@ -1993,6 +1993,197 @@ function M.new(deps)
     end
   end
 
+  -- Slots ------------------------------------------------------------------
+
+  -- The statuses that hold a slot. Mirrors `pipeline.ACTIVE`; it is only a
+  -- fallback for a caller that injected a pipeline module without `slots()`.
+  local ACTIVE_STATUSES = {
+    running = true,
+    verifying = true,
+    reviewing = true,
+    merging = true,
+    deploying = true,
+  }
+
+  -- The statuses `pipeline.resume` can walk back to `running`. Mirrors its
+  -- local `RESUME_PHASE`; only a fallback for the compare-and-set the resume
+  -- does before parking a task, so a task that reached a status the resume
+  -- cannot revive (`merged`, `queued`, ...) is never parked from it.
+  local RESUME_STATUSES = {
+    running = true,
+    stalled = true,
+    verifying = true,
+    reviewing = true,
+    merging = true,
+    deploying = true,
+    failed = true,
+  }
+
+  -- The requeue reason written when no slot is missing: the task is handed
+  -- back to the queue because a retry or a resume must not start it on its own
+  -- authority, not because the pipeline is full.
+  local REQUEUE_FOR_DISPATCH = "requeued for dispatch"
+
+  -- The project's cap, read exactly like the drain reads it, so a retry, a
+  -- resume, the status view and `pipeline.tick` all charge the same budget.
+  local function max_parallel_of(cfg)
+    local value = tonumber(type(cfg) == "table" and cfg.project and cfg.project.max_parallel)
+      or tonumber(type(cfg) == "table" and cfg.max_parallel) or 1
+    if value < 1 then
+      value = 1
+    end
+    return value
+  end
+
+  -- One wording for "no free slot", shared with `pipeline` so a tick skip, a
+  -- retry requeue and a resume requeue all say the same thing.
+  local function wait_slot_reason()
+    local text = type(deps.pipeline) == "table" and deps.pipeline.WAIT_SLOT or nil
+    if is_non_empty(text) then
+      return text
+    end
+    return "waiting for a free slot"
+  end
+
+  -- Normalise a projection to a list, for the fallback accounting below.
+  local function task_list(tasks)
+    local list = {}
+    if type(tasks) ~= "table" then
+      return list
+    end
+    if tasks[1] ~= nil then
+      for _, task in ipairs(tasks) do
+        if type(task) == "table" and type(task.id) == "string" then
+          list[#list + 1] = task
+        end
+      end
+      return list
+    end
+    local ids = {}
+    for id, task in pairs(tasks) do
+      if type(task) == "table" and type(task.id) == "string" then
+        ids[#ids + 1] = id
+      end
+    end
+    table.sort(ids)
+    for _, id in ipairs(ids) do
+      list[#list + 1] = tasks[id]
+    end
+    return list
+  end
+
+  -- The slot accounting a retry, a resume and the status view all use, so none
+  -- of them can read a different budget from the one `tick` enforces.
+  -- `exclude` names one task left out of the count: a task whose pilot has not
+  -- noticed yet must not be charged twice against the same budget.
+  local function slot_counts(tasks, max_parallel, exclude)
+    local pipeline = type(deps.pipeline) == "table" and deps.pipeline or nil
+    if pipeline and type(pipeline.slots) == "function" then
+      local called, in_flight, cap, free = pcall(pipeline.slots, tasks, {
+        max_parallel = max_parallel,
+        exclude = exclude,
+      })
+      if called and tonumber(cap) then
+        return tonumber(in_flight) or 0, tonumber(cap), tonumber(free) or 0
+      end
+    end
+    local cap = tonumber(max_parallel) or 1
+    if cap < 1 then
+      cap = 1
+    end
+    local in_flight = 0
+    for _, task in ipairs(task_list(tasks)) do
+      -- Mirror `pipeline.slots`: a parked `slot_wait` task holds no slot, even
+      -- when its original status is an active one.
+      if ACTIVE_STATUSES[task.status] and not task.slot_wait
+        and (exclude == nil or task.id ~= exclude) then
+        in_flight = in_flight + 1
+      end
+    end
+    local free = cap - in_flight
+    if free < 0 then
+      free = 0
+    end
+    return in_flight, cap, free
+  end
+
+  -- Persist a slot wait: `slot_wait = true`, its timestamp, and the named
+  -- reason in the journal. The task keeps its status and phase — a slot wait is
+  -- not a failure and never touches `failure_reason`. The field and the note
+  -- land in one append, so a reader never sees the flag without its reason.
+  --
+  -- A caller-injected state without `append` (tests, a scripted driver) still
+  -- gets the field through `set_fields`; the reason then lives in the returned
+  -- result and the status view rather than the journal.
+  local function mark_slot_wait(paths, task_id, reason, now)
+    now = now or os.date("!%Y-%m-%dT%H:%M:%SZ")
+    if type(deps.state.append) == "function" then
+      local ok, err = deps.state.append(paths.root, {
+        {
+          kind = "field",
+          task_id = task_id,
+          fields = { slot_wait = true, slot_wait_since = now },
+        },
+        { kind = "note", task_id = task_id, text = reason },
+      })
+      if not ok then
+        return nil, err
+      end
+      return true
+    end
+    if type(deps.state.set_fields) == "function" then
+      local ok, err = deps.state.set_fields(paths.root, task_id, {
+        slot_wait = true,
+        slot_wait_since = now,
+      })
+      if not ok then
+        return nil, err
+      end
+      return true
+    end
+    return nil, "the state module cannot persist a slot wait"
+  end
+
+  -- Why a task is not running, in words a human can act on. Computed from the
+  -- live projection, never persisted: the journal keeps the reason in a note
+  -- and this view recomputes it, so the status stays truthful after a reload.
+  -- An unmet dependency is named first — it would hold the task even with an
+  -- empty pipeline — then the slot wait. A task carrying the persisted
+  -- `slot_wait` flag is waiting by construction, whatever its status; a plain
+  -- `ready` task waits only when the cap leaves it no slot. Returns the reason
+  -- and, for a slot wait, its structure.
+  local function wait_reason_of(task, projection, max_parallel)
+    if type(task) ~= "table" or (not task.slot_wait and task.status ~= "ready") then
+      return nil, nil
+    end
+    local pipeline = type(deps.pipeline) == "table" and deps.pipeline or nil
+    if pipeline and type(pipeline.dependencies_met) == "function" then
+      local called, met, why = pcall(pipeline.dependencies_met, task, projection, {
+        max_parallel = max_parallel,
+        recover = recover_module(),
+      })
+      if called and met == false and is_non_empty(why) then
+        return why, nil
+      end
+    end
+    local in_flight, cap, free = slot_counts(projection, max_parallel, task.id)
+    -- A free slot means the drain can dispatch the task right away. A
+    -- `slot_wait` flag set while a slot is available is a hand-off to that
+    -- drain, not a wait — reporting it as `0 in flight, max_parallel 1` would
+    -- contradict itself. The journal still keeps the exact reason ("requeued
+    -- for dispatch"); the status only names a wait when the cap is actually
+    -- full, which is when a human wonders why nothing started.
+    if free > 0 then
+      return nil, nil
+    end
+    local reason = wait_slot_reason()
+    return string.format("%s (%d in flight, max_parallel %d)", reason, in_flight, cap), {
+      reason = reason,
+      in_flight = in_flight,
+      max_parallel = cap,
+    }
+  end
+
   -- The part of a run that follows qualification: the analysis gate, the
   -- scheduler loop and the optional deploy. `submit` reaches it after applying
   -- the qualified tasks; `answer` reaches it after the pending questions are
@@ -2013,12 +2204,9 @@ function M.new(deps)
     local deployed = false
 
     -- `max_parallel` is the project's cap, not a hardcoded one: a queue of
-    -- independent asks must not take one full pipeline each, end to end.
-    local max_parallel = tonumber(cfg.project and cfg.project.max_parallel)
-      or tonumber(cfg.max_parallel) or 1
-    if max_parallel < 1 then
-      max_parallel = 1
-    end
+    -- independent asks must not take one full pipeline each, end to end. Read
+    -- through the shared helper so a retry or a resume counts the same budget.
+    local max_parallel = max_parallel_of(cfg)
 
     -- Each selected task runs in its own plugin-lifetime spawn. A batch held
     -- by `async.join` lives in the drain's scope, and maki kills the live jobs
@@ -2436,17 +2624,81 @@ function M.new(deps)
           .. " skipped: the task is no longer failed")
         return nil
       end
+      -- A human retry parks a task as `failed` + `slot_wait` while the drain
+      -- waits for a slot, so the status guard alone would let this delayed job
+      -- through: it would move the task to `running` and spawn it directly,
+      -- past `max_parallel`, while another task still holds the slot. The
+      -- persisted wait means the drain owns the dispatch: this job must stand
+      -- down, not race it.
+      if current and current.slot_wait then
+        log(paths, "automatic retry of " .. tostring(task_id)
+          .. " skipped: the task is parked waiting for a free slot")
+        return nil
+      end
+      -- `max_parallel` is the only bound, and this job is a second dispatch
+      -- authority beside the drain's `tick`. Nothing above consults the cap, so
+      -- without this check a deferred retry fires while another task holds the
+      -- only slot and spawns beside it — the exact parallel-checks collision
+      -- this change removes. When no slot is free the task is parked like a
+      -- human retry (`slot_wait`, its reason, its timestamp; status and phase
+      -- untouched) and the drain — which sees `slot_wait` as a candidate and
+      -- moves the task to `running` through a legal path — dispatches it once a
+      -- slot frees. The count is read and the `failed -> running` move made in
+      -- one uninterrupted job step, so two jobs cannot both take the last slot.
+      local tasks_now = loaded and loaded.tasks or {}
+      local in_flight, cap, free = slot_counts(tasks_now, max_parallel_of(cfg), task_id)
+      if free <= 0 then
+        local reason = wait_slot_reason()
+        local marked, werr = mark_slot_wait(paths, task_id, reason)
+        if not marked then
+          log(paths, "automatic retry of " .. tostring(task_id)
+            .. " cannot be queued: " .. tostring(werr))
+          return nil
+        end
+        log(paths, string.format(
+          "task %s: automatic retry parked (%s: %d in flight, max_parallel %d)",
+          tostring(task_id), reason, in_flight, cap))
+        -- The persisted wait is the dispatch ticket: arm the drain, the single
+        -- authority that starts a parked task.
+        schedule_job(opts, paths, cfg, runner, session)
+        return nil
+      end
+      -- An automatic retry calls `run_and_handle` from this scheduler job, not
+      -- through `dispatch_one`, so it owns no spawn handle. Register one anyway:
+      -- a mid-session resume reads `task_handles` to tell a live task from an
+      -- interrupted one, and a live retry mistaken for interrupted would be
+      -- parked `slot_wait`, dropped out of the in-flight count and re-dispatched
+      -- on the same worktree — the duplicate-run/collision class this fixes.
+      -- The marker carries no `cancel`: it only proves the task is live.
+      local marker = { automatic_retry = true }
+      task_handles[task_id] = marker
       -- The legal `failed -> running` edge is the resume: it also settles the
-      -- attempt deadline so the next failure counts from this attempt.
-      local moved, merr = deps.state.transition(paths.root, task_id, "running", { phase = phase })
+      -- attempt deadline so the next failure counts from this attempt. The
+      -- dispatch also clears any residual wait atomically with the move.
+      local moved, merr = deps.state.transition(paths.root, task_id, "running", {
+        phase = phase,
+        fields = { slot_wait = false },
+      })
       if not moved then
+        if task_handles[task_id] == marker then
+          task_handles[task_id] = nil
+        end
         log(paths, "automatic retry of " .. tostring(task_id) .. " refused: " .. tostring(merr))
         return nil
       end
       log(paths, string.format("task %s: automatic retry (attempt %s/%s) after a %s failure",
         tostring(task_id), tostring(attempt),
         tostring(type(decision) == "table" and decision.max_attempts or "?"), cause))
-      return run_and_handle(opts, paths, cfg, runner, session, task_id)
+      local ran, result = pcall(run_and_handle, opts, paths, cfg, runner, session, task_id)
+      if task_handles[task_id] == marker then
+        task_handles[task_id] = nil
+      end
+      if not ran then
+        -- `run_and_handle` guards its own failures; re-raise anything it let
+        -- through so `run_pending` logs it instead of losing it.
+        error(result, 0)
+      end
+      return result
     end
 
     local function enqueue()
@@ -3041,6 +3293,19 @@ function M.new(deps)
     return recover_opts(nil)
   end
 
+  -- The project config, read the same way, for the numbers the status view
+  -- reports (the slot cap). A project without a readable config falls back to
+  -- the scheduler's own default.
+  local function status_config(paths)
+    if type(deps.config) == "table" and type(deps.config.load) == "function" then
+      local ok, cfg = pcall(deps.config.load, paths.config)
+      if ok and type(cfg) == "table" then
+        return cfg
+      end
+    end
+    return nil
+  end
+
   local RETRY_TOOL = "metronome_retry"
 
   -- The bound the status reports when the project config left it at the
@@ -3101,7 +3366,20 @@ function M.new(deps)
   -- A normalised view of one task for the status tools. The raw fields are
   -- copied untouched, so an existing caller keeps reading them; the enriched
   -- fields are what the panel and the agent need to resume the task.
-  local function status_view(paths, task, opts)
+  --
+  -- The two wait fields are a documented pair, not two spellings of one value:
+  --   * `slot_wait_flag` — the persisted task flag (`true` while the task is
+  --     parked, `nil` otherwise). This is the stable name for the boolean; the
+  --     raw task data is copied into the view, but `view.slot_wait` is *not* it.
+  --   * `slot_wait` — the live structured wait, `{ reason, in_flight,
+  --     max_parallel }`, or `nil` when the cap leaves the task no reason to
+  --     wait. A parked task whose slot is already free is a hand-off to the
+  --     drain: `slot_wait_flag` is still `true` but `slot_wait` is `nil`, since
+  --     reporting "0 in flight, max_parallel N" as a wait would contradict
+  --     itself. A consumer that only needs "is it parked?" must read
+  --     `slot_wait_flag`; one that wants to explain a wait reads `wait_reason`
+  --     (dependency first, then the slot) or `slot_wait.reason`.
+  local function status_view(paths, task, opts, projection, max_parallel)
     local view = {}
     for key, value in pairs(task) do
       view[key] = value
@@ -3111,6 +3389,18 @@ function M.new(deps)
     view.worktree = (type(task.worktree) == "string" and task.worktree ~= "" and task.worktree)
       or fs.joinpath(paths.worktrees, tostring(task.id or ""))
     view.transcript = status_transcript(paths, task)
+    -- Why a queued task is not running, named for a human: an unmet dependency
+    -- first, then the slot wait. Computed from the live projection, so no task
+    -- field is persisted and the journal schema is untouched.
+    local wait_reason, slot_wait = wait_reason_of(task, projection, max_parallel)
+    -- The persisted boolean is raw task data: the structured wait below only
+    -- reports a wait when the cap is actually full, so keep the raw flag
+    -- readable under its own key. A parked task whose drain is still pending has
+    -- `slot_wait = true` but no unmet cap — a caller must still be able to tell
+    -- it apart from a task that is not waiting at all.
+    view.slot_wait_flag = task.slot_wait and true or nil
+    view.wait_reason = wait_reason
+    view.slot_wait = slot_wait
     local last_error = status_last_error(task)
     view.last_error = last_error
     local retry = status_retry_action(task, opts)
@@ -3132,17 +3422,21 @@ function M.new(deps)
       return { ok = false, error = err or "cannot load state" }
     end
     local opts = status_recover_opts(paths)
+    -- The cap a queued task is waiting on: read from the config the way the
+    -- drain reads it, so the status never contradicts the scheduler.
+    local max_parallel = max_parallel_of(status_config(paths))
+    local projection = loaded.tasks or {}
     if is_non_empty(input and input.id) then
       local task = loaded.tasks and loaded.tasks[input.id]
       if not task then
         return { ok = false, error = "unknown task: " .. input.id }
       end
-      return { ok = true, task = status_view(paths, task, opts) }
+      return { ok = true, task = status_view(paths, task, opts, projection, max_parallel) }
     end
     local tasks = {}
     for id, task in pairs(loaded.tasks or {}) do
       if type(task) == "table" then
-        tasks[id] = status_view(paths, task, opts)
+        tasks[id] = status_view(paths, task, opts, projection, max_parallel)
       else
         tasks[id] = task
       end
@@ -3184,10 +3478,6 @@ function M.new(deps)
     if task.status ~= "failed" and task.status ~= "stalled" and task.status ~= "abandoned" then
       return { ok = false, error = "task is not failed, stalled or abandoned" }
     end
-    local moved, err = deps.state.transition(paths.root, input.id, "running", { phase = "implement" })
-    if not moved then
-      return { ok = false, error = err }
-    end
     -- A human retry is a fresh start: the attempt budget starts again from
     -- zero, so the automatic policy can act on the next failure instead of
     -- seeing a budget the user just reset as already spent.
@@ -3203,29 +3493,58 @@ function M.new(deps)
       pcall(deps.state.set_fields, paths.root, input.id, { failure = reset })
     end
 
-    -- A retry is a restart, not just a status move: re-dispatch the task from
-    -- its last checkpoint so the user does not have to submit it again.
     local cfg, cerr = load_config(nil)
     if not cfg then
-      return { ok = false, error = cerr, task = moved }
+      return { ok = false, error = cerr }
     end
     local opts = { ctx = M.resolve_ctx(input, ctx) }
     local runner, session, _, perr = prepare(opts, cfg, paths)
     if not runner then
-      return { ok = false, error = perr, task = moved }
+      return { ok = false, error = perr }
     end
     local bg = { ctx = background_ctx(opts.ctx) }
     pcall(function()
       maki.log.info("metronome retry bg in=" .. type(opts.ctx) .. " out=" .. type(bg.ctx))
     end)
-    -- Queued, not run: `run_pending` spawns the job, so even a retry that hangs
-    -- cannot hold the drain. The failure policy is the same one the scheduler
-    -- uses, so a retry that fails again is typed and, when transient, retried.
-    scheduler_extra[#scheduler_extra + 1] = function()
-      return run_and_handle(bg, paths, cfg, runner, session, input.id)
+
+    -- A retry is a restart, not just a status move — but it never starts the
+    -- task on its own authority. `max_parallel` is the only bound, and only
+    -- the drain enforces it: the task is parked with the persisted `slot_wait`
+    -- flag (keeping its original status and phase, so a task interrupted in
+    -- `reviewing` stays `reviewing`) and `pipeline.tick` dispatches it when a
+    -- slot is free. The tick moves a task to `running` before spawning it, so
+    -- admission is atomic by construction: two simultaneous retries cannot both
+    -- take the last slot, because the second one sees the first already in
+    -- flight.
+    local max_parallel = max_parallel_of(cfg)
+    local current = deps.state.load(paths.root)
+    local in_flight, cap, free = slot_counts(current and current.tasks or {},
+      max_parallel, input.id)
+    local waiting = free <= 0
+    local reason = waiting and wait_slot_reason() or REQUEUE_FOR_DISPATCH
+    local marked, merr = mark_slot_wait(paths, input.id, reason)
+    if not marked then
+      return { ok = false, error = merr }
     end
+    log(paths, string.format("task %s: queued for dispatch (%s)", tostring(input.id), reason))
+    -- Arm the drain: `pipeline.tick` is the single dispatch authority, so even
+    -- a retry that hangs cannot hold it, and no worktree is run twice.
     schedule_job(bg, paths, cfg, runner, session)
-    return { ok = true, background = true, task = moved }
+    local after = deps.state.load(paths.root)
+    local queued = after and after.tasks and after.tasks[input.id] or nil
+    return {
+      ok = true,
+      background = true,
+      requeued = true,
+      waiting = waiting or nil,
+      wait_reason = waiting and reason or nil,
+      slot_wait = waiting and {
+        reason = reason,
+        in_flight = in_flight,
+        max_parallel = cap,
+      } or nil,
+      task = queued,
+    }
   end
 
   -- Statuses a task can be stopped from: it is doing something, and stopping it
@@ -3587,31 +3906,106 @@ function M.new(deps)
       return { ok = false, error = perr }
     end
 
-    -- Walk each interrupted task back to `running` through legal transitions,
-    -- then re-dispatch it from its last checkpoint. `pipeline.resume` also
-    -- selects the `failed` tasks that are still retryable, so a `/reload`
-    -- restarts a transient failure instead of leaving it parked. Without the
-    -- dispatch the task only changes status and nothing drives it.
-    local resumed, err = deps.pipeline.resume(deps.state, paths.root, {
-      apply = true,
+    -- Select the interrupted tasks, then park each one for the drain. A resume
+    -- never walks a task to `running` on its own authority and never spawns it:
+    -- a reload that started every interrupted task at once is exactly the
+    -- `max_parallel` bypass this fixes. `pipeline.tick` is the single dispatch
+    -- authority; it sees the persisted `slot_wait` flag as a candidate once a
+    -- slot is free and clears the flag in the same transition. The task keeps
+    -- its original status and phase, so a task interrupted in `reviewing` stays
+    -- `reviewing` while it waits and a `/reload` replays the wait.
+    local max_parallel = max_parallel_of(cfg)
+    local selected, err = deps.pipeline.resume(deps.state, paths.root, {
+      apply = false,
       -- The same policy and bounds the drain uses, so a resume never retries
       -- past the budget the project set.
       recover = recover_module(),
       max_attempts = recover_opts(cfg).max_attempts,
-      dispatch = function(task)
-        scheduler_extra[#scheduler_extra + 1] = function()
-          return run_and_handle(opts, paths, cfg, runner, session, task.id)
-        end
-      end,
     })
-    if not resumed then
+    if not selected then
       return { ok = false, error = err }
+    end
+    local requeued, refused, live, skipped = {}, {}, {}, {}
+    for _, entry in ipairs(selected.resumed or {}) do
+      local id = type(entry) == "table" and entry.id or nil
+      -- The status the entry was selected from. Every entry `pipeline.resume`
+      -- returns carries it; it is what the compare-and-set below re-checks.
+      local expected = type(entry) == "table" and entry.from or nil
+      if id and task_handles[id] ~= nil then
+        -- A resume can run mid-session, while tasks are still live. A task that
+        -- still holds a spawn handle is not interrupted: parking it as
+        -- `slot_wait` would drop it out of the in-flight count, let the drain
+        -- re-dispatch the same worktree a second time and admit another task
+        -- into its slot — the `max_parallel` bypass this change removes.
+        entry.live = true
+        live[#live + 1] = id
+        log(paths, string.format("task %s: still live, resume leaves it alone", tostring(id)))
+      elseif id then
+        local current = deps.state.load(paths.root)
+        local task = current and current.tasks and current.tasks[id] or nil
+        -- Compare-and-set, the guard the `apply = true` path always had: the
+        -- selection was read once, before this loop, and a resume can run
+        -- mid-session while a late verdict, a scheduler tick or a second resume
+        -- moves the task. Parking it from a status it no longer holds would
+        -- dispatch a `failed` task the retryability filter excluded (a run that
+        -- just failed non-retryably and lost its handle) or leave a `merged`
+        -- task parked forever, which `tick` never dispatches. Skip such an
+        -- entry instead of marking it.
+        local lost = not task
+          or (expected ~= nil and task.status ~= expected)
+          or not RESUME_STATUSES[task.status]
+        if lost then
+          entry.skipped = true
+          if not task then
+            entry.reason = "status unreadable while resuming"
+          elseif expected ~= nil and task.status ~= expected then
+            entry.reason = string.format("status already moved to %s", tostring(task.status))
+          else
+            entry.reason = string.format("status %s is not resumable", tostring(task.status))
+          end
+          skipped[#skipped + 1] = { id = id, skipped = true, reason = entry.reason }
+          log(paths, string.format("task %s: resume skips it (%s)",
+            tostring(id), entry.reason))
+        else
+          local in_flight, cap, free = slot_counts(
+            current and current.tasks or {}, max_parallel, id)
+          local waiting = free <= 0
+          local reason = waiting and wait_slot_reason() or REQUEUE_FOR_DISPATCH
+          local marked, merr = mark_slot_wait(paths, id, reason)
+          if marked then
+            entry.requeued = true
+            entry.waiting = waiting or nil
+            entry.wait_reason = reason
+            entry.slot_wait = waiting and {
+              reason = reason,
+              in_flight = in_flight,
+              max_parallel = cap,
+            } or nil
+            requeued[#requeued + 1] = entry
+            if waiting then
+              refused[#refused + 1] = id
+            end
+            log(paths, string.format("task %s: queued on resume (%s)", tostring(id), reason))
+          else
+            log(paths, string.format("task %s: cannot queue on resume: %s",
+              tostring(id), tostring(merr)))
+          end
+        end
+      end
     end
     -- Always drain after a resume, even when no task was active: a task that
     -- was queued (`ready`) when the host died has no session to revive, and
     -- without a drain it would wait for the next submit to be noticed.
     schedule_job(opts, paths, cfg, runner, session)
-    return { ok = true, resumed = resumed.resumed, errors = resumed.errors }
+    return {
+      ok = true,
+      resumed = selected.resumed,
+      errors = selected.errors,
+      requeued = requeued,
+      waiting = refused,
+      live = live,
+      skipped = skipped,
+    }
   end
 
   function runtime.feedback(input)

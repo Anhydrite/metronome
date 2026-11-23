@@ -395,7 +395,10 @@ return function()
   local deps3 = {
     config = {
       load = function()
-        return { project = { repo = "/tmp/repo", base_ref = "main" } }
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+        }
       end,
     },
     roles = {
@@ -408,6 +411,7 @@ return function()
         implemented = true
         return { ok = false, error = "stop after dispatch" }
       end,
+      read_sheet = function() return {} end,
     },
     state = {
       load = function()
@@ -415,6 +419,12 @@ return function()
       end,
       transition = function(_, id, status)
         return { id = id, status = status }
+      end,
+      append = function()
+        return { tasks = { T1 = { id = "T1", status = "failed" } } }
+      end,
+      set_fields = function(_, id)
+        return { id = id, status = "failed" }
       end,
     },
     paths = function()
@@ -424,16 +434,37 @@ return function()
       fn()
     end,
     wait_turn_end = false,
-    runner = {}, git = {}, qualify = {}, questions = {}, analyze = {},
+    runner = {}, git = {}, qualify = {}, questions = {},
+    analyze = { gate = function() return { ok = true } end },
     checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
-    calibrate = {}, pipeline = {}, fence = {}, mode = {},
+    calibrate = {}, fence = {}, mode = {},
+    -- `retry` requeues the task and lets the drain dispatch it, like the real
+    -- `pipeline.tick`. This fixture's projection never moves, so the stub
+    -- dispatches once and reports an empty queue afterwards.
+    pipeline = {
+      tick = (function()
+        local calls = 0
+        return function(opts)
+          calls = calls + 1
+          if calls == 1 then
+            opts.dispatch({ id = "T1" })
+            return { ok = true, started = { "T1" } }
+          end
+          return { ok = true, started = {} }
+        end
+      end)(),
+    },
   }
   local rt3 = runtime.new(deps3)
   local retried = rt3.retry({ id = "T1" }, ctx)
   rt3.run_pending()
   eq(type(retried), "table", "retry returns a result")
   eq(retried and retried.background, true, "retry returns before the dispatch finishes")
-  eq(rt3.last_background and rt3.last_background.error, "stop after dispatch",
+  eq(retried and retried.requeued, true, "retry hands the task back to the drain")
+  eq(type(rt3.last_background) == "table"
+    and type(rt3.last_background.results) == "table"
+    and rt3.last_background.results[1]
+    and rt3.last_background.results[1].error or nil, "stop after dispatch",
     "retry reports the dispatch result on the background record")
   eq(implemented, true, "retry re-dispatches the task instead of only moving its status")
 
@@ -445,11 +476,17 @@ return function()
   -- the tool's LuaCtx, which the turn cancelled at once (duration_ms 0). The
   -- ctx carried by the request must win.
   local runner_ctx
+  -- The fixture's projection is a single record: this variable is both what
+  -- `state.load` returns and where `state.transition` writes, so the drain stub
+  -- sees the status the retry left behind.
   local retry_status = "failed"
   local deps4 = {
     config = {
       load = function()
-        return { project = { repo = "/tmp/repo", base_ref = "main" } }
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+        }
       end,
     },
     roles = {
@@ -474,7 +511,11 @@ return function()
         return { tasks = { T1 = { id = "T1", status = retry_status } } }
       end,
       transition = function(_, id, status)
+        retry_status = status
         return { id = id, status = status }
+      end,
+      set_fields = function(_, id)
+        return { id = id, status = retry_status, slot_wait = true }
       end,
     },
     paths = function()
@@ -484,9 +525,23 @@ return function()
       fn()
     end,
     wait_turn_end = false,
-    qualify = {}, questions = {}, analyze = {},
+    qualify = {}, questions = {},
+    analyze = { gate = function() return { ok = true } end },
     checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
-    calibrate = {}, pipeline = {}, fence = {}, mode = {}, git = {},
+    calibrate = {}, fence = {}, mode = {}, git = {},
+    -- `retry` only queues the task: the drain dispatches. The stub plays the
+    -- tick the real scheduler would run once the task is parked with
+    -- `slot_wait` (its status stays the original `failed`/`abandoned`).
+    pipeline = {
+      tick = function(opts)
+        if retry_status == "failed" or retry_status == "abandoned" then
+          retry_status = "running"
+          opts.dispatch({ id = "T1" })
+          return { ok = true, started = { "T1" } }
+        end
+        return { ok = true, started = {} }
+      end,
+    },
   }
   local rt4 = runtime.new(deps4)
   rt4.retry({ id = "T1" }, { session = "S1" })
@@ -2124,6 +2179,10 @@ auto_deploy = false
         if extra.phase then
           record.phase = extra.phase
         end
+        if type(extra.fields) == "table" and extra.fields.slot_wait == false then
+          record.slot_wait = nil
+          record.slot_wait_since = nil
+        end
         record.status = status
         if status == "running" and type(record.failure) == "table" then
           record.failure.attempts = 0
@@ -2364,7 +2423,9 @@ auto_deploy = false
     deploy = transient_deps.deploy,
     pipeline = {
       tick = function(opts)
-        if guard_record.status == "ready" then
+        if guard_record.status == "ready" or guard_record.slot_wait then
+          guard_record.slot_wait = nil
+          guard_record.slot_wait_since = nil
           opts.dispatch({ id = "T1" })
         end
         return { ok = true, started = {} }
@@ -2648,33 +2709,61 @@ auto_deploy = false
     git = transient_deps.git,
     merge = transient_deps.merge,
     deploy = transient_deps.deploy,
-    pipeline = {},
+    -- `retry` only queues the task: the drain dispatches it, exactly like the
+    -- real scheduler, so the stub plays `pipeline.tick` on the live projection
+    -- and clears the wait when it dispatches.
+    pipeline = {
+      tick = function(opts)
+        if retry_record.status == "ready" or retry_record.slot_wait then
+          retry_record.slot_wait = nil
+          retry_record.slot_wait_since = nil
+          opts.dispatch({ id = "T1" })
+          return { ok = true, started = { "T1" } }
+        end
+        return { ok = true, started = {} }
+      end,
+    },
     paths = transient_deps.paths,
     spawn = function(fn) fn() end,
     defer = function() return {} end,
     wait_turn_end = false,
     runner = {},
-    qualify = {}, questions = {}, analyze = {},
+    qualify = {}, questions = {}, analyze = transient_deps.analyze,
     calibrate = {}, fence = {}, mode = {},
   }
   notified = {}
   local rt_retry = runtime.new(retry_deps)
   local retried = rt_retry.retry({ id = "T1" }, { session = "S1" })
   eq(retried and retried.ok, true, "metronome_retry accepts a failed task")
+  eq(retried and retried.requeued, true, "metronome_retry queues the task for the drain")
   rt_retry.run_pending()
   eq(retried_impl, 1, "metronome_retry re-dispatches the task from its checkpoint")
   eq(retry_record.status, "failed", "the retried task failed again")
   eq(retry_record.failure and retry_record.failure.attempts, 1,
     "a human retry resets the attempt budget")
-  eq(rt_retry.last_background and rt_retry.last_background.failure
-    and rt_retry.last_background.failure.cause, "network",
+  -- The dispatch is the drain's now, so its outcome lives in the drain's
+  -- results rather than on the retry's own background record.
+  eq(type(rt_retry.last_background) == "table"
+    and type(rt_retry.last_background.results) == "table"
+    and rt_retry.last_background.results[1]
+    and rt_retry.last_background.results[1].failure
+    and rt_retry.last_background.results[1].failure.cause or nil, "network",
     "the background record carries the typed failure, not only the raw error")
-  eq(rt_retry.last_background and rt_retry.last_background.decision
-    and rt_retry.last_background.decision.action, "auto_retry",
+  eq(type(rt_retry.last_background) == "table"
+    and type(rt_retry.last_background.results) == "table"
+    and rt_retry.last_background.results[1]
+    and rt_retry.last_background.results[1].decision
+    and rt_retry.last_background.results[1].decision.action or nil, "auto_retry",
     "the background record carries the resume decision")
-  eq(rt_retry.last_background and rt_retry.last_background.retrying, true,
+  eq(type(rt_retry.last_background) == "table"
+    and type(rt_retry.last_background.results) == "table"
+    and rt_retry.last_background.results[1]
+    and rt_retry.last_background.results[1].retrying or nil, true,
     "the background record says the task is being retried")
-  eq(type(rt_retry.last_background and rt_retry.last_background.error), "string",
+  eq(type(type(rt_retry.last_background) == "table"
+    and rt_retry.last_background.results
+    and rt_retry.last_background.results[1]
+    and rt_retry.last_background.results[1].error), "string",
     "the background record keeps the raw step error")
 
   -- An async retry that completes must re-drain after itself: the queued job
@@ -2707,9 +2796,20 @@ auto_deploy = false
     git = transient_deps.git,
     merge = transient_deps.merge,
     deploy = transient_deps.deploy,
+    -- The retry only queues the task: the drain dispatches. The stub plays one
+    -- tick that starts the parked task, then reports an empty queue.
     pipeline = {
-      tick = function()
+      tick = function(opts)
         async_ticks = async_ticks + 1
+        if async_record.status == "ready" or async_record.slot_wait then
+          -- The dispatch is queued, so the projection must move now or the next
+          -- tick would spawn the same task again.
+          async_record.slot_wait = nil
+          async_record.slot_wait_since = nil
+          async_record.status = "running"
+          opts.dispatch({ id = "T1" })
+          return { ok = true, started = { "T1" } }
+        end
         return { ok = true, started = {} }
       end,
     },

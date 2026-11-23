@@ -54,7 +54,15 @@ def replay(events: list[dict]) -> dict[str, dict]:
                 if "phase" in event:
                     task["phase"] = event["phase"]
             elif kind == "field":
-                task.update(event.get("fields") or {})
+                fields = event.get("fields") or {}
+                # `slot_wait = false` is the dispatch clearing the wait. The
+                # journal has no null, so the field event drops both wait
+                # fields instead of leaving a stale timestamp behind.
+                if fields.get("slot_wait") is False:
+                    task.pop("slot_wait", None)
+                    task.pop("slot_wait_since", None)
+                    fields = {k: v for k, v in fields.items() if k != "slot_wait"}
+                task.update(fields)
             elif kind == "note":
                 task.setdefault("notes", []).append(event.get("text"))
             if "at" in event:
