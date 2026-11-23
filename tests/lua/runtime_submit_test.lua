@@ -3485,6 +3485,166 @@ local function case_failure_policy(env)
   has(tostring(notified[1]), "credentials", "the escalation names the remedy")
   eq(auth_record.branch, "metronome/t1", "the auth failure keeps the branch")
 
+  do
+    -- A malformed review never fails the task ---------------------------------
+    --
+    -- review.lua replays an invalid answer once and, when it is still malformed,
+    -- hands back cause = "review_invalid", transient = true. The runtime must
+    -- propagate that contract and hold the task in `reviewing`: its code is
+    -- committed, its checks are green, so no `failed` transition, no PR closed,
+    -- and the branch, worktree, transcript and checkpoints stay resumable.
+    local held_record = {
+      id = "T1", status = "ready", title = "t", checks = { "true" },
+      branch = "metronome/t1", worktree = "/tmp/wt-t1", run_dir = "/tmp/runs/T1",
+      checkpoints = { "c1", "c2" },
+      pr = { number = 54, url = "u", state = "open" },
+    }
+    local held_transitions = {}
+    local held_state = mem_state(held_record)
+    local held_transition = held_state.transition
+    held_state.transition = function(state_root, id, status, extra)
+      held_transitions[#held_transitions + 1] = status
+      return held_transition(state_root, id, status, extra)
+  end
+  local function held_saw(wanted)
+    for _, status in ipairs(held_transitions) do
+      if status == wanted then
+        return true
+      end
+    end
+    return false
+  end
+  local held_pr_closed = 0
+  local held_reviews = 0
+  local held_retries = 0
+  local held_invalid = {
+    ok = false,
+    cause = "review_invalid",
+    transient = true,
+    error = "review_invalid: finding 1: expected an object with severity and message",
+    round = 1,
+    sha = "abc",
+  }
+  local held_deps = {
+    config = transient_deps.config,
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = held_state,
+    implement = {
+      run = function()
+        return { ok = true, ctx = { worktree = "/tmp/wt-t1", branch = "metronome/t1" }, sha = "abc" }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = {
+      loop = function()
+        held_reviews = held_reviews + 1
+        return held_invalid
+      end,
+    },
+    git = {
+      pr_open = function() return { number = 54, url = "u", state = "open" } end,
+      pr_close = function()
+        held_pr_closed = held_pr_closed + 1
+        return { closed = true }
+      end,
+    },
+    merge = transient_deps.merge,
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if held_record.slot_wait or held_record.status == "ready" then
+          held_record.slot_wait = nil
+          held_record.status = "running"
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    defer = function()
+      held_retries = held_retries + 1
+      return {}
+    end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_held = runtime.new(held_deps)
+  rt_held.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_held.run_pending()
+  eq(held_reviews, 1, "the review loop ran once for the malformed answer")
+  eq(held_record.status, "reviewing", "an invalid review leaves the task in reviewing")
+  eq(held_saw("failed"), false, "an invalid review emits no failed transition")
+  eq(held_pr_closed, 0, "an invalid review does not close the PR")
+  eq(held_record.pr and held_record.pr.state, "open", "the PR stays open")
+  eq(held_record.branch, "metronome/t1", "an invalid review keeps the branch")
+  eq(held_record.worktree, "/tmp/wt-t1", "an invalid review keeps the worktree")
+  eq(held_record.run_dir, "/tmp/runs/T1", "an invalid review keeps the transcript")
+  eq(#(held_record.checkpoints or {}), 2, "an invalid review keeps the checkpoints")
+  eq(held_retries, 0, "no automatic retry is armed for a task that is not failed")
+  eq(#notified, 0, "an invalid review does not wake a human")
+  eq(type(held_record.failure), "table", "the invalid review is recorded, not lost")
+  eq(held_record.failure and held_record.failure.cause, "review_invalid",
+    "the recorded cause is typed review_invalid")
+  eq(held_record.failure and held_record.failure.transient, true,
+    "the recorded cause is transient")
+  -- `set_fields` writes a raw `field` event that the journal replays verbatim,
+  -- so every key of the persisted failure must belong to the schema's closed
+  -- set (schemas/task.schema.json). A stray key such as `held` would poison the
+  -- replayed projection and fail tools/validate-state.py.
+  do
+    local allowed = {
+      cause = true, message = true, remedy = true, transient = true,
+      attempts = true, at = true, next_retry_at = true, phase = true,
+    }
+    local stray = {}
+    for key in pairs(held_record.failure or {}) do
+      if not allowed[key] then
+        stray[#stray + 1] = tostring(key)
+      end
+    end
+    eq(#stray, 0, "the recorded failure stays inside the schema's closed key set: "
+      .. table.concat(stray, ","))
+  end
+  local held_result = type(rt_held.last_background) == "table"
+    and type(rt_held.last_background.results) == "table"
+    and rt_held.last_background.results[1] or nil
+  eq(held_result and held_result.cause, "review_invalid",
+    "the drain result keeps the typed cause")
+  eq(held_result and held_result.transient, true, "the drain result keeps transient")
+  local held_retry = rt_held.retry({ id = "T1" }, { session = "S1" })
+  eq(held_retry and held_retry.ok, false,
+    "a task kept in reviewing is resumed from its checkpoint, not retried as failed")
+
+  -- The resume path applies the same guard: a `/reload` walks the interrupted
+  -- reviewing task back to running and re-dispatches it; a second invalid
+  -- review holds it again instead of destroying it.
+  held_deps.pipeline.resume = function()
+    -- The runtime parks the selected entry with `slot_wait` and lets the drain
+    -- dispatch it; the fake hands back the entry shaped like the scheduler's.
+    return { ok = true, resumed = { { id = "T1", from = "reviewing" } }, errors = {} }
+  end
+  local held_resume = rt_held.resume({})
+  eq(held_resume and held_resume.ok, true, "the resume accepts a reviewing task")
+  rt_held.run_pending()
+  eq(held_reviews, 2, "the resumed task went through the review again")
+  eq(held_record.status, "reviewing", "the resume path holds the task in reviewing")
+  eq(held_saw("failed"), false, "the resume path emits no failed transition either")
+  eq(held_pr_closed, 0, "the resume path does not close the PR")
+  eq(held_record.branch, "metronome/t1", "the resume path keeps the branch")
+  eq(#(held_record.checkpoints or {}), 2, "the resume path keeps the checkpoints")
+  eq(held_retries, 0, "the resume path arms no automatic retry")
+
+  end
+
   -- A late automatic retry must not run a task a human already resumed -----
   --
   -- The backoff timer and a human retry can both decide to restart the same

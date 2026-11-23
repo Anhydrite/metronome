@@ -164,12 +164,43 @@ return function()
   eq(extra[1].foo, nil, "unknown keys are dropped")
   eq(extra[1].file, nil, "non-schema keys are dropped")
 
-  local badsev, badsev_err = review.parse_findings('{"findings":[{"severity":"critical","message":"m"}]}')
-  eq(badsev, nil, "an unknown severity is refused")
-  has(badsev_err, "severity", "the severity error names the field")
+  -- A bare string finding is a message, and a message with no severity is
+  -- minor: the tolerant half of the contract.
+  local strings = review.parse_findings('{"findings":["could be clearer"]}')
+  eq(strings and strings[1] and strings[1].severity, "minor", "a string finding becomes minor")
+  eq(strings and strings[1] and strings[1].message, "could be clearer", "the string becomes the message")
+
+  local empty_string, empty_string_err = review.parse_findings('{"findings":[""]}')
+  eq(empty_string, nil, "an empty string finding is refused")
+  has(empty_string_err, "finding 1", "the empty-string error names the finding")
+  has(empty_string_err, "message", "the empty-string error names the message field")
+
+  local unknownsev, unknownsev_err = review.parse_findings('{"findings":[{"severity":"critical","message":"m"}]}')
+  eq(unknownsev_err, nil, "an unknown severity is tolerated: " .. tostring(unknownsev_err))
+  eq(unknownsev[1].severity, "major", "an unknown severity falls back to major")
+
+  local absentsev, absentsev_err = review.parse_findings('{"findings":[{"message":"m"}]}')
+  eq(absentsev_err, nil, "a missing severity is tolerated: " .. tostring(absentsev_err))
+  eq(absentsev[1].severity, "major", "a missing severity falls back to major")
+
+  local number_finding, number_finding_err = review.parse_findings('{"findings":[42]}')
+  eq(number_finding, nil, "a number finding is refused")
+  has(number_finding_err, "finding 1", "the number error names the finding")
+  has(number_finding_err, "expected an object with severity and message",
+    "the number error names the expected shape")
+  has(number_finding_err, "number", "the number error names the type")
+
+  local bool_finding, bool_finding_err = review.parse_findings('{"findings":[true]}')
+  eq(bool_finding, nil, "a boolean finding is refused")
+  has(bool_finding_err, "boolean", "the boolean error names the type")
+
+  local null_finding, null_finding_err = review.parse_findings('{"findings":[null]}')
+  eq(null_finding, nil, "a null finding is refused")
+  has(null_finding_err, "null", "the null error names the type")
 
   local badmsg, badmsg_err = review.parse_findings('{"findings":[{"severity":"major","message":""}]}')
   eq(badmsg, nil, "an empty message is refused")
+  has(badmsg_err, "finding 1", "the message error names the finding")
   has(badmsg_err, "message", "the message error names the field")
 
   local badline, badline_err = review.parse_findings('{"findings":[{"severity":"major","message":"m","line":0}]}')
@@ -474,14 +505,86 @@ return function()
   has(raise_result.error, "boom", "a raising runner explains itself")
   eq(state.load(root).tasks[id_raise].review, nil, "a raising runner stores no review")
 
-  local wt_bad, id_bad = seed_worktree({ ["src/bad.lua"] = "return 8\n" })
-  make_task(id_bad)
-  local bad_result = review.review(review_opts(id_bad, wt_bad, function()
-    return { ok = true, text = "not json at all" }
+  -- Keep the malformed-answer cases in their own scope: the enclosing case is
+  -- long, and Lua 5.1 caps a function at 200 active locals.
+  do
+  -- A malformed first answer is replayed once with the exact defect in the
+  -- prompt. The same SHA and round are kept, so the second answer is stored as
+  -- the round's only review.
+  local wt_retry, id_retry, sha_retry = seed_worktree({ ["src/retry.lua"] = "return 8\n" })
+  make_task(id_retry)
+  local retry_calls = {}
+  local retry_raw = maki.fs.joinpath(base, "raw-" .. id_retry)
+  local retry_result = review.review(review_opts(id_retry, wt_retry, function(request)
+    retry_calls[#retry_calls + 1] = request
+    if #retry_calls == 1 then
+      return { ok = true, text = '{"findings":[42]}', run_dir = maki.fs.joinpath(retry_raw, "1") }
+    end
+    return { ok = true, text = CLEAN, run_dir = maki.fs.joinpath(retry_raw, "2") }
   end))
-  eq(bad_result.ok, false, "invalid output blocks")
-  has(bad_result.error, "review output invalid", "the error says the output was invalid")
-  eq(state.load(root).tasks[id_bad].review, nil, "invalid output stores no review")
+  eq(retry_result.ok, true, "a valid replay approves: " .. tostring(retry_result.error))
+  eq(retry_result.approved, true, "a valid replay is approved")
+  eq(retry_result.round, 1, "the replay keeps the same round")
+  eq(retry_result.sha, sha_retry, "the replay keeps the same sha")
+  eq(#retry_calls, 2, "an invalid first answer is replayed once")
+  has(retry_calls[2].prompt, "finding 1: expected an object with severity and message",
+    "the correction names the exact defect")
+  has(retry_calls[2].prompt, "ONLY valid JSON", "the correction asks for JSON only")
+  has(retry_calls[2].prompt, sha_retry, "the correction keeps the reviewed sha")
+  eq(retry_calls[1].prompt ~= retry_calls[2].prompt, true, "the replay prompt differs")
+  eq(maki.fs.read(maki.fs.joinpath(retry_raw, "1", "review-raw-1.txt")), '{"findings":[42]}',
+    "the invalid first answer is kept in the run dir")
+  local after_retry = state.load(root).tasks[id_retry]
+  eq(after_retry.review and after_retry.review.round, 1, "the replay stores round 1 once")
+  eq(after_retry.review and after_retry.review.findings, nil, "the valid replay stores no findings")
+  eq(after_retry.status, "reviewing", "the replay does not move the task")
+
+  -- Two invalid answers fail as review_invalid/transient. Nothing is stored or
+  -- moved: the checkpoint, branch and raw transcript survive for a retry.
+  local wt_inv, id_inv, sha_inv = seed_worktree({ ["src/inv.lua"] = "return 8\n" })
+  make_task(id_inv, { checkpoints = { sha_inv } })
+  local inv_raw = maki.fs.joinpath(base, "raw-" .. id_inv)
+  local inv_calls = 0
+  local inv_texts = { "first invalid answer", "second invalid answer" }
+  local inv_result = review.review(review_opts(id_inv, wt_inv, function()
+    inv_calls = inv_calls + 1
+    return {
+      ok = true,
+      text = inv_texts[inv_calls],
+      run_dir = maki.fs.joinpath(inv_raw, tostring(inv_calls)),
+    }
+  end))
+  eq(inv_result.ok, false, "two invalid answers do not approve")
+  eq(inv_result.cause, "review_invalid", "two invalid answers have a typed cause")
+  eq(inv_result.transient, true, "review_invalid is transient")
+  has(inv_result.error, "review_invalid:", "the error is namespaced by the cause")
+  eq(inv_result.round, 1, "review_invalid keeps the round")
+  eq(inv_result.sha, sha_inv, "review_invalid keeps the sha")
+  eq(inv_calls, 2, "the reviewer is replayed exactly once")
+  eq(inv_result.run and inv_result.run.text, inv_texts[2], "the result carries the second run")
+  local after_inv = state.load(root).tasks[id_inv]
+  eq(after_inv.status, "reviewing", "review_invalid leaves the status untouched")
+  eq(after_inv.review, nil, "review_invalid stores no review")
+  eq(after_inv.checkpoints and after_inv.checkpoints[1], sha_inv, "review_invalid keeps the checkpoint")
+  eq(git.head_sha(wt_inv), sha_inv, "review_invalid keeps the branch where it was")
+  eq(maki.fs.read(maki.fs.joinpath(inv_raw, "1", "review-raw-1.txt")), inv_texts[1],
+    "the first raw answer is kept")
+  eq(maki.fs.read(maki.fs.joinpath(inv_raw, "2", "review-raw-2.txt")), inv_texts[2],
+    "the second raw answer is kept")
+
+  -- A runner that reports no run_dir still leaves evidence: the fallback path is
+  -- derived from state_root the way the runner would have laid it out.
+  local wt_fb, id_fb = seed_worktree({ ["src/fallback.lua"] = "return 8\n" })
+  make_task(id_fb)
+  local fb_result = review.review(review_opts(id_fb, wt_fb, function()
+    return { ok = true, text = "fallback invalid answer" }
+  end))
+  eq(fb_result.cause, "review_invalid", "the fallback scenario is review_invalid")
+  local fb_dir = maki.fs.joinpath(run_state_root, "runs", id_fb, "review", "1")
+  eq(maki.fs.read(maki.fs.joinpath(fb_dir, "review-raw-1.txt")), "fallback invalid answer",
+    "a missing run_dir falls back to state_root")
+
+  end
 
   -- review: no runner --------------------------------------------------------
 
@@ -814,6 +917,9 @@ return function()
   eq(after_loop.review and after_loop.review.commit_sha, git.head_sha(wt_loop),
     "the loop stores the fixed sha")
 
+  -- Keep the tail of this long case in its own scope so the function stays
+  -- under the Lua 5.1 limit of 200 active locals.
+  do
   -- loop: a fix that does nothing escalates --------------------------------
 
   local wt_noop, id_noop = seed_worktree({ ["src/noop.lua"] = "return 13\n" })
@@ -883,4 +989,5 @@ return function()
 
   -- The base directory is deliberately kept: tests/run-lua.sh validates the
   -- journal this test wrote.
+  end
 end
