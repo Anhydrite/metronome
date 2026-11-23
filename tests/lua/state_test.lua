@@ -547,9 +547,49 @@ return function()
   eq(state.checkpoint_of({ failure = { cause = "unknown" } }), nil,
     "a task with a failure but no checkpoints still reads nil for the checkpoint")
 
-  -- The schema accepts the new field, and refuses an unknown one inside it.
+  -- A slot wait is a task field, not a failure: it survives a replay and is
+  -- cleared by the dispatch, without ever touching the status or phase.
+  local slot_root = tmp_root("state-slot-wait")
+  state.create(slot_root, {
+    id = "T-20261122-w001",
+    title = "waiting for a slot",
+    status = "reviewing",
+    phase = "review",
+    branch = "metronome/w001",
+    worktree = "/tmp/wt-w001",
+  })
+  local marked_slot, marked_err = state.set_fields(slot_root, "T-20261122-w001", {
+    slot_wait = true,
+    slot_wait_since = "2026-11-22T22:00:00Z",
+  })
+  eq(marked_err, nil, "the slot wait is persisted: " .. tostring(marked_err))
+  eq(marked_slot and marked_slot.slot_wait, true, "the projection carries the wait")
+  eq(marked_slot and marked_slot.status, "reviewing", "the wait keeps the original status")
+  eq(marked_slot and marked_slot.phase, "review", "the wait keeps the original phase")
+  eq(marked_slot and marked_slot.failure_reason, nil, "the wait is not a failure")
+
+  maki.fs.rm(state.paths(slot_root).projection)
+  local replayed_slot = state.load(slot_root).tasks["T-20261122-w001"]
+  eq(replayed_slot and replayed_slot.slot_wait, true, "the wait survives a replay")
+  eq(replayed_slot and replayed_slot.slot_wait_since, "2026-11-22T22:00:00Z",
+    "the wait timestamp survives a replay")
+  eq(replayed_slot and replayed_slot.status, "reviewing", "the replayed wait keeps the status")
+  eq(replayed_slot and replayed_slot.phase, "review", "the replayed wait keeps the phase")
+
+  local cleared_slot = state.set_fields(slot_root, "T-20261122-w001", { slot_wait = false })
+  eq(cleared_slot and cleared_slot.slot_wait, nil, "clearing the wait drops slot_wait")
+  eq(cleared_slot and cleared_slot.slot_wait_since, nil,
+    "clearing the wait drops slot_wait_since too")
+  eq(cleared_slot and cleared_slot.status, "reviewing", "clearing the wait keeps the status")
+
   local qualify = load_module("qualify")
   local validate_tmp = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "state-validate")
+  local wait_schema, wait_schema_err = qualify.validate_projection(replayed_slot, {
+    tmp_dir = validate_tmp,
+  })
+  eq(wait_schema, true, "the schema accepts slot_wait and slot_wait_since: "
+    .. tostring(wait_schema_err))
+
   local schema_ok, schema_err = qualify.validate_projection(after_failure.tasks["T-20261122-c001"], {
     tmp_dir = validate_tmp,
   })

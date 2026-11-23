@@ -2090,14 +2090,53 @@ function M.new(deps)
     return in_flight, cap, free
   end
 
+  -- Persist a slot wait: `slot_wait = true`, its timestamp, and the named
+  -- reason in the journal. The task keeps its status and phase — a slot wait is
+  -- not a failure and never touches `failure_reason`. The field and the note
+  -- land in one append, so a reader never sees the flag without its reason.
+  --
+  -- A caller-injected state without `append` (tests, a scripted driver) still
+  -- gets the field through `set_fields`; the reason then lives in the returned
+  -- result and the status view rather than the journal.
+  local function mark_slot_wait(paths, task_id, reason, now)
+    now = now or os.date("!%Y-%m-%dT%H:%M:%SZ")
+    if type(deps.state.append) == "function" then
+      local ok, err = deps.state.append(paths.root, {
+        {
+          kind = "field",
+          task_id = task_id,
+          fields = { slot_wait = true, slot_wait_since = now },
+        },
+        { kind = "note", task_id = task_id, text = reason },
+      })
+      if not ok then
+        return nil, err
+      end
+      return true
+    end
+    if type(deps.state.set_fields) == "function" then
+      local ok, err = deps.state.set_fields(paths.root, task_id, {
+        slot_wait = true,
+        slot_wait_since = now,
+      })
+      if not ok then
+        return nil, err
+      end
+      return true
+    end
+    return nil, "the state module cannot persist a slot wait"
+  end
+
   -- Why a task is not running, in words a human can act on. Computed from the
-  -- live projection, never persisted: the journal keeps the reason in the
-  -- status event and this view recomputes it, so no task field is added and the
-  -- task schema does not change. An unmet dependency is named first — it would
-  -- hold the task even with an empty pipeline — then the slot wait when the cap
-  -- is reached. Returns the reason and, for a slot wait, its structure.
+  -- live projection, never persisted: the journal keeps the reason in a note
+  -- and this view recomputes it, so the status stays truthful after a reload.
+  -- An unmet dependency is named first — it would hold the task even with an
+  -- empty pipeline — then the slot wait. A task carrying the persisted
+  -- `slot_wait` flag is waiting by construction, whatever its status; a plain
+  -- `ready` task waits only when the cap leaves it no slot. Returns the reason
+  -- and, for a slot wait, its structure.
   local function wait_reason_of(task, projection, max_parallel)
-    if type(task) ~= "table" or task.status ~= "ready" then
+    if type(task) ~= "table" or (not task.slot_wait and task.status ~= "ready") then
       return nil, nil
     end
     local pipeline = type(deps.pipeline) == "table" and deps.pipeline or nil
@@ -2111,7 +2150,7 @@ function M.new(deps)
       end
     end
     local in_flight, cap, free = slot_counts(projection, max_parallel, task.id)
-    if free > 0 then
+    if not task.slot_wait and free > 0 then
       return nil, nil
     end
     local reason = wait_slot_reason()
@@ -3364,28 +3403,29 @@ function M.new(deps)
 
     -- A retry is a restart, not just a status move — but it never starts the
     -- task on its own authority. `max_parallel` is the only bound, and only
-    -- the drain enforces it: the task is put back in the queue (`ready`, at its
-    -- last checkpoint) and `pipeline.tick` dispatches it when a slot is free.
-    -- The tick moves a task to `running` before spawning it, so admission is
-    -- atomic by construction: two simultaneous retries cannot both take the
-    -- last slot, because the second one sees the first already in flight.
+    -- the drain enforces it: the task is parked with the persisted `slot_wait`
+    -- flag (keeping its original status and phase, so a task interrupted in
+    -- `reviewing` stays `reviewing`) and `pipeline.tick` dispatches it when a
+    -- slot is free. The tick moves a task to `running` before spawning it, so
+    -- admission is atomic by construction: two simultaneous retries cannot both
+    -- take the last slot, because the second one sees the first already in
+    -- flight.
     local max_parallel = max_parallel_of(cfg)
     local current = deps.state.load(paths.root)
     local in_flight, cap, free = slot_counts(current and current.tasks or {},
       max_parallel, input.id)
     local waiting = free <= 0
     local reason = waiting and wait_slot_reason() or REQUEUE_FOR_DISPATCH
-    local moved, err = deps.state.transition(paths.root, input.id, "ready", {
-      phase = "implement",
-      reason = reason,
-    })
-    if not moved then
-      return { ok = false, error = err }
+    local marked, merr = mark_slot_wait(paths, input.id, reason)
+    if not marked then
+      return { ok = false, error = merr }
     end
-    log(paths, string.format("task %s: requeued for dispatch (%s)", tostring(input.id), reason))
+    log(paths, string.format("task %s: queued for dispatch (%s)", tostring(input.id), reason))
     -- Arm the drain: `pipeline.tick` is the single dispatch authority, so even
     -- a retry that hangs cannot hold it, and no worktree is run twice.
     schedule_job(bg, paths, cfg, runner, session)
+    local after = deps.state.load(paths.root)
+    local queued = after and after.tasks and after.tasks[input.id] or nil
     return {
       ok = true,
       background = true,
@@ -3397,7 +3437,7 @@ function M.new(deps)
         in_flight = in_flight,
         max_parallel = cap,
       } or nil,
-      task = moved,
+      task = queued,
     }
   end
 
@@ -3760,94 +3800,53 @@ function M.new(deps)
       return { ok = false, error = perr }
     end
 
-    -- Walk each interrupted task back to `running` through legal transitions,
-    -- then hand it back to the queue. `pipeline.resume` also selects the
-    -- `failed` tasks that are still retryable, so a `/reload` restarts a
-    -- transient failure instead of leaving it parked. The walk is only a
-    -- status move here: the task must never be spawned from this callback, or
-    -- a reload would start every interrupted task at once, behind
-    -- `max_parallel`'s back. `run_task` restarts every non-epic task at
-    -- implement, so requeueing costs no work and keeps the scheduler the single
-    -- dispatch authority.
+    -- Select the interrupted tasks, then park each one for the drain. A resume
+    -- never walks a task to `running` on its own authority and never spawns it:
+    -- a reload that started every interrupted task at once is exactly the
+    -- `max_parallel` bypass this fixes. `pipeline.tick` is the single dispatch
+    -- authority; it sees the persisted `slot_wait` flag as a candidate once a
+    -- slot is free and clears the flag in the same transition. The task keeps
+    -- its original status and phase, so a task interrupted in `reviewing` stays
+    -- `reviewing` while it waits and a `/reload` replays the wait.
     local max_parallel = max_parallel_of(cfg)
-    -- The admission predicate: the same accounting `pipeline.tick` uses, on the
-    -- live projection, with the entry itself left out of the count. It is
-    -- handed to `pipeline.resume` and consulted again in the dispatch callback —
-    -- the only place that sees one entry at a time — so a task that cannot be
-    -- admitted is never walked to `running` and never spawned: it goes back to
-    -- `ready` with the named reason.
-    local function admit(id)
-      local current = deps.state.load(paths.root)
-      return slot_counts(current and current.tasks or {}, max_parallel, id)
-    end
-    local admitted, refused = {}, {}
-    local resumed, err = deps.pipeline.resume(deps.state, paths.root, {
-      apply = true,
+    local selected, err = deps.pipeline.resume(deps.state, paths.root, {
+      apply = false,
       -- The same policy and bounds the drain uses, so a resume never retries
       -- past the budget the project set.
       recover = recover_module(),
       max_attempts = recover_opts(cfg).max_attempts,
-      admission = function(task)
-        local id = type(task) == "table" and task.id or nil
-        if not id then
-          return false, wait_slot_reason()
-        end
-        local _, _, free = admit(id)
-        if free > 0 then
-          return true
-        end
-        return false, wait_slot_reason()
-      end,
-      dispatch = function(task)
-        local id = type(task) == "table" and task.id or nil
-        if not id then
-          return
-        end
-        local in_flight, cap, free = admit(id)
+    })
+    if not selected then
+      return { ok = false, error = err }
+    end
+    local requeued, refused = {}, {}
+    for _, entry in ipairs(selected.resumed or {}) do
+      local id = type(entry) == "table" and entry.id or nil
+      if id then
+        local current = deps.state.load(paths.root)
+        local in_flight, cap, free = slot_counts(
+          current and current.tasks or {}, max_parallel, id)
         local waiting = free <= 0
         local reason = waiting and wait_slot_reason() or REQUEUE_FOR_DISPATCH
-        local moved, merr = deps.state.transition(paths.root, id, "ready", {
-          phase = "implement",
-          reason = reason,
-        })
-        if not moved then
-          log(paths, string.format("task %s: cannot requeue on resume: %s",
-            tostring(id), tostring(merr)))
-          return
-        end
-        admitted[#admitted + 1] = {
-          id = id,
-          requeued = true,
-          waiting = waiting or nil,
-          wait_reason = reason,
-          slot_wait = waiting and {
+        local marked, merr = mark_slot_wait(paths, id, reason)
+        if marked then
+          entry.requeued = true
+          entry.waiting = waiting or nil
+          entry.wait_reason = reason
+          entry.slot_wait = waiting and {
             reason = reason,
             in_flight = in_flight,
             max_parallel = cap,
-          } or nil,
-        }
-        if waiting then
-          refused[#refused + 1] = id
+          } or nil
+          requeued[#requeued + 1] = entry
+          if waiting then
+            refused[#refused + 1] = id
+          end
+          log(paths, string.format("task %s: queued on resume (%s)", tostring(id), reason))
+        else
+          log(paths, string.format("task %s: cannot queue on resume: %s",
+            tostring(id), tostring(merr)))
         end
-        log(paths, string.format("task %s: requeued on resume (%s)", tostring(id), reason))
-      end,
-    })
-    if not resumed then
-      return { ok = false, error = err }
-    end
-    -- Report the requeue, and the wait, in the resume result: a caller (and a
-    -- human) must see why a resumed task has not started.
-    local by_id = {}
-    for _, entry in ipairs(admitted) do
-      by_id[entry.id] = entry
-    end
-    for _, entry in ipairs(resumed.resumed or {}) do
-      local requeue = type(entry) == "table" and entry.id and by_id[entry.id] or nil
-      if requeue then
-        entry.requeued = true
-        entry.waiting = requeue.waiting
-        entry.wait_reason = requeue.wait_reason
-        entry.slot_wait = requeue.slot_wait
       end
     end
     -- Always drain after a resume, even when no task was active: a task that
@@ -3856,9 +3855,9 @@ function M.new(deps)
     schedule_job(opts, paths, cfg, runner, session)
     return {
       ok = true,
-      resumed = resumed.resumed,
-      errors = resumed.errors,
-      requeued = admitted,
+      resumed = selected.resumed,
+      errors = selected.errors,
+      requeued = requeued,
       waiting = refused,
     }
   end

@@ -266,7 +266,16 @@ function M.replay(text)
             end
           elseif event.kind == "field" then
             for k, v in pairs(event.fields or {}) do
-              task[k] = v
+              -- `slot_wait = false` is the dispatch clearing the wait. JSON has
+              -- no null, so the field event carries false and both wait fields
+              -- are dropped here: a projection must never keep a stale
+              -- `slot_wait` or its timestamp once the task is dispatched.
+              if k == "slot_wait" and v == false then
+                task.slot_wait = nil
+                task.slot_wait_since = nil
+              else
+                task[k] = v
+              end
             end
           elseif event.kind == "note" then
             task.notes = task.notes or {}
@@ -640,6 +649,16 @@ function M.transition(root, task_id, to, extra)
     phase = extra.phase or nil,
     reason = extra.reason or nil,
   }
+  -- A caller may clear or patch fields in the same append as the status move:
+  -- the dispatch of a slot-waiting task clears `slot_wait` atomically with
+  -- `running`, so a reader never sees a running task still claiming the wait.
+  if type(extra.fields) == "table" then
+    events[#events + 1] = {
+      kind = "field",
+      task_id = task_id,
+      fields = extra.fields,
+    }
+  end
 
   local new_state, err = M.append(root, events)
   if not new_state then

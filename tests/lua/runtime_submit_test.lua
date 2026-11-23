@@ -420,6 +420,12 @@ return function()
       transition = function(_, id, status)
         return { id = id, status = status }
       end,
+      append = function()
+        return { tasks = { T1 = { id = "T1", status = "failed" } } }
+      end,
+      set_fields = function(_, id)
+        return { id = id, status = "failed" }
+      end,
     },
     paths = function()
       return paths
@@ -508,6 +514,9 @@ return function()
         retry_status = status
         return { id = id, status = status }
       end,
+      set_fields = function(_, id)
+        return { id = id, status = retry_status, slot_wait = true }
+      end,
     },
     paths = function()
       return paths
@@ -520,11 +529,12 @@ return function()
     analyze = { gate = function() return { ok = true } end },
     checks = {}, converge = {}, review = {}, merge = {}, deploy = {},
     calibrate = {}, fence = {}, mode = {}, git = {},
-    -- `retry` only requeues: the drain dispatches. The stub plays the tick the
-    -- real scheduler would run once the task is `ready`.
+    -- `retry` only queues the task: the drain dispatches. The stub plays the
+    -- tick the real scheduler would run once the task is parked with
+    -- `slot_wait` (its status stays the original `failed`/`abandoned`).
     pipeline = {
       tick = function(opts)
-        if retry_status == "ready" then
+        if retry_status == "failed" or retry_status == "abandoned" then
           retry_status = "running"
           opts.dispatch({ id = "T1" })
           return { ok = true, started = { "T1" } }
@@ -2169,6 +2179,10 @@ auto_deploy = false
         if extra.phase then
           record.phase = extra.phase
         end
+        if type(extra.fields) == "table" and extra.fields.slot_wait == false then
+          record.slot_wait = nil
+          record.slot_wait_since = nil
+        end
         record.status = status
         if status == "running" and type(record.failure) == "table" then
           record.failure.attempts = 0
@@ -2409,7 +2423,9 @@ auto_deploy = false
     deploy = transient_deps.deploy,
     pipeline = {
       tick = function(opts)
-        if guard_record.status == "ready" then
+        if guard_record.status == "ready" or guard_record.slot_wait then
+          guard_record.slot_wait = nil
+          guard_record.slot_wait_since = nil
           opts.dispatch({ id = "T1" })
         end
         return { ok = true, started = {} }
@@ -2693,11 +2709,14 @@ auto_deploy = false
     git = transient_deps.git,
     merge = transient_deps.merge,
     deploy = transient_deps.deploy,
-    -- `retry` only requeues the task: the drain dispatches it, exactly like the
-    -- real scheduler, so the stub plays `pipeline.tick` on the live projection.
+    -- `retry` only queues the task: the drain dispatches it, exactly like the
+    -- real scheduler, so the stub plays `pipeline.tick` on the live projection
+    -- and clears the wait when it dispatches.
     pipeline = {
       tick = function(opts)
-        if retry_record.status == "ready" then
+        if retry_record.status == "ready" or retry_record.slot_wait then
+          retry_record.slot_wait = nil
+          retry_record.slot_wait_since = nil
           opts.dispatch({ id = "T1" })
           return { ok = true, started = { "T1" } }
         end
@@ -2777,14 +2796,16 @@ auto_deploy = false
     git = transient_deps.git,
     merge = transient_deps.merge,
     deploy = transient_deps.deploy,
-    -- The retry only requeues: the drain dispatches. The stub plays one tick
-    -- that starts the ready task, then reports an empty queue.
+    -- The retry only queues the task: the drain dispatches. The stub plays one
+    -- tick that starts the parked task, then reports an empty queue.
     pipeline = {
       tick = function(opts)
         async_ticks = async_ticks + 1
-        if async_record.status == "ready" then
+        if async_record.status == "ready" or async_record.slot_wait then
           -- The dispatch is queued, so the projection must move now or the next
           -- tick would spawn the same task again.
+          async_record.slot_wait = nil
+          async_record.slot_wait_since = nil
           async_record.status = "running"
           opts.dispatch({ id = "T1" })
           return { ok = true, started = { "T1" } }
