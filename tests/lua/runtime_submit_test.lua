@@ -2222,6 +2222,12 @@ auto_deploy = false
   -- condemning the task on the first lock. The sleep seam keeps the test fast,
   -- and the step that is replayed is the git operation, not the model session.
   local function check_git_lock_replay()
+  -- The runtime recovers the git_lock cause from a bare error string through
+  -- git.classify, so the stubs below supply the real classifier.
+  local git_mod = load_module("git")
+  local function classify(what, result)
+    return git_mod.classify(what, result)
+  end
   -- The real merge.rebase drops the fetch diagnostic and hands back only
   -- `(nil, err)`; the stub mirrors that so the test proves the runtime recovers
   -- the git_lock cause from the error text rather than from a synthetic table.
@@ -2250,7 +2256,7 @@ auto_deploy = false
     },
     converge = transient_deps.converge,
     review = transient_deps.review,
-    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    git = { classify = classify, pr_open = function() return { number = 1, url = "u", state = "open" } end },
     merge = {
       rebase = function()
         replay_seen.rebase = replay_seen.rebase + 1
@@ -2324,7 +2330,7 @@ auto_deploy = false
     checks = transient_deps.checks,
     converge = transient_deps.converge,
     review = transient_deps.review,
-    git = { pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    git = { classify = classify, pr_open = function() return { number = 1, url = "u", state = "open" } end },
     merge = {
       rebase = function()
         exhausted_seen.rebase = exhausted_seen.rebase + 1
@@ -2370,6 +2376,101 @@ auto_deploy = false
   eq(exhausted_record.worktree, "/tmp/wt-t1", "the failure keeps the worktree")
   eq(exhausted_record.run_dir, "/tmp/runs/T1", "the failure keeps the transcript directory")
   eq(#(exhausted_record.checkpoints or {}), 2, "the failure keeps the checkpoints")
+
+  -- A git_lock exhausted during a fix round still names git_lock and keeps
+  -- every artefact. The review loop forwards only `error` from a failed fix,
+  -- so the runtime must carry the fix's diagnosis through to handle_failure.
+  local fix_record = {
+    id = "T1", status = "ready", title = "t", checks = { "true" },
+    branch = "metronome/t1", worktree = "/tmp/wt-t1",
+    checkpoints = { "c1", "c2" }, run_dir = "/tmp/runs/T1",
+    pr = { number = 7, url = "u", state = "open" },
+  }
+  local fix_impl = 0
+  local fix_deps = {
+    config = {
+      load = function()
+        return {
+          project = { repo = "/tmp/repo", base_ref = "main" },
+          checks = { default = { "true" }, timeout_secs = 10 },
+          merge = { method = "squash", auto_merge = false },
+          review = { max_rounds = 3 },
+          deploy = { auto_deploy = false },
+          recover = { max_attempts = 1, backoff_base_secs = 0 },
+        }
+      end,
+    },
+    roles = transient_deps.roles,
+    recover = recover_mod,
+    state = mem_state(fix_record),
+    implement = {
+      run = function()
+        fix_impl = fix_impl + 1
+        if fix_impl == 1 then
+          return { ok = true, ctx = { worktree = "/tmp/wt", branch = "b" }, sha = "abc" }
+        end
+        return {
+          ok = false,
+          error = "rebase failed [git_lock]: cannot lock ref 'refs/heads/metronome/t1'",
+          diagnosis = {
+            cause = "git_lock",
+            message = "another git process holds the ref lock",
+            remedy = "retry in a moment: the ref lock is transient",
+            transient = true,
+            retryable = true,
+          },
+        }
+      end,
+      read_sheet = function() return {} end,
+    },
+    checks = transient_deps.checks,
+    converge = transient_deps.converge,
+    review = {
+      -- Mimic the real loop: it calls fix and keeps only its error string.
+      loop = function(opts)
+        local fixed = opts.fix({ findings = { "f" }, round = 2 })
+        return { ok = false, round = 2, error = type(fixed) == "table" and fixed.error or "fix failed" }
+      end,
+    },
+    git = { classify = classify, pr_open = function() return { number = 1, url = "u", state = "open" } end },
+    merge = {
+      rebase = function() return { ok = true, base = "origin/main@fresh", sha = "rebsha" } end,
+      run = function() return { ok = true } end,
+    },
+    deploy = transient_deps.deploy,
+    pipeline = {
+      tick = function(opts)
+        if fix_record.status == "ready" then
+          opts.dispatch({ id = "T1" })
+        end
+        return { ok = true, started = {} }
+      end,
+    },
+    paths = transient_deps.paths,
+    spawn = function(fn) fn() end,
+    defer = function() return {} end,
+    wait_turn_end = false,
+    runner = {},
+    qualify = transient_deps.qualify,
+    questions = transient_deps.questions,
+    analyze = transient_deps.analyze,
+    calibrate = {}, fence = {}, mode = {},
+  }
+  notified = {}
+  local rt_fix = runtime.new(fix_deps)
+  rt_fix.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_fix.run_pending()
+  eq(fix_impl, 2, "the fix round re-implemented once")
+  eq(fix_record.status, "failed", "an exhausted git_lock in a fix round fails the task")
+  eq(fix_record.failure and fix_record.failure.cause, "git_lock",
+    "the fix-round failure names git_lock")
+  eq(fix_record.failure and fix_record.failure.transient, true, "git_lock is transient")
+  has(tostring(fix_record.failure_reason), "git_lock", "the fix-round reason names git_lock")
+  has(tostring(fix_record.failure_reason), "retry", "the fix-round reason names the remedy")
+  eq(fix_record.branch, "metronome/t1", "the fix-round failure keeps the branch")
+  eq(fix_record.worktree, "/tmp/wt-t1", "the fix-round failure keeps the worktree")
+  eq(fix_record.run_dir, "/tmp/runs/T1", "the fix-round failure keeps the transcript directory")
+  eq(#(fix_record.checkpoints or {}), 2, "the fix-round failure keeps the checkpoints")
 
   
   end

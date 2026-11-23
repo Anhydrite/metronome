@@ -1294,6 +1294,11 @@ function M.new(deps)
       -- the convergence diff, then reviews again, up to `review.max_rounds`.
       -- Only an exhausted bound escalates, and only a real error (a dead
       -- reviewer, an invalid answer) ends the task before that.
+      -- The review loop forwards only `error` from a failed fix round, dropping
+      -- the fix's diagnosis. Keep it here so that a git_lock exhausted during a
+      -- fix round still reaches `handle_failure` as `git_lock` with its remedy,
+      -- instead of being classified as an unknown cause.
+      local fix_diagnosis
       local function fix(result)
         local findings = type(result) == "table" and result.findings or nil
         local moved, merr = state.transition(paths.root, task_id, "running", { phase = "implement" })
@@ -1304,7 +1309,13 @@ function M.new(deps)
           task_id, tostring(result and result.round or "?")))
         local again, err = implement_and_verify(findings)
         if not again then
-          return { ok = false, error = (err and err.error) or "fix failed" }
+          fix_diagnosis = type(err) == "table" and err.diagnosis or nil
+          return {
+            ok = false,
+            error = (err and err.error) or "fix failed",
+            diagnosis = fix_diagnosis,
+            phase = "implement",
+          }
         end
         state.transition(paths.root, task_id, "verifying", { phase = "verify" })
         state.transition(paths.root, task_id, "reviewing", { phase = "review" })
@@ -1338,7 +1349,13 @@ function M.new(deps)
         if type(reviewed) == "table" and reviewed.escalated then
           reason = string.format("review escalated after %s round(s)", tostring(reviewed.round or "?"))
         end
-        return { ok = false, error = reason, review = reviewed, pr = pr }
+        return {
+          ok = false,
+          error = reason,
+          review = reviewed,
+          pr = pr,
+          diagnosis = fix_diagnosis,
+        }
       end
 
       -- The SHA the reviewer approved is the one that ships, not the first
@@ -1775,32 +1792,32 @@ function M.new(deps)
 
   -- Ref-lock contention named in a raw git error string. `merge.rebase` returns
   -- only `(nil, err)` when its internal fetch fails -- it drops the diagnostic
-  -- third value -- so the caller cannot branch on `diag.cause`. Recognize the
-  -- same three git messages classify() uses, so a lock during the rebase's
-  -- fetch is still replayed and reported as `git_lock`, not `network`.
-  local GIT_LOCK_TEXT = {
-    "cannot lock ref",
-    "unable to update local ref",
-    "failed to update ref",
-  }
-
+  -- third value -- so the caller cannot branch on `diag.cause`. The lock
+  -- patterns live in `git.classify`; reuse it on a synthetic result so the two
+  -- can never disagree: a new lock message added there is recognized here too.
   function git_lock_error_diag(err)
     if type(err) ~= "string" then
       return nil
     end
-    for _, needle in ipairs(GIT_LOCK_TEXT) do
-      if err:find(needle, 1, true) then
-        return {
-          cause = "git_lock",
-          message = "another git process holds the ref lock (cannot lock ref)",
-          remedy = "retry in a moment: the ref lock is transient and the same command succeeds once it clears",
-          transient = true,
-          retryable = true,
-          remediable = true,
-        }
-      end
+    local classify = deps.git and deps.git.classify
+    if type(classify) ~= "function" then
+      return nil
     end
-    return nil
+    -- `what` is irrelevant to the lock branch: classify checks the ref-lock
+    -- messages before any per-command branch.
+    local diag = classify("fetch", { stderr = err })
+    if type(diag) ~= "table" or diag.cause ~= "git_lock" then
+      return nil
+    end
+    return {
+      cause = "git_lock",
+      message = diag.message or "another git process holds the ref lock (cannot lock ref)",
+      remedy = diag.hint or diag.remedy
+        or "retry in a moment: the ref lock is transient and the same command succeeds once it clears",
+      transient = true,
+      retryable = true,
+      remediable = true,
+    }
   end
 
   -- A task that will not be merged must not leave an open PR behind: the list
