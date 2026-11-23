@@ -551,6 +551,72 @@ return function()
   eq(ccode, 0, "the commit worktree head is readable")
   has(cout, "extra.lua", "the change is in the commit")
 
+  -- PR verification: recorded number, worktree cwd ---------------------------
+  --
+  -- A recorded `pr.state` is only a cache: pr_open re-reads the PR before
+  -- reusing it, and that read must target the task worktree -- the repository
+  -- the PR belongs to -- never the plugin's own checkout. The fake `gh` records
+  -- both its cwd and its argv, so one log proves the number and the repository.
+
+  local pr_root = maki.fs.joinpath(base, "state-pr")
+  local gh_bin = maki.fs.joinpath(base, "pr-bin")
+  local gh_log = maki.fs.joinpath(base, "gh-pr.log")
+  maki.fs.mkdir(gh_bin, { parents = true })
+  maki.fs.write(gh_log, "")
+  local gh_script = maki.fs.joinpath(gh_bin, "gh")
+  local function squote(value)
+    return "'" .. value:gsub("'", "'\\''") .. "'"
+  end
+  maki.fs.write(gh_script, table.concat({
+    "#!/usr/bin/env bash",
+    "printf 'cwd=%s argv=%s\\n' \"$(pwd)\" \"$*\" >> " .. squote(gh_log),
+    "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then",
+    "  echo '{\"number\":77,\"url\":\"https://github.com/example/repo/pull/77\",\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"baseRefName\":\"main\"}'",
+    "  exit 0",
+    "fi",
+    "echo \"unexpected: $*\" >&2",
+    "exit 2",
+    "",
+  }, "\n"))
+  local gh_code, gh_out = sh({ "chmod", "+x", gh_script })
+  eq(gh_code, 0, "fake gh is executable: " .. gh_out:sub(1, 80))
+
+  local pr_task_id = "T-20261122-pr01"
+  local pr_created, pr_cerr = state.create(pr_root, {
+    id = pr_task_id,
+    title = "verify pr",
+    status = "reviewing",
+  })
+  eq(pr_cerr, nil, "PR task created: " .. tostring(pr_cerr))
+  eq(pr_created and pr_created.status, "reviewing", "PR task starts reviewing")
+
+  local pr_attached, pr_aerr = git.pr_attach(state, pr_root, pr_task_id, {
+    number = 77,
+    url = "https://github.com/example/repo/pull/77",
+    state = "open",
+  })
+  eq(pr_aerr, nil, "the recorded PR is attached: " .. tostring(pr_aerr))
+  eq(pr_attached and pr_attached.pr and pr_attached.pr.number, 77, "the task carries PR 77")
+
+  local pr_reused, pr_rerr = git.pr_open(state, pr_root, pr_task_id, {
+    title = "feat: verify pr",
+    base = "main",
+    head = "metronome/T-20261122-pr01",
+    worktree = worktree,
+    gh = gh_script,
+    attach_only = true,
+  })
+  eq(pr_rerr, nil, "pr_open reuses the verified PR: " .. tostring(pr_rerr))
+  eq(pr_reused and pr_reused.number, 77, "pr_open returns the recorded number")
+
+  local gh_text = maki.fs.read(gh_log) or ""
+  has(gh_text, "cwd=" .. worktree, "the verification runs in the task worktree")
+  eq(gh_text:find("cwd=" .. repo .. " ", 1, true), nil,
+    "the verification never runs in the project repository")
+  has(gh_text, "argv=pr view 77 --json number,url,state,mergeable,baseRefName",
+    "the verification uses the recorded number and the full JSON field list")
+  eq(gh_text:find("pr create", 1, true), nil, "a verified open PR is not recreated")
+
   -- Cleanup -----------------------------------------------------------------
 
   local removed, rerr = git.worktree_remove(repo, worktree, { force = true })

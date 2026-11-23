@@ -271,7 +271,149 @@ local function repair_note(result)
   return table.concat(parts, "; ")
 end
 
+-- Journal a repairable conflict once and shape the result the runtime acts on.
+-- Both conflict entries (a rebase conflict before merging, a conflicting PR
+-- after `gh pr merge`) go through this single place, so the note wording and
+-- the returned fields cannot drift apart and the note is never duplicated.
+local function repairable_result(state, root, id, details)
+  -- The escalation wording is what the runtime surfaces when the repair bound
+  -- is reached (`error`), so it must carry the files, the base, the command and
+  -- the faulty commit instead of git's raw "rebase failed".
+  details.escalation = M.escalation(details)
+
+  if type(state) == "table" and type(state.append) == "function" then
+    local lines = { "merge conflict (repairable): " .. repair_note(details) }
+    for _, hunk in ipairs(details.conflict_hunks or {}) do
+      lines[#lines + 1] = string.format("--- %s:%s\n%s",
+        tostring(hunk.file), tostring(hunk.start), tostring(hunk.text))
+    end
+    pcall(state.append, root, {
+      kind = "note",
+      task_id = id,
+      text = table.concat(lines, "\n"),
+    })
+  end
+
+  return {
+    ok = false,
+    error = details.escalation,
+    conflict = true,
+    conflict_files = details.conflict_files,
+    conflict_file_list = details.conflict_file_list,
+    conflict_hunks = details.conflict_hunks,
+    conflict_commit = details.conflict_commit,
+    base = details.base,
+    base_sha = details.base_sha,
+    upstream = details.upstream,
+    rebase_command = details.rebase_command,
+    escalation = details.escalation,
+  }
+end
+
 -- Merge the PR ---------------------------------------------------------------
+
+-- How many times an UNKNOWN PR is re-read before concluding, and how long to
+-- wait between reads. Both are injectable: a test must never sleep for real,
+-- and the bound must never grow into an unbounded wait.
+local DEFAULT_MERGEABLE_ATTEMPTS = 3
+local DEFAULT_MERGEABLE_DELAY_MS = 2000
+
+-- The default pause between two reads. Guarded because a plugin-scope session
+-- may not expose a uv module at all; a missing sleep degrades to an immediate
+-- retry rather than an error, and the read count stays bounded either way.
+local function default_sleep(ms)
+  if type(maki.uv) == "table" and type(maki.uv.sleep) == "function" then
+    maki.uv.sleep(ms)
+  end
+end
+
+-- After `gh pr merge` answered "not mergeable", the classifier alone cannot
+-- tell a real conflict from a PR GitHub has not finished computing. Re-read the
+-- PR a bounded number of times:
+--   - CONFLICTING -> the repairable conflict shaped by
+--     git.pr_conflict_details (conflict=true, base, upstream, rebase_command);
+--   - MERGEABLE   -> the merge is retried once, and read back;
+--   - UNKNOWN     -> the injected sleep paces the next read;
+--   - any other state (closed, merged) -> the classified failure, untouched.
+-- When the bound is spent the conclusion names UNKNOWN and the read count, so
+-- the caller knows the wait was bounded rather than skipped.
+local function recover_not_mergeable(opts, git, gh, pr, diag, args)
+  local attempts = math.floor(tonumber(opts.mergeable_attempts) or DEFAULT_MERGEABLE_ATTEMPTS)
+  if attempts < 1 then
+    attempts = 1
+  end
+  local delay = tonumber(opts.mergeable_delay_ms) or DEFAULT_MERGEABLE_DELAY_MS
+  local sleep = type(opts.sleep) == "function" and opts.sleep or default_sleep
+
+  local reads = 0
+  for i = 1, attempts do
+    reads = reads + 1
+    local info, ierr = git.pr_view(pr, {
+      gh = gh,
+      worktree = opts.worktree,
+      timeout_ms = opts.timeout_ms,
+    })
+    if not info then
+      return nil, ierr
+    end
+
+    -- A closed or merged PR cannot be waiting on GitHub's mergeability: it is
+    -- a real failure and waiting would only delay the classified verdict.
+    if info.state ~= "open" then
+      return nil, string.format("%s (pull request state: %s)",
+        git.describe(diag), tostring(info.state)), diag
+    end
+
+    local mergeable = is_non_empty(info.mergeable) and info.mergeable or "unknown"
+    if mergeable == "conflicting" then
+      local details, message = git.pr_conflict_details(info, {
+        base = opts.base,
+        remote = opts.remote,
+      })
+      if details then
+        return nil, message, details
+      end
+      return nil, tostring(message), diag
+    end
+
+    if mergeable == "mergeable" then
+      local again, aerr = exec(args, opts.worktree, opts.timeout_ms)
+      if not again then
+        return nil, aerr
+      end
+      if again.ok then
+        local after, aerr2 = git.pr_view(pr, {
+          gh = gh,
+          worktree = opts.worktree,
+          timeout_ms = opts.timeout_ms,
+        })
+        if not after then
+          return nil, aerr2
+        end
+        if after.state ~= "merged" then
+          return nil, string.format("merge command succeeded but PR state is %s",
+            tostring(after.state))
+        end
+        return { ok = true, state = "merged" }
+      end
+      local again_diag = git.classify("gh pr merge", again)
+      if again_diag.cause == "already_merged" then
+        return { ok = true, state = "merged", already_merged = true }
+      end
+      if again_diag.cause ~= "not_mergeable" then
+        return nil, git.describe(again_diag), again_diag
+      end
+      diag = again_diag
+    end
+
+    if i < attempts then
+      sleep(delay)
+    end
+  end
+
+  return nil, string.format("%s (mergeable UNKNOWN after %d re-reads)",
+    git.describe(diag), reads), diag
+end
 
 -- Squash-merge (by default) the PR through `gh`, then read it back.
 --
@@ -279,6 +421,11 @@ end
 -- is still open (a queued auto-merge, for instance), and a task that claims
 -- merged before GitHub agrees is a lie the next step would inherit. An
 -- "already merged" failure is the one failure that is really a success.
+--
+-- A "not mergeable" failure is not a verdict either: GitHub says that for a
+-- conflicting PR and for one whose mergeability is still being computed. The
+-- PR is re-read (bounded) so a real conflict reaches the repair path instead of
+-- dying as an opaque failure.
 function M.merge_pr(opts)
   opts = type(opts) == "table" and opts or {}
 
@@ -320,6 +467,9 @@ function M.merge_pr(opts)
     local diag = git.classify("gh pr merge", result)
     if diag.cause == "already_merged" then
       return { ok = true, state = "merged", already_merged = true }
+    end
+    if diag.cause == "not_mergeable" then
+      return recover_not_mergeable(opts, git, gh, pr, diag, args)
     end
     return nil, git.describe(diag), diag
   end
@@ -569,42 +719,12 @@ local function run_impl(opts)
         rebase_command = is_non_empty(rinfo.command) and rinfo.command
           or ("git rebase " .. upstream),
       }
-      -- The escalation wording is what the runtime surfaces when the repair
-      -- bound is reached (`error`), so it must carry the files, the base, the
-      -- command and the faulty commit instead of git's raw "rebase failed".
-      details.escalation = M.escalation(details)
-
       -- Journal the conflict (files, hunks, base, command) without touching
       -- the status: the repair re-enters implement on the fresh base. The note
       -- says the conflict is being repaired, not that it cannot be.
-      if type(state.append) == "function" then
-        local lines = { "merge conflict (repairable): " .. repair_note(details) }
-        for _, hunk in ipairs(details.conflict_hunks or {}) do
-          lines[#lines + 1] = string.format("--- %s:%s\n%s",
-            tostring(hunk.file), tostring(hunk.start), tostring(hunk.text))
-        end
-        pcall(state.append, root, {
-          kind = "note",
-          task_id = id,
-          text = table.concat(lines, "\n"),
-        })
-      end
-
-      return {
-        ok = false,
-        error = details.escalation,
-        rebase = rebase,
-        conflict = true,
-        conflict_files = details.conflict_files,
-        conflict_file_list = details.conflict_file_list,
-        conflict_hunks = details.conflict_hunks,
-        conflict_commit = details.conflict_commit,
-        base = details.base,
-        base_sha = details.base_sha,
-        upstream = details.upstream,
-        rebase_command = details.rebase_command,
-        escalation = details.escalation,
-      }
+      local result = repairable_result(state, root, id, details)
+      result.rebase = rebase
+      return result
     end
 
     -- Anything else (no worktree, a dead remote, a failed fetch) is not
@@ -619,15 +739,75 @@ local function run_impl(opts)
   end
 
   -- Merge the PR.
-  local merged, mg_err = M.merge_pr({
+  local merged, mg_err, mg_diag = M.merge_pr({
     git = git,
     gh = opts.gh,
     pr = pr,
     worktree = worktree,
     method = opts.method,
     timeout_ms = opts.timeout_ms,
+    base = base,
+    remote = remote,
+    mergeable_attempts = opts.mergeable_attempts,
+    mergeable_delay_ms = opts.mergeable_delay_ms,
+    sleep = opts.sleep,
   })
   if not merged then
+    -- A PR GitHub reports as CONFLICTING is the same repairable conflict as a
+    -- conflicting rebase: the work has to be redone on the fresh base, not the
+    -- task killed. Rebase once for diagnostics only -- git.rebase aborts the
+    -- rebase on conflict, so the worktree is left clean -- and fold whatever it
+    -- found (files, hunks, commit) into the conflict details. A diagnostic
+    -- rebase that finds no conflict (GitHub's mergeability alone disagreed)
+    -- still returns the conflict shape: the runtime stamps "unknown" on it,
+    -- never a bare `failed`.
+    if type(mg_diag) == "table" and mg_diag.conflict == true then
+      local conflict_base = is_non_empty(mg_diag.base) and mg_diag.base or base
+      local upstream = is_non_empty(mg_diag.upstream) and mg_diag.upstream
+        or (remote .. "/" .. conflict_base)
+      local rebase_command = is_non_empty(mg_diag.rebase_command) and mg_diag.rebase_command
+        or ("git rebase " .. upstream)
+
+      local _, _, diag_info = M.rebase({
+        git = git,
+        repo = opts.repo,
+        worktree = worktree,
+        base = conflict_base,
+        remote = remote,
+      })
+      diag_info = type(diag_info) == "table" and diag_info or {}
+      local conflict_file_list = type(diag_info.conflict) == "table" and diag_info.conflict
+        or nil
+      local has_conflict = type(conflict_file_list) == "table" and #conflict_file_list > 0
+      if has_conflict then
+        upstream = is_non_empty(diag_info.upstream) and diag_info.upstream or upstream
+        rebase_command = is_non_empty(diag_info.command) and diag_info.command or rebase_command
+      end
+
+      local base_sha = nil
+      if type(git.rev_parse) == "function" then
+        base_sha = git.rev_parse(worktree, upstream)
+      end
+
+      local details = {
+        conflict = true,
+        conflict_files = has_conflict and table.concat(conflict_file_list, ", ") or nil,
+        conflict_file_list = has_conflict and conflict_file_list or nil,
+        conflict_hunks = has_conflict and cap_hunks(diag_info.hunks) or nil,
+        conflict_commit = has_conflict and is_non_empty(diag_info.commit)
+          and diag_info.commit or nil,
+        base = conflict_base,
+        base_sha = is_non_empty(base_sha) and base_sha or nil,
+        upstream = upstream,
+        rebase_command = rebase_command,
+        pr = mg_diag.pr,
+      }
+      local result = repairable_result(state, root, id, details)
+      result.rebase = rebase
+      result.merge = merged
+      result.merge_diag = mg_diag
+      return result
+    end
     fail_task(state, root, id, mg_err)
     return { ok = false, error = mg_err, rebase = rebase, merge = merged }
   end

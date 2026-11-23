@@ -959,7 +959,8 @@ function M.new(deps)
         end
       end
 
-      pr = deps.git.pr_open(state, paths.root, task_id, {
+      local pr_err
+      pr, pr_err = deps.git.pr_open(state, paths.root, task_id, {
         repo = paths.repo,
         worktree = paths.repo,
         base = base,
@@ -970,7 +971,11 @@ function M.new(deps)
         attach_only = true,
       })
       if not pr then
-        return { ok = false, error = "cannot open the epic pull request" }
+        -- The gh reason (cause, command, detail) is the diagnosis: a generic
+        -- "cannot open" sentence sends the reader to the transcript for
+        -- nothing.
+        return { ok = false, error = "cannot open the epic pull request: "
+          .. tostring(pr_err or "unknown gh error") }
       end
 
       local opened, oerr = state.transition(paths.root, task_id, "pr_open", { phase = "merge" })
@@ -1006,6 +1011,9 @@ function M.new(deps)
       merged, merge_err = with_merge_gate(function()
         return deps.merge.run({
           task = task_id,
+          -- The PR this run just read back from gh, never a PR supposed from
+          -- the state loaded at the start of the run.
+          pr = type(pr) == "table" and (pr.number or pr.url) or pr,
           worktree = worktree,
           repo = paths.repo,
           git = deps.git,
@@ -1442,14 +1450,20 @@ function M.new(deps)
         approved_sha = (deps.git.head_sha and deps.git.head_sha(worktree)) or impl.sha
         -- no-mistakes pushed the branch and opened the PR itself; read it back
         -- and attach it to the task before the merge step.
-        pr = deps.git.pr_view(impl.ctx.branch, {
+        local pr_err
+        pr, pr_err = deps.git.pr_view(impl.ctx.branch, {
           repo = paths.repo,
           worktree = worktree,
           gh = "gh",
           timeout_ms = 60000,
         })
         if not pr then
-          return { ok = false, error = "no-mistakes passed but its pull request cannot be found", no_mistakes = gate }
+          return {
+            ok = false,
+            error = "no-mistakes passed but its pull request cannot be found: "
+              .. tostring(pr_err or "unknown gh error"),
+            no_mistakes = gate,
+          }
         end
         deps.git.pr_attach(state, paths.root, task_id, pr)
       else
@@ -1462,7 +1476,8 @@ function M.new(deps)
         -- so the runtime does not even call it a second time — a second PR would
         -- split the review from the merge.
         if not pr then
-          pr = deps.git.pr_open(state, paths.root, task_id, {
+          local pr_err
+          pr, pr_err = deps.git.pr_open(state, paths.root, task_id, {
             repo = paths.repo,
             worktree = worktree,
             base = base,
@@ -1473,7 +1488,14 @@ function M.new(deps)
             attach_only = true,
           })
           if not pr then
-            return { ok = false, error = "cannot open the pull request" }
+            -- `pr_open` already refused to reuse a recorded PR that gh did not
+            -- confirm, so this error carries gh's own reason (cause, command,
+            -- detail). Keep it: a generic sentence is a blank diagnosis.
+            return {
+              ok = false,
+              error = "cannot open the pull request: "
+                .. tostring(pr_err or "unknown gh error"),
+            }
           end
         end
 
@@ -1590,6 +1612,11 @@ function M.new(deps)
       merged, merge_err = with_merge_gate(function()
         return deps.merge.run({
           task = task_id,
+          -- The PR read back by `pr_open` in this run (reused, recreated or
+          -- attached after no-mistakes), persisted before it was returned. The
+          -- merge never reconstructs a PR supposed from the state loaded at the
+          -- beginning of the run.
+          pr = type(pr) == "table" and (pr.number or pr.url) or pr,
           worktree = worktree,
           repo = paths.repo,
           git = deps.git,

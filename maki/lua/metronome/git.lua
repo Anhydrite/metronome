@@ -948,12 +948,35 @@ function M.normalize_pr(raw)
   return { number = number, url = url, state = state }
 end
 
+-- `gh` answers mergeability in its own vocabulary (MERGEABLE/CONFLICTING/
+-- UNKNOWN). Only `conflicting` is actionable here, so the value is lowercased
+-- and anything unexpected degrades to `unknown` rather than being trusted.
+local MERGEABLE_STATES = { mergeable = true, conflicting = true, unknown = true }
+
+local function normalize_mergeable(value)
+  if value == nil then
+    return "unknown"
+  end
+  local mergeable = tostring(value):lower()
+  if MERGEABLE_STATES[mergeable] then
+    return mergeable
+  end
+  return "unknown"
+end
+
 -- Read a PR back from GitHub. `ref` is a number, a branch or a URL -- `gh`
 -- accepts all three, and pr_create uses the URL it just printed.
+--
+-- The live answer carries two fields the state store never sees: `mergeable`
+-- (normalized to mergeable/conflicting/unknown) and `base` (baseRefName). A
+-- recorded PR is only a cache -- pr_open re-reads it here before reusing it,
+-- and merge.lua reads `mergeable` to turn a conflicting PR into a repairable
+-- conflict instead of an opaque "not mergeable".
 function M.pr_view(ref, opts)
   opts = opts or {}
   local result, err = run(
-    { opts.gh or "gh", "pr", "view", tostring(ref), "--json", "number,url,state" },
+    { opts.gh or "gh", "pr", "view", tostring(ref),
+      "--json", "number,url,state,mergeable,baseRefName" },
     { cwd = opts.worktree, timeout_ms = opts.timeout_ms }
   )
   if not result then
@@ -966,7 +989,55 @@ function M.pr_view(ref, opts)
   if not decoded_ok or type(decoded) ~= "table" then
     return nil, "gh pr view returned invalid JSON: " .. result.stdout:sub(1, 200)
   end
-  return M.normalize_pr(decoded)
+  -- normalize_pr keeps only number/url/state: the two live-only fields are
+  -- added afterwards so a caller cannot persist them by accident (pr_attach
+  -- normalizes again on the way to the store).
+  local pr, nerr = M.normalize_pr(decoded)
+  if not pr then
+    return nil, nerr
+  end
+  pr.mergeable = normalize_mergeable(decoded.mergeable)
+  pr.base = type(decoded.baseRefName) == "string" and decoded.baseRefName ~= ""
+    and decoded.baseRefName or nil
+  return pr
+end
+
+-- Describe a conflicting PR in the shape runtime.conflict_details already
+-- normalizes, so merge.lua can hand it to the bounded conflict repair instead of
+-- surfacing gh's bare "not mergeable". Read-only: nothing is written.
+function M.pr_conflict_details(pr, opts)
+  opts = type(opts) == "table" and opts or {}
+  pr = type(pr) == "table" and pr or {}
+  local mergeable = normalize_mergeable(pr.mergeable)
+  local number = pr.number
+  if mergeable ~= "conflicting" then
+    return nil, string.format("pull request %s is not conflicting (mergeable: %s)",
+      number and ("#" .. tostring(number)) or "unknown", mergeable)
+  end
+  local base = (type(pr.base) == "string" and pr.base ~= "" and pr.base)
+    or (type(opts.base) == "string" and opts.base ~= "" and opts.base)
+    or "main"
+  local remote = (type(opts.remote) == "string" and opts.remote ~= "" and opts.remote)
+    or "origin"
+  local upstream = remote .. "/" .. base
+  local command = "git rebase " .. upstream
+  local files = type(opts.conflict_files) == "table" and opts.conflict_files
+    or (type(pr.conflict_files) == "table" and pr.conflict_files or nil)
+  local message = string.format(
+    "pull request #%s conflicts with %s: resolve with `%s`",
+    tostring(number or "?"), base, command)
+  if files and #files > 0 then
+    message = message .. " (files: " .. table.concat(files, ", ") .. ")"
+  end
+  return {
+    conflict = true,
+    conflict_files = files,
+    base = base,
+    upstream = upstream,
+    rebase_command = command,
+    pr = number,
+    mergeable = "conflicting",
+  }, message
 end
 
 -- Every open pull request, with the branch it comes from. The reconciler
@@ -1151,30 +1222,58 @@ end
 -- work visible: the caller can retry the move without opening a second PR.
 --
 -- A repair re-enters this step while the previous PR is still open, so an open
--- PR carried by the task is reused as-is: closing it and opening a second one
--- only produced a close/create pair per repair round (the PR loop of
--- T-20261122-0033). Closing a PR stays what `pr_close` is for -- an explicit
--- abandonment -- and is never done here. A new PR is opened only when the task
--- carries no open one.
+-- PR carried by the task is reused -- but only after `gh` confirms it really is
+-- OPEN. The recorded field is a cache, never the truth: a PR closed on GitHub
+-- (T-20261122-0043 / T-20261122-004c) used to be reused as-is, and the later
+-- `gh pr merge` failed with an opaque "not mergeable". A closed or merged PR
+-- takes the creation path, and an unreadable `gh` never falls back to an
+-- optimistic reuse: creation is attempted and the gh error is reported.
+--
+-- The verification always runs in the task worktree, never in the plugin's own
+-- repository, and against the recorded number.
+--
+-- Closing a PR stays what `pr_close` is for -- an explicit abandonment -- and
+-- is never done here.
 function M.pr_open(state, root, task_id, opts)
   opts = opts or {}
   local loaded = type(state.load) == "function" and state.load(root) or nil
   local existing = loaded and loaded.tasks and loaded.tasks[task_id]
     and loaded.tasks[task_id].pr or nil
+  local verify_error = nil
   if existing and existing.number
     and (existing.state == "open" or existing.state == nil) then
-    if opts.attach_only then
-      return existing
+    local live, verr = M.pr_view(existing.number, {
+      gh = opts.gh,
+      worktree = opts.worktree,
+      timeout_ms = opts.timeout_ms,
+    })
+    if live and live.state == "open" then
+      -- Reuse, but persist the state just read so the task carries the truth.
+      local task, aerr = M.pr_attach(state, root, task_id, live)
+      if not task then
+        return nil, aerr
+      end
+      if opts.attach_only then
+        return live
+      end
+      local moved, terr = state.transition(root, task_id, "pr_open", { phase = opts.phase or "review" })
+      if not moved then
+        return nil, terr
+      end
+      return live
     end
-    local moved, terr = state.transition(root, task_id, "pr_open", { phase = opts.phase or "review" })
-    if not moved then
-      return nil, terr
-    end
-    return existing
+    -- Closed, merged, or unreadable: never reuse what `gh` did not confirm.
+    verify_error = verr
+      or ("PR #" .. tostring(existing.number) .. " is "
+        .. tostring(live and live.state or "unreadable"))
   end
-  local pr, err = M.pr_create(opts)
+  local pr, err, diag = M.pr_create(opts)
   if not pr then
-    return nil, err
+    if verify_error then
+      return nil, string.format("recorded PR cannot be reused (%s): %s",
+        tostring(verify_error), tostring(err)), diag
+    end
+    return nil, err, diag
   end
   local task, aerr = M.pr_attach(state, root, task_id, pr)
   if not task then

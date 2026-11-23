@@ -1295,6 +1295,348 @@ return function()
     "the implement-side note names the faulty commit")
   eq(rebasing.pr_opens(), 1, "the implement-side repair opens no second PR")
 
+  -- T0 regression: a failed merge task whose recorded PR is CLOSED on GitHub ---
+  --
+  -- `git.pr_open` used to trust the persisted `task.pr.state` field: the task
+  -- reused a PR that GitHub had already closed, then `gh pr merge` answered
+  -- "not mergeable" and the task died in a loop with no diagnosis (T-20261122-0043
+  -- / T-20261122-004c). The runtime now re-reads the PR through the real git
+  -- module (with a fake `gh` binary) and recreates it when it is closed, then
+  -- merges the PR it just read back.
+  do
+    local git_module = load_module("git")
+    local pr_root = mktmpdir("metronome-runtime-pr")
+    local bins = maki.fs.joinpath(pr_root, "bin")
+    maki.fs.mkdir(bins, { parents = true })
+    local gh_log = maki.fs.joinpath(pr_root, "gh.log")
+    maki.fs.write(gh_log, "")
+    local function quote(text)
+      return "'" .. tostring(text):gsub("'", "'\\''") .. "'"
+    end
+    -- Same fake-binary trick as pr_test.lua: the script logs its argv, so a
+    -- test proves exactly one `pr create` and zero `pr close`.
+    local function fake_gh(name, body)
+      local path = maki.fs.joinpath(bins, name)
+      maki.fs.write(path, "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> "
+        .. quote(gh_log) .. "\n" .. body .. "\n")
+      local job = maki.fn.jobstart({ "chmod", "+x", path }, { scope = "plugin" })
+      maki.fn.jobwait(job, 10000)
+      return path
+    end
+    local function count_gh(needle)
+      local n = 0
+      for line in (maki.fs.read(gh_log) or ""):gmatch("[^\n]+") do
+        if line:find(needle, 1, true) then
+          n = n + 1
+        end
+      end
+      return n
+    end
+
+    -- The recorded PR #75 is CLOSED on GitHub; `pr create` opens #76, whose
+    -- `pr view` is OPEN. `pr close` is logged but must never be called.
+    local closed_gh = fake_gh("gh-closed", [[
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  if [ "$3" = "75" ]; then
+    echo '{"number":75,"url":"https://github.com/example/repo/pull/75","state":"CLOSED","mergeable":"UNKNOWN","baseRefName":"main"}'
+  else
+    echo '{"number":76,"url":"https://github.com/example/repo/pull/76","state":"OPEN","mergeable":"MERGEABLE","baseRefName":"main"}'
+  fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  echo "https://github.com/example/repo/pull/76"
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "close" ]; then
+  exit 0
+fi
+echo "unexpected: $*" >&2
+exit 2
+]])
+    -- An open PR #42: the reuse path, no create, no close.
+    local open_gh = fake_gh("gh-open", [[
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  echo '{"number":42,"url":"https://github.com/example/repo/pull/42","state":"OPEN","mergeable":"MERGEABLE","baseRefName":"main"}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "close" ]; then
+  exit 0
+fi
+echo "unexpected: $*" >&2
+exit 2
+]])
+    -- `gh` cannot be interrogated and creation is refused: the explicit gh
+    -- reason must reach the failure message, never an optimistic reuse.
+    local failing_gh = fake_gh("gh-fail", [[
+echo "gh: authentication failed (HTTP 401): not logged in" >&2
+exit 1
+]])
+
+    local pr_paths = {
+      repo = pr_root,
+      root = maki.fs.joinpath(pr_root, "state"),
+      tasks = maki.fs.joinpath(pr_root, "tasks"),
+      worktrees = maki.fs.joinpath(pr_root, "worktrees"),
+      runs = maki.fs.joinpath(pr_root, "runs"),
+      prompts = maki.fs.joinpath(pr_root, "prompts"),
+      config = maki.fs.joinpath(pr_root, "config.toml"),
+    }
+    maki.fs.mkdir(pr_paths.root, { parents = true })
+
+    -- The real git module, with only the binary name and the side-effecting
+    -- git commands narrowed: pr_open/pr_view/pr_create keep their real
+    -- implementation (verification, recreation, persistence).
+    local function git_with_gh(gh)
+      local wrapped = {}
+      for key, value in pairs(git_module) do
+        wrapped[key] = value
+      end
+      local function with_bin(opts)
+        local copy = {}
+        for key, value in pairs(opts or {}) do
+          copy[key] = value
+        end
+        copy.gh = gh
+        return copy
+      end
+      wrapped.pr_open = function(state, root, id, opts)
+        return git_module.pr_open(state, root, id, with_bin(opts))
+      end
+      wrapped.pr_view = function(ref, opts)
+        return git_module.pr_view(ref, with_bin(opts))
+      end
+      wrapped.pr_create = function(opts)
+        return git_module.pr_create(with_bin(opts))
+      end
+      wrapped.pr_close = function(ref, opts)
+        return git_module.pr_close(ref, with_bin(opts))
+      end
+      -- The merge itself is faked below; these only keep the implement turn
+      -- from shelling out to git in a directory that is not a repository.
+      wrapped.push = function() return true end
+      wrapped.rev_parse = function() return "base123" end
+      wrapped.reset_hard = function() return "sha" end
+      return wrapped
+    end
+
+    local function pr_deps(gh, initial)
+      local record = {
+        id = "T1", status = "failed", title = "t", phase = "merge",
+        checks = { "true" },
+        pr = {
+          number = 75,
+          url = "https://github.com/example/repo/pull/75",
+          state = "open",
+        },
+      }
+      for key, value in pairs(initial or {}) do
+        record[key] = value
+      end
+      local events = {}
+      local merge_prs = {}
+      local impl_conflicts = {}
+      local impl_calls = 0
+      local dispatched_conflict = false
+      local deps
+      deps = {
+        config = {
+          load = function()
+            return {
+              project = { repo = pr_root, base_ref = "main", max_parallel = 1 },
+              checks = { default = { "true" }, timeout_secs = 10 },
+              merge = { method = "squash", auto_merge = true, max_conflict_retries = 2 },
+              deploy = { auto_deploy = false, plan_file = "deploy.md" },
+            }
+          end,
+        },
+        roles = { session_opts = function()
+          return { system = "", model_spec = "m", thinking = "low", tools = {} }
+        end },
+        state = {
+          load = function() return { tasks = { T1 = record } } end,
+          transition = function(_, id, status, fields)
+            events[#events + 1] = {
+              kind = "transition", status = status,
+              phase = fields and fields.phase,
+              reason = fields and fields.reason,
+            }
+            record.status = status
+            if fields and fields.phase then record.phase = fields.phase end
+            return { id = id, status = status }
+          end,
+          set_fields = function(_, _, fields)
+            events[#events + 1] = { kind = "field", fields = fields }
+            for key, value in pairs(fields or {}) do record[key] = value end
+            return true
+          end,
+          append = function(_, event)
+            events[#events + 1] = event
+            return true
+          end,
+        },
+        implement = {
+          run = function(run_opts)
+            impl_calls = impl_calls + 1
+            if run_opts.conflict ~= nil then
+              impl_conflicts[#impl_conflicts + 1] = run_opts.conflict
+            end
+            return {
+              ok = true,
+              ctx = { worktree = pr_paths.repo, branch = "metronome/t1" },
+              sha = "sha",
+            }
+          end,
+          read_sheet = function() return {} end,
+        },
+        checks = { verify = function() return { ok = true } end, write_report = function() end },
+        converge = { run = function() return { ok = true } end },
+        review = { review = function() return { ok = true, approved = true } end },
+        merge = {
+          rebase = function() return { ok = true, base = "origin/main" } end,
+          run = function(run_opts)
+            merge_prs[#merge_prs + 1] = run_opts.pr
+            record.status = "merged"
+            return { ok = true }
+          end,
+        },
+        git = git_with_gh(gh),
+        deploy = { run = function() return { ok = true } end },
+        pipeline = {
+          tick = function(tick_opts)
+            if not dispatched_conflict then
+              dispatched_conflict = true
+              tick_opts.dispatch({ id = "T1" })
+            end
+            return { ok = true, started = {} }
+          end,
+        },
+        paths = function() return pr_paths end,
+        spawn = function(fn) fn() end,
+        wait_turn_end = false,
+        runner = {},
+        qualify = {
+          run = function() return { ok = true, tasks = {} } end,
+          next_id = function() return "T1" end,
+          apply = function() return { ok = true, tasks = { { id = "T1", title = "t" } } } end,
+        },
+        questions = { round = function() return { questions = {} } end, answer = function() return {} end },
+        analyze = { gate = function() return { ok = true } end },
+        calibrate = {}, fence = {}, mode = {},
+      }
+      return {
+        deps = deps, record = record, events = events,
+        merge_prs = merge_prs, impl_conflicts = impl_conflicts,
+        impl_calls = function() return impl_calls end,
+      }
+    end
+
+    -- (1) Closed PR recreated, then merged on the new number ------------------
+    maki.fs.write(gh_log, "")
+    local recreated = pr_deps(closed_gh)
+    local rt_closed = runtime.new(recreated.deps)
+    rt_closed.retry({ id = "T1" }, { session = "S1" })
+    rt_closed.run_pending()
+    eq(recreated.record.status, "merged",
+      "a failed merge task with a closed PR is relaunched and reaches merged")
+    eq(recreated.record.pr and recreated.record.pr.number, 76,
+      "the closed PR is recreated and the new number is persisted")
+    eq(count_gh("pr create"), 1, "exactly one PR is created for the closed PR")
+    eq(count_gh("pr close"), 0, "the relaunch closes no PR")
+    eq(count_gh("pr view 75"), 1, "the recorded PR is re-read before reuse")
+    eq(recreated.merge_prs[1], 76,
+      "the merge consumes the PR re-read in this run, not the recorded #75")
+    eq(#events_matching(recreated.events, function(event)
+      return event.kind == "transition" and event.status == "failed"
+    end), 0, "the relaunch never fails on the closed PR")
+
+    -- (2) An OPEN PR is reused: no second PR, no close -----------------------
+    maki.fs.write(gh_log, "")
+    local reused = pr_deps(open_gh, {
+      pr = { number = 42, url = "https://github.com/example/repo/pull/42", state = "open" },
+    })
+    local rt_open = runtime.new(reused.deps)
+    rt_open.retry({ id = "T1" }, { session = "S1" })
+    rt_open.run_pending()
+    eq(reused.record.status, "merged", "an open PR is reused and merged")
+    eq(count_gh("pr create"), 0, "an open PR is never recreated")
+    eq(count_gh("pr close"), 0, "an open PR is never closed")
+    eq(reused.record.pr and reused.record.pr.number, 42,
+      "the persisted PR stays the re-read one")
+    eq(reused.merge_prs[1], 42, "the merge consumes the re-read PR")
+
+    -- (3) An unreadable gh is never an optimistic reuse: the explicit reason --
+    maki.fs.write(gh_log, "")
+    local unreadable = pr_deps(failing_gh)
+    local rt_fail = runtime.new(unreadable.deps)
+    rt_fail.retry({ id = "T1" }, { session = "S1" })
+    rt_fail.run_pending()
+    eq(unreadable.record.status, "failed",
+      "an unopenable PR fails the task with ok=false")
+    local failed_message = tostring(unreadable.record.failure
+      and unreadable.record.failure.message or "")
+    eq(failed_message:find("cannot open the pull request", 1, true) ~= nil, true,
+      "the failure says the pull request cannot be opened")
+    eq(failed_message:find("authentication failed", 1, true) ~= nil, true,
+      "the failure carries the explicit gh reason, not a generic sentence")
+    eq(count_gh("pr create") >= 1, true, "an unreadable gh still attempts creation")
+    eq(count_gh("pr close"), 0, "the failure closes no PR")
+
+    -- (4) A conflicting PR triggers the existing bounded repair --------------
+    maki.fs.write(gh_log, "")
+    local conflicting = pr_deps(open_gh, {
+      status = "failed",
+      phase = "merge",
+      pr = { number = 42, url = "https://github.com/example/repo/pull/42", state = "open" },
+    })
+    local conflict_calls = 0
+    conflicting.deps.merge.run = function(run_opts)
+      conflict_calls = conflict_calls + 1
+      conflicting.merge_prs[#conflicting.merge_prs + 1] = run_opts.pr
+      if conflict_calls == 1 then
+        return {
+          ok = false,
+          conflict = true,
+          conflict_files = "docs/configuration.md",
+          conflict_file_list = { "docs/configuration.md" },
+          conflict_hunks = {
+            { file = "docs/configuration.md", start = 12,
+              text = "<<<<<<< HEAD\nold\n=======\nnew\n>>>>>>> 59738f2" },
+          },
+          conflict_commit = "59738f2",
+          base = "main",
+          base_sha = "base123",
+          upstream = "origin/main",
+          rebase_command = "git rebase origin/main",
+          mergeable = "conflicting",
+          error = "pull request #42 conflicts with main",
+        }
+      end
+      conflicting.record.status = "merged"
+      return { ok = true }
+    end
+    local rt_conflict = runtime.new(conflicting.deps)
+    rt_conflict.retry({ id = "T1" }, { session = "S1" })
+    rt_conflict.run_pending()
+    eq(conflicting.record.status, "merged",
+      "a conflicting PR is repaired and merges instead of failing")
+    eq(conflicting.record.conflict_retries, 1, "the conflict repair is counted on the task")
+    eq(conflict_calls, 2, "the merge is attempted again after the repair")
+    eq(#events_matching(conflicting.events, function(event)
+      return event.kind == "transition" and event.status == "failed"
+    end), 0, "a conflicting PR never transitions to failed before the bound")
+    eq(#conflicting.impl_conflicts, 1, "the repair turn receives the conflict facts")
+    local given = conflicting.impl_conflicts[1] or {}
+    eq(given.files and given.files[1], "docs/configuration.md",
+      "the repair turn receives the conflicting files")
+    eq(given.base, "main", "the repair turn receives the base")
+    eq(given.base_sha, "base123", "the repair turn receives the base sha")
+    eq(given.command, "git rebase origin/main", "the repair turn receives the exact command")
+    eq(conflicting.merge_prs[1], 42, "the conflicting merge consumes the re-read PR")
+    eq(count_gh("pr close"), 0, "the repair opens no second PR and closes none")
+    eq(count_gh("pr create"), 0, "the repair reuses the open PR")
+  end
+
   -- The prompt and the config carry the conflict contract -------------------
   local implement = load_module("implement")
   local conflict_prompt = implement.render_prompt(
