@@ -55,6 +55,11 @@ def replay(events: list[dict]) -> dict[str, dict]:
                     task["phase"] = event["phase"]
             elif kind == "field":
                 task.update(event.get("fields") or {})
+            elif kind == "quarantine_cleared":
+                # Same rule as state.lua: the marker is dropped, the status is
+                # untouched. Without this the replay would keep a quarantine the
+                # Lua side already lifted, and the roundtrip journal would drift.
+                task.pop("quarantine", None)
             elif kind == "note":
                 task.setdefault("notes", []).append(event.get("text"))
             if "at" in event:

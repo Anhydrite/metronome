@@ -256,6 +256,11 @@ function M.replay(text)
             for k, v in pairs(event.fields or {}) do
               task[k] = v
             end
+          elseif event.kind == "quarantine_cleared" then
+            -- The marker is set by a field event and dropped by its own event,
+            -- so a clean re-analysis lifts it without a new submit. The status
+            -- is untouched: a quarantined task keeps its status throughout.
+            task.quarantine = nil
           elseif event.kind == "note" then
             task.notes = task.notes or {}
             table.insert(task.notes, event.text)
@@ -645,6 +650,29 @@ function M.set_fields(root, task_id, fields)
     kind = "field",
     task_id = task_id,
     fields = fields,
+  })
+  if not new_state then
+    return nil, err
+  end
+  return new_state.tasks[task_id]
+end
+
+-- Lift a quarantine. The task keeps its status: a quarantined task stays
+-- `qualifying`, so clearing it is not a transition, only the removal of a
+-- marker. It goes through the journal as its own event so a rebuild of the
+-- projection — or a fresh replay of the whole file — cannot resurrect it.
+function M.clear_quarantine(root, task_id)
+  local state = M.load(root)
+  local task = state.tasks[task_id]
+  if not task then
+    return nil, "unknown task: " .. task_id
+  end
+  if task.quarantine == nil then
+    return task
+  end
+  local new_state, err = M.append(root, {
+    kind = "quarantine_cleared",
+    task_id = task_id,
   })
   if not new_state then
     return nil, err
