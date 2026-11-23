@@ -465,6 +465,11 @@ return function()
     "a hand-off with a free slot reports no slot wait")
   eq(handed_off and handed_off.task and handed_off.task.slot_wait, nil,
     "a hand-off with a free slot carries no structured wait")
+  -- The raw field stays readable under its stable name even when the live
+  -- structured wait is nil: a consumer that only asks "is it parked?" reads
+  -- `slot_wait_flag` and is never silently told `slot_wait = nil` instead.
+  eq(handed_off and handed_off.task and handed_off.task.slot_wait_flag, true,
+    "a hand-off keeps the persisted flag readable under its stable name")
   pump_calls(env3, 1)
   eq(#env3.calls, 1, "the retry is dispatched exactly once")
   eq(env3.calls[1], F, "the task that starts is the retried one")
