@@ -334,6 +334,16 @@ Everything else — implementation, testing, minor fixes — proceeds autonomous
 - **Never compromise quality for speed.** Deadlines do not exist here.
 - **A failure is never final.** Every `failed` task stays resumable: typed diagnosis, actionable remedy, bounded retry, human escalation only when a retry is impossible. The scheduler never stops on a failed task.
 
+## Failure doctrine
+
+A failed task is a defect in the product, not an accident to retry. Whenever a task fails:
+
+1. **Stop and find the root cause.** Read the journal, `runtime.log`, the run transcript, the exact command and its exit code. Reproduce it before touching anything (P3).
+2. **Fix the cause, never the symptom.** A retry that only clears the status without changing the cause is forbidden; it will fail again.
+3. **Strengthen Metronome itself.** The product is meant to be exercised on its own repository: a pipeline defect found in self-use becomes a product fix, with a test written red first (T0) and green after (T1). We improve the tool by using it.
+4. **Escalate only when the fix is not straightforward.** If the root-cause fix is an architecture decision, a destructive action or a scope expansion, lay out the options and the tradeoffs, then ask the user for validation. Never guess a long-term design choice.
+5. **Never leave a workflow down.** Either the root cause is fixed and the task resumes from its checkpoint, or the blocker is escalated with a precise, actionable remedy. `failed` and a stopped scheduler are the worst outcomes, and both are temporary until proven otherwise.
+
 ## Anti-rationalization
 
 The model will try to rationalize skipping the pipeline. This table is the hard counter.
@@ -348,3 +358,4 @@ The model will try to rationalize skipping the pipeline. This table is the hard 
 | "I'll merge now, review later" | Never merge without a clean review | Wait for `approved` on the exact SHA |
 | "This protected file is in the way" | P7: rules cannot be rewritten by the work | Stop and escalate to the user |
 | "The task failed, it's over" | A failure is never final: `failed` is resumable | Read `last_error`/`retry_action`, then retry from the checkpoint |
+| "It failed, just retry it" | Failure doctrine: a retry without a root-cause fix is a loop | Diagnose, fix the cause at the root, then resume |
