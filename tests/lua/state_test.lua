@@ -25,6 +25,23 @@ return function()
   eq(state.can_transition("abandoned", "failed"), true, "abandoned -> failed allowed for escalation")
   eq(state.can_transition("running", "running"), true, "same status is a no-op")
 
+  -- Requeue to ready: the edge a bounded retry needs ------------------------
+  --
+  -- runtime.retry and runtime.resume both have to put a task back in the
+  -- scheduler's hands instead of starting it behind max_parallel's back. A
+  -- task recovered by /reload has no pilot any more, and run_task restarts at
+  -- implement for every non-epic task, so requeueing mid-pipeline costs no
+  -- work — it only means legal transitions must reach `ready` from every
+  -- status a task can be parked in.
+  for _, from in ipairs({
+    "failed", "stalled", "abandoned", "running",
+    "verifying", "reviewing", "merging", "deploying",
+  }) do
+    eq(state.can_transition(from, "ready"), true, from .. " -> ready allowed for a requeue")
+  end
+  eq(state.can_transition("merged", "ready"), false, "merged -> ready still refused")
+  eq(state.can_transition("deployed", "ready"), false, "deployed -> ready still refused")
+
   eq(state.is_terminal("merged"), true, "merged is terminal")
   eq(state.is_terminal("deployed"), true, "deployed is terminal")
   eq(state.is_terminal("running"), false, "running is not terminal")
@@ -447,6 +464,59 @@ return function()
   eq((state.failure_of(resumed_task) or {}).next_retry_at, nil, "the replay clears next_retry_at too")
   eq((state.failure_of(resumed_task) or {}).cause, "git_identity", "the replay keeps the cause")
   eq(state.checkpoint_of(resumed_task), "2222222", "the resume keeps its checkpoints")
+
+  -- A requeue to ready never clobbers the cause ------------------------------
+  --
+  -- A retry with no free slot puts the task back in `ready` and journals the
+  -- wait reason. That reason explains a wait, not a fault: it must stay in the
+  -- journal event and never be read back as `failure_reason`, or a healthy
+  -- queued task would show an invented `unknown` error and its real diagnosis
+  -- would be lost.
+  local requeue_root = tmp_root("state-requeue-ready")
+  state.create(requeue_root, { id = "T-20261122-q001", title = "requeue me" })
+  state.transition(requeue_root, "T-20261122-q001", "qualifying")
+  state.transition(requeue_root, "T-20261122-q001", "ready")
+  state.transition(requeue_root, "T-20261122-q001", "running")
+  local queued_failure = {
+    cause = "checks_red",
+    message = "checks exited 1",
+    remedy = "rerun tests/run-lua.sh",
+    transient = true,
+    attempts = 1,
+    at = "2026-11-22T10:00:00Z",
+    next_retry_at = "2026-11-22T10:00:30Z",
+    phase = "verify",
+  }
+  state.transition(requeue_root, "T-20261122-q001", "failed", {
+    reason = "checks exited 1",
+    failure = queued_failure,
+  })
+  local requeued, requeue_err = state.transition(requeue_root, "T-20261122-q001", "ready", {
+    reason = "waiting for a free slot",
+  })
+  eq(requeue_err, nil, "the requeue to ready has no error: " .. tostring(requeue_err))
+  eq(requeued and requeued.status, "ready", "the task is back in ready")
+  eq(requeued and requeued.failure_reason, "checks exited 1",
+    "the wait reason does not overwrite the failure reason")
+  local kept_failure = state.failure_of(requeued)
+  eq(kept_failure and kept_failure.cause, "checks_red", "the requeue keeps the cause")
+  eq(kept_failure and kept_failure.attempts, 1, "the requeue keeps the attempt count")
+  eq(kept_failure and kept_failure.next_retry_at, "2026-11-22T10:00:30Z",
+    "the requeue keeps the retry deadline")
+
+  -- The wait reason is still journaled: humans must see why the retry waited.
+  local requeue_journal = maki.fs.read(state.paths(requeue_root).journal) or ""
+  has(requeue_journal, "waiting for a free slot", "the wait reason lands in the journal")
+
+  -- And the same holds when the journal is replayed from scratch.
+  maki.fs.rm(state.paths(requeue_root).projection)
+  local replayed_requeue = state.load(requeue_root).tasks["T-20261122-q001"]
+  eq(replayed_requeue and replayed_requeue.status, "ready", "the requeue replays from the journal")
+  eq(replayed_requeue and replayed_requeue.failure_reason, "checks exited 1",
+    "the replayed requeue keeps the failure reason")
+  local replayed_kept = state.failure_of(replayed_requeue)
+  eq(replayed_kept and replayed_kept.cause, "checks_red", "the replayed requeue keeps the cause")
+  eq(replayed_kept and replayed_kept.attempts, 1, "the replayed requeue keeps the attempt count")
 
   -- A malformed failure is refused with an explanation, never written blind.
   local not_table, not_table_err = state.transition(root, "T-20261122-c001", "failed", { failure = "boom" })

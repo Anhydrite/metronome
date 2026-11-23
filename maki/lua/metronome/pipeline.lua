@@ -32,6 +32,12 @@
 
 local M = {}
 
+-- The named wait reason for "no free slot". Every entry point that has to put
+-- a task back in the queue (a tick skip, a retry without a slot, a resume
+-- without a slot) writes this same sentence in the journal, so a human — and
+-- metronome_status — read one wording, not three.
+M.WAIT_SLOT = "waiting for a free slot"
+
 local ACTIVE = {
   running = true,
   verifying = true,
@@ -328,18 +334,46 @@ end
 
 -- Scheduling ----------------------------------------------------------------
 
--- Pick the tasks to start from an already-filtered candidate list. `running`
--- is the tasks already in flight (a list or a map). Returns `started, skipped`;
--- every skipped task carries a reason, so the panel and the logs can say why it
--- waited. Shared by `schedule` (ready tasks) and `tick` (ready + retries).
-local function pick(candidates, tasks, running, opts)
+-- The slot accounting every entry point shares. `tasks` is a projection (a
+-- list or a map); `opts.max_parallel` is the cap, defaulting exactly like
+-- `pick()` does. Returns `in_flight` (how many tasks hold a slot),
+-- `max_parallel` (the cap, at least 1) and `free` (the remaining slots, never
+-- negative).
+--
+-- A slot is held by the statuses `pick()` already refuses to overbook: the
+-- active ones. `opts.exclude` names one task id left out of the count, so a
+-- retry of a task that is still active is not charged twice against the same
+-- budget.
+function M.slots(tasks, opts)
   opts = type(opts) == "table" and opts or {}
   local max_parallel = tonumber(opts.max_parallel) or 2
   if max_parallel < 1 then
     max_parallel = 1
   end
 
-  local in_flight = M.collect(running)
+  local exclude = opts.exclude
+  local in_flight = 0
+  for _, task in ipairs(M.collect(tasks)) do
+    if ACTIVE[task.status] and (exclude == nil or task.id ~= exclude) then
+      in_flight = in_flight + 1
+    end
+  end
+
+  local free = max_parallel - in_flight
+  if free < 0 then
+    free = 0
+  end
+  return in_flight, max_parallel, free
+end
+
+-- Pick the tasks to start from an already-filtered candidate list. `running`
+-- is the tasks already in flight (a list or a map). Returns `started, skipped`;
+-- every skipped task carries a reason, so the panel and the logs can say why it
+-- waited. Shared by `schedule` (ready tasks) and `tick` (ready + retries).
+local function pick(candidates, tasks, running, opts)
+  opts = type(opts) == "table" and opts or {}
+  local in_flight, max_parallel = M.slots(running, { max_parallel = opts.max_parallel })
+
   local selected = {}
   local skipped = {}
 
@@ -359,14 +393,17 @@ local function pick(candidates, tasks, running, opts)
     local met, reason = M.dependencies_met(task, tasks, opts)
     if not met then
       skipped[#skipped + 1] = { id = task.id, reason = reason }
-    elseif #in_flight + #selected >= max_parallel then
-      skipped[#skipped + 1] = { id = task.id, reason = "max_parallel reached" }
+    elseif in_flight + #selected >= max_parallel then
+      skipped[#skipped + 1] = {
+        id = task.id,
+        reason = M.WAIT_SLOT .. " (max_parallel reached)",
+      }
     else
       local files = type(task.files) == "table" and task.files or {}
       -- A task that declares no files has an unknown blast radius: it could
       -- touch anything, so it runs alone. It still starts on an empty
       -- pipeline; naming a file in the intention buys the parallelism back.
-      if #files == 0 and (#in_flight + #selected > 0) then
+      if #files == 0 and (in_flight + #selected > 0) then
         skipped[#skipped + 1] = {
           id = task.id,
           reason = "no declared files: runs alone (name a file to run it in parallel)",

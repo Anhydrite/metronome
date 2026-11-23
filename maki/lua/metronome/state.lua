@@ -23,25 +23,31 @@ local TERMINAL = {
 
 -- Legal transitions. Anything else is a bug in the caller, so it raises rather
 -- than silently corrupting the journal.
+--
+-- `ready` is a legal target from every status a task can be parked in, not
+-- only from `qualifying`: `runtime.retry` and `runtime.resume` requeue a task
+-- instead of starting it behind max_parallel's back, and a task recovered by
+-- /reload has no pilot any more. `run_task` restarts at implement for every
+-- non-epic task, so requeueing mid-pipeline costs no work.
 local TRANSITIONS = {
   draft = { qualifying = true, abandoned = true },
   qualifying = { awaiting_answers = true, ready = true, failed = true, abandoned = true },
   awaiting_answers = { qualifying = true, abandoned = true },
   ready = { running = true, failed = true, abandoned = true },
-  running = { verifying = true, failed = true, stalled = true, abandoned = true },
-  verifying = { running = true, reviewing = true, failed = true, abandoned = true },
-  reviewing = { changes_requested = true, pr_open = true, failed = true, abandoned = true },
+  running = { verifying = true, failed = true, stalled = true, abandoned = true, ready = true },
+  verifying = { running = true, reviewing = true, failed = true, abandoned = true, ready = true },
+  reviewing = { changes_requested = true, pr_open = true, failed = true, abandoned = true, ready = true },
   changes_requested = { running = true, failed = true, abandoned = true },
   pr_open = { merging = true, merged = true, failed = true, abandoned = true },
-  merging = { merged = true, failed = true },
+  merging = { merged = true, failed = true, ready = true },
   merged = { deploying = true, deployed = true },
-  deploying = { deployed = true, failed = true },
+  deploying = { deployed = true, failed = true, ready = true },
   deployed = {},
-  failed = { running = true, abandoned = true },
-  stalled = { running = true, failed = true, abandoned = true },
+  failed = { running = true, abandoned = true, ready = true },
+  stalled = { running = true, failed = true, abandoned = true, ready = true },
   -- A retried task that re-enters review can hit the round limit while it is
   -- still abandoned; escalation must be able to fail it, not error out.
-  abandoned = { running = true, failed = true },
+  abandoned = { running = true, failed = true, ready = true },
 }
 
 -- An epic task owns the single PR from the epic branch to the project base.
@@ -149,6 +155,12 @@ end
 -- deadline any more, and the attempt budget starts again from zero.
 local RESUME_STATUSES = { running = true, verifying = true, reviewing = true, merged = true }
 
+-- A status event may carry a reason. Only a status that *is* a failure writes
+-- it into `failure_reason`; a move carries why the task moved (a free-slot
+-- wait, a review round), and reading that back as a cause would make the
+-- status report invent an `unknown` error on a healthy task.
+local REASON_AS_FAILURE = { failed = true, abandoned = true }
+
 local function settle_failure(task)
   local failure = task.failure
   if type(failure) ~= "table" then
@@ -242,7 +254,7 @@ function M.replay(text)
           if event.kind == "status" then
             task.status = event.status
             task.phase = event.phase or task.phase
-            if type(event.reason) == "string" and event.reason ~= "" then
+            if type(event.reason) == "string" and event.reason ~= "" and REASON_AS_FAILURE[event.status] then
               task.failure_reason = event.reason
             end
             -- A failure is only rewritten by a failure event: branch, worktree,

@@ -80,6 +80,42 @@ return function()
   eq(#started, 2, "two tasks sharing a file are both selected")
   eq(#skipped, 0, "sharing a file produces no skip")
 
+  -- slots: the one definition of the cap -------------------------------------
+  --
+  -- `max_parallel` is the single authority every entry point shares (a tick, a
+  -- retry, a resume). `slots` is the pure projection of that authority: it
+  -- counts the statuses the scheduler already treats as in flight, and it can
+  -- leave the candidate itself out of the count so a retry of a task that is
+  -- still active is not charged twice.
+  eq(pipeline.WAIT_SLOT, "waiting for a free slot", "the wait reason is one constant")
+
+  local projection = {
+    task("T-run", "running", { files = { "src/1" } }),
+    task("T-verify", "verifying"),
+    task("T-review", "reviewing"),
+    task("T-merge", "merging"),
+    task("T-deploy", "deploying"),
+    task("T-ready", "ready"),
+    task("T-failed", "failed"),
+    task("T-merged", "merged"),
+  }
+  local in_flight, max_parallel, free = pipeline.slots(projection, { max_parallel = 3 })
+  eq(in_flight, 5, "every ACTIVE status counts as in flight")
+  eq(max_parallel, 3, "slots reports the cap it was given")
+  eq(free, 0, "a saturated pipeline has no free slot")
+
+  local _, _, free_two = pipeline.slots(projection, { max_parallel = 7 })
+  eq(free_two, 2, "the free count is the cap minus what is in flight")
+
+  local excluded, _, free_excluded = pipeline.slots(projection, { max_parallel = 7, exclude = "T-run" })
+  eq(excluded, 4, "the candidate task is left out of the count")
+  eq(free_excluded, 3, "excluding the candidate frees its own slot")
+
+  local default_in_flight, default_max, default_free = pipeline.slots({})
+  eq(default_in_flight, 0, "an empty projection has nothing in flight")
+  eq(default_max, 2, "slots falls back to the same default cap as pick")
+  eq(default_free, 2, "an empty pipeline has every slot free")
+
   -- schedule: max_parallel -------------------------------------------------
 
   local tasks = {
@@ -94,6 +130,17 @@ return function()
   eq(#skipped, 1, "the third task is skipped")
   eq(skipped[1].id, "T-3", "the skipped task is named")
   eq(skipped[1].reason:find("max_parallel", 1, true) ~= nil, true, "the skip reason is max_parallel")
+  eq(skipped[1].reason:find(pipeline.WAIT_SLOT, 1, true) ~= nil, true, "the skip reason names the wait reason")
+
+  -- The cap `pick` applies is the one `slots` reports: one in flight task and
+  -- a cap of two leaves exactly one free slot, and exactly one task starts.
+  local one_running = { task("T-run", "running") }
+  local slots_in_flight, slots_cap, slots_free = pipeline.slots(one_running, { max_parallel = 2 })
+  eq(slots_in_flight, 1, "one task is in flight")
+  eq(slots_cap, 2, "the cap is two")
+  eq(slots_free, 1, "one slot is free")
+  started = pipeline.schedule(tasks, one_running, { max_parallel = 2 })
+  eq(#started, slots_free, "pick starts exactly the free slots the helper reports")
 
   -- schedule: a running task never blocks on files -------------------------
 
