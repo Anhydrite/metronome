@@ -220,6 +220,30 @@ function M.render_prompt(task, sheet, ctx, opts)
     end
     line("")
   end
+  -- Answered questions are binding. The sheet may be missing, stale or simply
+  -- lagging behind the journal (an answer is applied to `task.questions` before
+  -- the sheet is rewritten), so the prompt renders the answers itself instead of
+  -- trusting the sheet to carry them. Unanswered questions stay non-binding and
+  -- are not repeated here.
+  local answered = {}
+  for _, question in ipairs(type(task.questions) == "table" and task.questions or {}) do
+    if type(question) == "table" and is_non_empty(question.answer) then
+      answered[#answered + 1] = question
+    end
+  end
+  if #answered > 0 then
+    line("## Réponses aux questions (contraignantes)")
+    line("")
+    line("A human answered these questions. The answers are binding: when an answer")
+    line("contradicts the task intent or the task sheet, the answer wins and the")
+    line("intent is overridden.")
+    line("")
+    for _, question in ipairs(answered) do
+      line("- " .. tostring(question.id) .. ": " .. tostring(question.text))
+      line("  - Réponse (" .. tostring(question.answered_at) .. "): " .. tostring(question.answer))
+    end
+    line("")
+  end
   line("## Rules")
   line("")
   if #files > 0 then
