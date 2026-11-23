@@ -171,6 +171,58 @@ local function retryable(task, opts)
   return attempts < limit
 end
 
+-- A failed task whose review loop escalated: a human relaunch grants it a
+-- fresh review budget instead of retrying it automatically. recover owns the
+-- detection, so the runtime and the pipeline agree on one definition.
+local function is_review_escalation(task, opts)
+  local rec = recover_module(opts)
+  if not rec or type(rec.is_review_escalation) ~= "function" then
+    return false
+  end
+  local ok, escalated = pcall(rec.is_review_escalation, task)
+  return ok and escalated == true
+end
+
+-- What the reset writes, when there is one: the review field patch, the note
+-- naming the old round and the granted budget. recover builds both, so the
+-- pipeline and `metronome_retry` reset in exactly the same words.
+local function review_reset(task, opts)
+  local rec = recover_module(opts)
+  if not rec or type(rec.review_budget_reset) ~= "function" then
+    return nil
+  end
+  local ok, reset = pcall(rec.review_budget_reset, task)
+  if ok and type(reset) == "table" then
+    return reset
+  end
+  return nil
+end
+
+-- Grant the fresh budget: the field patch and the journal note land before the
+-- task crosses to `running`, so no reader ever sees the relaunch without its
+-- reset. Without the note the reset would be invisible in the journal.
+local function apply_review_reset(state, root, entry)
+  local reset = entry.review_reset
+  if type(state.set_fields) ~= "function" then
+    return nil, "state module is missing set_fields"
+  end
+  local stored, serr = state.set_fields(root, entry.id, { review = reset.review })
+  if not stored then
+    return nil, serr or "cannot reset the review round budget"
+  end
+  if type(state.append) == "function" then
+    local appended, aerr = state.append(root, {
+      kind = "note",
+      task_id = entry.id,
+      text = reset.note,
+    })
+    if not appended then
+      return nil, aerr or "cannot journal the review round reset"
+    end
+  end
+  return true
+end
+
 -- Start candidates -----------------------------------------------------------
 
 -- The failed tasks that may start again now: transient, under the attempt
@@ -450,8 +502,10 @@ function M.resume(state, root, opts)
     local phase = RESUME_PHASE[task.status]
     -- A failed task is resumed only when it is actually retryable: a red
     -- permanent failure (auth, checks red, budget exhausted) stays failed until
-    -- a human acts, so a reload does not loop it forever.
-    if phase and (task.status ~= "failed" or retryable(task, opts)) then
+    -- a human acts, so a reload does not loop it forever. A review escalation is
+    -- the exception: it is not retried automatically, but a `/reload` relaunch
+    -- is exactly the human act that grants it a fresh review budget.
+    if phase and (task.status ~= "failed" or retryable(task, opts) or is_review_escalation(task, opts)) then
       if task.status == "failed" and type(task.failure) == "table" and is_non_empty(task.failure.phase) then
         phase = task.failure.phase
       end
@@ -461,6 +515,7 @@ function M.resume(state, root, opts)
         phase = phase,
         path = RESUME_PATH[task.status],
         task = task,
+        review_reset = task.status == "failed" and review_reset(task, opts) or nil,
       }
     end
   end
@@ -482,7 +537,18 @@ function M.resume(state, root, opts)
       -- against, and a stale walk would dispatch a task already restarted.
       local expected = entry.from
       local moved = true
-      for _, to in ipairs(entry.path) do
+      -- A review-escalated task gets its round budget back in the same gesture
+      -- as the move back to `running`, before it crosses over: the first review
+      -- of the relaunch must be round 1, not round max+1 with no review at all.
+      if entry.review_reset then
+        local applied, aerr = apply_review_reset(state, root, entry)
+        if not applied then
+          moved = false
+          entry.reason = aerr
+          errors[#errors + 1] = { id = entry.id, skipped = true, reason = aerr }
+        end
+      end
+      for _, to in ipairs(moved and entry.path or {}) do
         local current_state = state.load(root)
         local current = type(current_state) == "table"
           and current_state.tasks and current_state.tasks[entry.id] or nil

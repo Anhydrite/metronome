@@ -3249,6 +3249,21 @@ function M.new(deps)
       retry_alias[key] = value
     end
     view.retry_actions = retry_alias
+    -- The review budget is part of what a human needs to see: a task escalated
+    -- at its last round shows 0 remaining, and the same task after a relaunch
+    -- shows the full budget again. The raw `review` object is left untouched.
+    local review = type(task.review) == "table" and task.review or nil
+    if review then
+      local round = tonumber(review.round)
+      local max_rounds = tonumber(review.max_rounds)
+      view.review_round = round
+      view.review_max_rounds = max_rounds
+      if round and max_rounds then
+        view.review_rounds_remaining = math.max(0, math.floor(max_rounds) - math.floor(round))
+      else
+        view.review_rounds_remaining = nil
+      end
+    end
     return view
   end
 
@@ -3300,6 +3315,37 @@ function M.new(deps)
     return { ok = true, background = true, applied = applied }
   end
 
+  -- Grant a relaunched review-escalated task a fresh review budget. The reset
+  -- happens before the task crosses back to `running`, keeps the last round's
+  -- findings as the implementer's feedback, and is journaled — the field patch
+  -- plus a note naming the old round and the granted budget — so the relaunch
+  -- stays auditable. Any other failure cause leaves the counter alone.
+  local function reset_review_budget(paths, task)
+    local recover = recover_module()
+    if not recover or type(recover.review_budget_reset) ~= "function" then
+      return nil
+    end
+    local ok, reset = pcall(recover.review_budget_reset, task)
+    if not ok or type(reset) ~= "table" then
+      return nil
+    end
+    local stored, serr = deps.state.set_fields(paths.root, task.id, { review = reset.review })
+    if not stored then
+      return nil, serr or "cannot reset the review round budget"
+    end
+    if type(deps.state.append) == "function" then
+      local appended, aerr = pcall(deps.state.append, paths.root, {
+        kind = "note",
+        task_id = task.id,
+        text = reset.note,
+      })
+      if not appended then
+        return nil, aerr or "cannot journal the review round reset"
+      end
+    end
+    return reset
+  end
+
   function runtime.retry(input, ctx)
     input = type(input) == "table" and input or {}
     local paths = project_paths()
@@ -3310,6 +3356,14 @@ function M.new(deps)
     end
     if task.status ~= "failed" and task.status ~= "stalled" and task.status ~= "abandoned" then
       return { ok = false, error = "task is not failed, stalled or abandoned" }
+    end
+    -- A task escalated by its review keeps `review.round` at the budget, so a
+    -- relaunch would escalate on its first round with no review run at all
+    -- (T-20261122-0043). The budget is granted in the same gesture as the move
+    -- back to `running`, before the task crosses over.
+    local review_reset, reset_err = reset_review_budget(paths, task)
+    if reset_err then
+      return { ok = false, error = reset_err }
     end
     local moved, err = deps.state.transition(paths.root, input.id, "running", { phase = "implement" })
     if not moved then

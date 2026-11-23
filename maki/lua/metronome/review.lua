@@ -897,6 +897,27 @@ local function review_impl(opts)
     return stale
   end
 
+  -- The stored round already sits at the budget: there is no round left to
+  -- run. Escalating here would journal "review escalated after N rounds" for a
+  -- review that never happened — the empty escalation that made a relaunch of
+  -- T-20261122-0043 fail with zero reviewer turns. Refuse truthfully instead,
+  -- without a note and without a model turn: the caller must relaunch the task
+  -- so the review round budget is reset.
+  local stored_round = math.floor(tonumber(previous.round) or 0)
+  if stored_round >= max_rounds then
+    return {
+      ok = false,
+      error = string.format(
+        "review budget exhausted: round %d of %d, no review performed; relaunch the task to reset the review round budget",
+        stored_round, max_rounds
+      ),
+      round = stored_round,
+      max_rounds = max_rounds,
+      sha = sha,
+      budget_exhausted = true,
+    }
+  end
+
   local base = opts.base or task.base_ref or "main"
   local changed, cerr = opts.git.changed_files(worktree, base, { three_dot = true })
   if not changed then

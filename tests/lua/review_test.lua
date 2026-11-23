@@ -564,6 +564,55 @@ return function()
   eq(note_at < failed_at, true, "the note is written before the failed transition")
   has(esc_note, esc_expected_note, "the note keeps its exact text")
 
+  -- review: a stored round at the budget is never reviewed --------------------
+  --
+  -- Reproduction T-20261122-0043: the task failed at review.round = 3 with
+  -- review.max_rounds = 3. Relaunching kept the counter, so the next dispatch
+  -- computed round 4, escalated, and journaled "review escalated after 4 rounds"
+  -- without a single review of the new commit. A stored round already at the
+  -- budget must refuse truthfully: no reviewer turn, no note, no failure.
+  local wt_late, id_late, sha_late = seed_worktree({ ["src/late.lua"] = "return 30\n" })
+  make_task(id_late)
+  state.set_fields(root, id_late, { review = { round = 3, max_rounds = 3, commit_sha = sha_late } })
+  local late_calls = 0
+  local late_result = review.review(review_opts(id_late, wt_late, function()
+    late_calls = late_calls + 1
+    return { ok = true, text = CLEAN }
+  end))
+  eq(late_calls, 0, "a spent review budget spends no reviewer turn")
+  eq(late_result.ok, false, "a spent review budget is not ok")
+  has(late_result.error, "review budget exhausted", "the error says the budget is exhausted")
+  has(late_result.error, "round 3 of 3", "the error names the stored round and the budget")
+  eq(late_result.escalated, nil, "no escalation is reported")
+  local after_late = state.load(root).tasks[id_late]
+  eq(after_late.status, "reviewing", "the spent budget does not fail the task")
+  eq((table.concat(after_late.notes or {}, "\n"):lower()):find("escalated after", 1, true), nil,
+    "no misleading 'escalated after' note is written")
+
+  -- review: the relaunched budget is real -------------------------------------
+  --
+  -- The reset the relaunch writes: round 0, same budget, findings kept. The
+  -- next round is round 1 and it is a real reviewer turn, never an escalation.
+  state.set_fields(root, id_late, {
+    review = {
+      round = 0,
+      max_rounds = 3,
+      commit_sha = sha_late,
+      findings = { { severity = "blocking", message = "still broken", path = "src/a.lua", line = 2 } },
+    },
+  })
+  local fresh_calls = 0
+  local fresh_result = review.review(review_opts(id_late, wt_late, function()
+    fresh_calls = fresh_calls + 1
+    return { ok = true, text = CLEAN }
+  end))
+  eq(fresh_result.ok, true, "the relaunched round reviews: " .. tostring(fresh_result.error))
+  eq(fresh_result.round, 1, "the first review after the reset is round 1")
+  eq(fresh_calls, 1, "the relaunched round runs one real reviewer turn")
+  eq(fresh_result.escalated, nil, "the relaunched round does not escalate")
+  local after_fresh = state.load(root).tasks[id_late]
+  eq(after_fresh.review and after_fresh.review.round, 1, "the new round is stored")
+
   -- review: a verdict that arrives after the task left reviewing --------------
   --
   -- The same review round can be applied twice: another driver moved the task
@@ -807,6 +856,30 @@ return function()
   end))
   eq(nofixfn.changes_requested, true, "a loop without a fix returns the changes_requested result")
   eq(nofixfn.round, 1, "a loop without a fix stops after round 1")
+
+  -- recover: the escalation is a typed cause ---------------------------------
+  --
+  -- The runtime needs one authority to recognise "this task was escalated by
+  -- its review" before it resets the round budget. Without the typed cause a
+  -- retry keeps `review.round` and escalates empty again.
+  local recover = load_module("recover")
+  local found = false
+  for _, cause in ipairs(recover.CAUSES or {}) do
+    if cause == "review_escalated" then
+      found = true
+    end
+  end
+  eq(found, true, "review_escalated is part of the closed set of causes")
+  local diagnosis = recover.classify("review escalated after 3 round(s)")
+  eq(diagnosis.cause, "review_escalated", "the escalation message is typed")
+  eq(diagnosis.transient, false, "a review escalation is not transient")
+  local decision = recover.decide({
+    cause = "review_escalated",
+    transient = false,
+    attempts = 1,
+    phase = "review",
+  })
+  eq(decision.action, "human", "a review escalation goes to a human, never to an automatic retry")
 
   -- The base directory is deliberately kept: tests/run-lua.sh validates the
   -- journal this test wrote.
