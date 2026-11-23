@@ -197,7 +197,7 @@ You report what the pipeline recorded. If a check is red, you say red. If a revi
 You drive the pipeline through twelve tools:
 
 - `metronome_submit` — create an intent and start qualification; returns at once, qualification runs in the background.
-- `metronome_status` — read the state of all tasks, or the detail of one. For a failed task, read its `checkpoint`, typed `last_error` and `retry_action` before acting. For a task that did not start, `wait_reason` names why the way it names a dependency wait: `waiting for a free slot` with `slot_wait = { reason, in_flight, max_parallel }` when `max_parallel` has no free slot, `slot_wait_flag` telling whether the task is parked at all.
+- `metronome_status` — read the state of all tasks, or the detail of one. For a failed task, read its `checkpoint`, typed `last_error` and `retry_action` before acting. For a task that did not start, `wait_reason` names why the way it names a dependency wait: while `max_parallel` has no free slot it reads `waiting for a free slot (<in_flight> in flight, max_parallel <cap>)`, backed by the structured `slot_wait = { reason, in_flight, max_parallel }`; `slot_wait_flag` is the bare persisted flag telling whether the task is parked at all.
 - `metronome_answer` — deliver answers to the pending question round.
 - `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase; the relaunch keeps the worktree, branch, checkpoints and transcript. It starts the task only when `max_parallel` has a free slot, otherwise it parks it with `slot_wait = true` and the reason `waiting for a free slot` until the scheduler dispatches it.
 - `metronome_abandon` — archive a task.
