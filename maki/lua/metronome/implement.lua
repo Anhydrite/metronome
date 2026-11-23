@@ -236,6 +236,23 @@ local function sleep_for(opts)
   return function() end
 end
 
+-- Seed the PRNG once per process so two maki instances that collide do not
+-- start from the same state and replay their backoff in lockstep. `os.time` has
+-- one-second resolution and `os.clock` starts near zero, so mix in the address
+-- of a fresh table -- a per-process source (ASLR) -- for desync.
+local function seed_git_lock_random()
+  if maki.__git_lock_random_seeded then
+    return
+  end
+  maki.__git_lock_random_seeded = true
+  local seed = os.time() + math.floor((os.clock and os.clock() or 0) * 1000)
+  local addr = tostring({}):match("0x(%x+)")
+  if addr then
+    seed = seed + tonumber(addr, 16)
+  end
+  math.randomseed(seed % 2147483647)
+end
+
 -- ~200 ms with jitter, so two tasks that collided do not replay in lockstep
 -- and collide again.
 local function git_lock_backoff_ms(opts)
@@ -243,6 +260,7 @@ local function git_lock_backoff_ms(opts)
   if base < 0 then
     base = 0
   end
+  seed_git_lock_random()
   local jitter = base > 0 and (math.random() * base) or 0
   return math.floor(base + jitter)
 end

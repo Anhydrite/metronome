@@ -2222,12 +2222,9 @@ auto_deploy = false
   -- condemning the task on the first lock. The sleep seam keeps the test fast,
   -- and the step that is replayed is the git operation, not the model session.
   local function check_git_lock_replay()
-  local lock_diag = {
-    cause = "git_lock",
-    message = "cannot lock ref 'refs/remotes/origin/main'",
-    hint = "another git process holds a ref lock; retry in a moment",
-  }
-
+  -- The real merge.rebase drops the fetch diagnostic and hands back only
+  -- `(nil, err)`; the stub mirrors that so the test proves the runtime recovers
+  -- the git_lock cause from the error text rather than from a synthetic table.
   local replay_seen = { rebase = 0, checks = 0 }
   local replay_sleeps = {}
   local replay_record = {
@@ -2258,7 +2255,7 @@ auto_deploy = false
       rebase = function()
         replay_seen.rebase = replay_seen.rebase + 1
         if replay_seen.rebase < 3 then
-          return nil, "rebase failed [git_lock]: cannot lock ref", lock_diag
+          return nil, "rebase failed [git_lock]: cannot lock ref"
         end
         return { ok = true, base = "origin/main@fresh", sha = "rebsha" }
       end,
@@ -2331,7 +2328,7 @@ auto_deploy = false
     merge = {
       rebase = function()
         exhausted_seen.rebase = exhausted_seen.rebase + 1
-        return nil, "rebase failed [git_lock]: cannot lock ref", lock_diag
+        return nil, "rebase failed [git_lock]: cannot lock ref"
       end,
       run = function() return { ok = true } end,
     },

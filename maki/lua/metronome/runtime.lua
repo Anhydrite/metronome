@@ -965,6 +965,7 @@ function M.new(deps)
   local git_lock_sleep
   local retry_git_lock
   local git_lock_diagnosis
+  local git_lock_error_diag
   local later
   local retry_attempts
 
@@ -1046,13 +1047,21 @@ function M.new(deps)
       local diff_base = "origin/" .. base
       if deps.merge and type(deps.merge.rebase) == "function" then
         local rebased, rebase_err, rebase_diag = retry_git_lock(opts, function()
-          return deps.merge.rebase({
+          local value, err, diag = deps.merge.rebase({
             repo = paths.repo,
             worktree = worktree,
             remote = "origin",
             base = base,
             git = deps.git,
           })
+          -- merge.rebase folds the git diagnostic into the error string and
+          -- drops the third value when its internal fetch fails, so recover a
+          -- git_lock cause from the text: otherwise a ref lock during the
+          -- rebase's fetch would never be replayed nor named.
+          if not value and type(diag) ~= "table" then
+            diag = git_lock_error_diag(err)
+          end
+          return value, err, diag
         end)
         if not rebased then
           if type(rebase_diag) == "table" and rebase_diag.conflict then
@@ -1694,12 +1703,30 @@ function M.new(deps)
     return function() end
   end
 
+  -- Seed the PRNG once per process so two maki instances that collide do not
+  -- start from the same state and replay their backoff in lockstep. `os.time`
+  -- has one-second resolution and `os.clock` starts near zero, so mix in the
+  -- address of a fresh table -- a per-process source (ASLR) -- for desync.
+  local function seed_git_lock_random()
+    if maki.__git_lock_random_seeded then
+      return
+    end
+    maki.__git_lock_random_seeded = true
+    local seed = os.time() + math.floor((os.clock and os.clock() or 0) * 1000)
+    local addr = tostring({}):match("0x(%x+)")
+    if addr then
+      seed = seed + tonumber(addr, 16)
+    end
+    math.randomseed(seed % 2147483647)
+  end
+
   local function git_lock_backoff_ms(opts)
     local base = tonumber(type(opts) == "table" and opts.git_lock_delay_ms)
       or GIT_LOCK_DELAY_MS
     if base < 0 then
       base = 0
     end
+    seed_git_lock_random()
     local jitter = base > 0 and (math.random() * base) or 0
     return math.floor(base + jitter)
   end
@@ -1744,6 +1771,36 @@ function M.new(deps)
       retryable = true,
       remediable = true,
     }
+  end
+
+  -- Ref-lock contention named in a raw git error string. `merge.rebase` returns
+  -- only `(nil, err)` when its internal fetch fails -- it drops the diagnostic
+  -- third value -- so the caller cannot branch on `diag.cause`. Recognize the
+  -- same three git messages classify() uses, so a lock during the rebase's
+  -- fetch is still replayed and reported as `git_lock`, not `network`.
+  local GIT_LOCK_TEXT = {
+    "cannot lock ref",
+    "unable to update local ref",
+    "failed to update ref",
+  }
+
+  function git_lock_error_diag(err)
+    if type(err) ~= "string" then
+      return nil
+    end
+    for _, needle in ipairs(GIT_LOCK_TEXT) do
+      if err:find(needle, 1, true) then
+        return {
+          cause = "git_lock",
+          message = "another git process holds the ref lock (cannot lock ref)",
+          remedy = "retry in a moment: the ref lock is transient and the same command succeeds once it clears",
+          transient = true,
+          retryable = true,
+          remediable = true,
+        }
+      end
+    end
+    return nil
   end
 
   -- A task that will not be merged must not leave an open PR behind: the list
