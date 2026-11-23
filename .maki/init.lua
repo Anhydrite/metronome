@@ -4,6 +4,21 @@
 -- ("attempt to yield across metamethod/C-call boundary"), so the harness is
 -- loaded with loadstring and run as a plain Lua chunk instead.
 
+-- Where a load/compile failure of the test harness is reported. tests/run-lua.sh
+-- points MAKI_TEST_ERROR_PATH inside its per-run workspace so concurrent runs do
+-- not share the file; without it, fall back to the state dir.
+local function harness_error_path()
+  local override = maki.uv.os_getenv("MAKI_TEST_ERROR_PATH")
+  if override and override ~= "" then
+    return override
+  end
+  local dir = maki.env.state_dir()
+  if not dir then
+    return nil
+  end
+  return maki.fs.joinpath(dir, "metronome-harness-error.txt")
+end
+
 -- End-to-end hook: scripts/e2e.sh sets METRONOME_E2E_DRIVER to a Lua file that
 -- composes the real modules against a throwaway repository. It runs instead of
 -- the unit harness, and writes its own result file.
@@ -56,14 +71,14 @@ if run_lua_tests and run_lua_tests ~= "" then
 local path = maki.fs.joinpath(maki.uv.cwd(), ".maki", "lua", "metronome_test.lua")
 local src = maki.fs.read(path)
 if not src then
-  local dir = maki.env.state_dir()
-  if dir then maki.fs.write(dir .. "/metronome-harness-error.txt", "cannot read " .. path .. "\n") end
+  local target = harness_error_path()
+  if target then maki.fs.write(target, "cannot read " .. path .. "\n") end
   return
 end
 local chunk, err = loadstring(src, "@" .. path)
 if not chunk then
-  local dir = maki.env.state_dir()
-  if dir then maki.fs.write(dir .. "/metronome-harness-error.txt", "compile: " .. tostring(err) .. "\n") end
+  local target = harness_error_path()
+  if target then maki.fs.write(target, "compile: " .. tostring(err) .. "\n") end
   return
 end
 setfenv(chunk, setmetatable({ maki = maki, require = require }, { __index = _G }))
