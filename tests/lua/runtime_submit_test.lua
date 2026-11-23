@@ -1005,7 +1005,7 @@ return function()
   eq(table.concat(prune_closed, ","):find("11", 1, true), nil,
     "the failed task's PR is never closed")
 
-  -- Stop and abandon prune the dead task's GitHub debris automatically ------
+  -- Stop and abandon prune the explicitly abandoned task's GitHub debris -----
   local auto_tasks = {
     STOPME = { id = "STOPME", status = "running", branch = "metronome/stopme" },
     ABANDONME = { id = "ABANDONME", status = "failed", branch = "metronome/abandonme" },

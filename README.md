@@ -70,7 +70,7 @@ All commands are subcommands of one `/metronome` dispatcher.
 | `/metronome calibrate` | Generate `review-rules.md` from the repository. |
 | `/metronome retry <id>` | Restart a failed task from its last stable phase. |
 | `/metronome abandon <id>` | Archive a task. |
-| `/metronome prune` | Reconcile GitHub with the journal: close orphan PRs, delete stale branches. |
+| `/metronome prune` | Reconcile GitHub with the journal: close PRs and delete branches of abandoned tasks or of tasks gone from the journal only; failed and stalled tasks are preserved as retryable. |
 | `/metronome stop <id>` | Cancel an in-flight task and park it as abandoned. |
 | `/metronome delete <id>` | Remove a task from the panel and status; a snapshot is kept in the archive and the slow cleanup runs in the background. |
 | `/metronome archive` | List the snapshots kept for deleted tasks. |
