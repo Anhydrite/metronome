@@ -649,10 +649,11 @@ function M.escalate(state, root, task_id, opts)
   end
   round = math.floor(round)
 
+  local note = string.format("review escalated after %d rounds: human review required", round)
   local appended, aerr = state.append(root, {
     kind = "note",
     task_id = task_id,
-    text = string.format("review escalated after %d rounds: human review required", round),
+    text = note,
   })
   if not appended then
     return nil, aerr or "cannot append the escalation note"
@@ -668,7 +669,18 @@ function M.escalate(state, root, task_id, opts)
     )
   end
 
-  local moved, merr = state.transition(root, task_id, "failed", { phase = "review" })
+  -- The transition carries the reason, not only the note: a mute `failed` is
+  -- an empty diagnosis for the user and for recover. The wording names the
+  -- task, the phase, the escalation and the round count, and points at the
+  -- note written just above, which holds the remedy.
+  local reason = string.format(
+    "task %s failed in phase review: review escalated after %d rounds (see note)",
+    tostring(task_id), round
+  )
+  local moved, merr = state.transition(root, task_id, "failed", {
+    phase = "review",
+    reason = reason,
+  })
   if not moved then
     return nil, merr
   end

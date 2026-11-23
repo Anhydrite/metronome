@@ -341,16 +341,92 @@ local UNKNOWN = {
   remedy = "inspect the transcript and the worktree, then retry or fix by hand.",
 }
 
--- Diagnose one execution error. `opts` is accepted for symmetry (a caller may
--- pass the phase or extra hints) but classification is purely textual. With a
--- nil error the result is `unknown`, never an exception.
+-- Read one context field of `opts` without ever raising, whatever the table.
+local function field(opts, key)
+  local ok, value = pcall(function()
+    return opts[key]
+  end)
+  if ok then
+    return value
+  end
+  return nil
+end
+
+-- The first non-empty text among `values`, collapsed to one line, or nil.
+local function first_text(limit, ...)
+  for i = 1, select("#", ...) do
+    local value = select(i, ...)
+    if value ~= nil then
+      local ok, text = pcall(one_line, value, limit)
+      if ok and type(text) == "string" and text ~= "" then
+        return text
+      end
+    end
+  end
+  return nil
+end
+
+-- An empty error still happened somewhere, for a reason, at a status. Build a
+-- message out of the context the caller carries, so a failure is never logged
+-- without a diagnostic:
+--   "task <id> failed in phase <phase>: <detail> (status <status>)"
+-- where <detail> is the reason, else the latest note flagged "(see note)",
+-- else a plain statement that nothing more was recorded. Without a task id the
+-- head is "failure in phase <phase>"; a missing phase is "unknown phase".
+local function contextual_message(opts)
+  local ok, message = pcall(function()
+    opts = default_opts(opts)
+    local task = first_text(80, field(opts, "task_id"), field(opts, "task"))
+    local phase = first_text(80, field(opts, "phase")) or "unknown phase"
+    local status = first_text(40, field(opts, "status"))
+    local reason = first_text(200, field(opts, "reason"))
+    local note = first_text(200, field(opts, "note"))
+
+    local detail
+    local detail_names_status = false
+    if reason then
+      detail = reason
+    elseif note then
+      detail = note .. " (see note)"
+    elseif status then
+      detail = "status " .. status .. ", no detail recorded"
+      detail_names_status = true
+    else
+      detail = "no detail recorded"
+    end
+
+    local head
+    if task then
+      head = string.format("task %s failed in phase %s", task, phase)
+    else
+      head = string.format("failure in phase %s", phase)
+    end
+    local out = head .. ": " .. detail
+    if status and not detail_names_status then
+      out = out .. " (status " .. status .. ")"
+    end
+    return one_line(out, 300)
+  end)
+  if ok and type(message) == "string" and message ~= "" then
+    return message
+  end
+  return "failure in phase unknown phase: no detail recorded"
+end
+
+-- Diagnose one execution error. `opts` may carry the failure's context
+-- (task_id/task, phase, status, reason, note); classification stays purely
+-- textual, but an empty error is described from that context instead of the
+-- useless "no error details". With a nil error the result is `unknown`, never
+-- an exception.
 function M.classify(err, opts)
-  local ok, result = pcall(function()
-    local raw = err_text(err)
-    local lower = raw:lower()
-    for _, rule in ipairs(RULES) do
-      if any_of(lower, rule.patterns) then
-        return rule, raw
+  -- pcall returns every value of the body: keep both the matched rule and the
+  -- raw text, otherwise the message is always empty (the historical bug).
+  local ok, rule, raw = pcall(function()
+    local text = err_text(err)
+    local lower = text:lower()
+    for _, candidate in ipairs(RULES) do
+      if any_of(lower, candidate.patterns) then
+        return candidate, text
       end
     end
     if missing_binary_fallback(lower) then
@@ -358,20 +434,19 @@ function M.classify(err, opts)
         cause = "binary_missing",
         transient = true,
         remedy = "install the missing binary (gh, no-mistakes, git) or fix PATH, then retry.",
-      }, raw
+      }, text
     end
-    return UNKNOWN, raw
+    return UNKNOWN, text
   end)
   if not ok then
-    return { cause = "unknown", message = "", remedy = UNKNOWN.remedy,
+    return { cause = "unknown", message = contextual_message(opts), remedy = UNKNOWN.remedy,
       transient = false, retryable = false, remediable = false }
   end
-  local rule, raw = result
   local transient = rule.transient == true
   local benign = rule.cause == "nothing_to_commit"
   local message = one_line(raw)
   if message == "" then
-    message = benign and "nothing to commit" or "no error details"
+    message = benign and "nothing to commit" or contextual_message(opts)
   end
   return {
     cause = rule.cause,
@@ -397,11 +472,22 @@ function M.backoff_secs(attempts, opts)
 end
 
 -- Turn an error plus the prior attempt record into a failure record.
--- `opts` may carry: phase, now, and the retry bounds.
+-- `opts` may carry: phase, now, the failure context (task_id/task, status,
+-- reason, note) and the retry bounds. The context is forwarded to classify, so
+-- the message and the phase of the record are the same as classify's.
 function M.record(err, prior, opts)
   opts = default_opts(opts)
   prior = type(prior) == "table" and prior or {}
-  local diagnosis = M.classify(err, opts)
+  local phase = field(opts, "phase") or field(prior, "phase")
+  local context = {
+    task_id = field(opts, "task_id"),
+    task = field(opts, "task"),
+    phase = phase,
+    status = field(opts, "status"),
+    reason = field(opts, "reason"),
+    note = field(opts, "note"),
+  }
+  local diagnosis = M.classify(err, context)
   local b = bounds(opts)
   local attempts = number(prior.attempts, 0) + 1
   local now = number(opts.now, number(prior.at, nil))

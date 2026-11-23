@@ -206,4 +206,114 @@ return function()
   eq(line:find("retry", 1, true) ~= nil, true, "describe includes the action")
   eq(line:find("1/3", 1, true) ~= nil, true, "describe includes the attempt count")
   eq(line:find("next at", 1, true) ~= nil, true, "describe includes the next retry time")
+
+  -- A non-empty error keeps its own text: the context never replaces it.
+  eq(recover.classify("HTTP 401 Unauthorized").message, "HTTP 401 Unauthorized",
+    "a non-empty error keeps its text as the message")
+  eq(recover.classify({ stderr = "sh: bh: command not found" }).message:find("bh", 1, true) ~= nil,
+    true, "a table error keeps its text as the message")
+
+  -- An empty error never loses the failure's context ------------------------
+
+  -- A failure whose result carried no `error` field still has a phase, a
+  -- reason and a status: the diagnostic must be built from them instead of
+  -- falling back to an empty "no error details".
+  local function assert_diagnostic(message, label)
+    eq(type(message), "string", label .. ": message is a string")
+    eq(#message > 0, true, label .. ": message is not empty")
+    eq(message:find("no error details", 1, true), nil, label .. ": never 'no error details'")
+    eq(message:find("\n", 1, true), nil, label .. ": message stays on one line")
+  end
+
+  local escalated = recover.classify("", {
+    task_id = "T-20261122-0043",
+    phase = "review",
+    reason = "review escalated after 3 rounds",
+    status = "failed",
+  })
+  eq(escalated.cause, "unknown", "an empty error is an unknown cause")
+  eq(escalated.transient, false, "an empty error is not transient")
+  assert_diagnostic(escalated.message, "escalation")
+  eq(escalated.message:find("T-20261122-0043", 1, true) ~= nil, true,
+    "the message names the task")
+  eq(escalated.message:find("phase review", 1, true) ~= nil, true,
+    "the message names the phase")
+  eq(escalated.message:find("review escalated after 3 rounds", 1, true) ~= nil, true,
+    "the message names the reason")
+  eq(escalated.message:find("failed", 1, true) ~= nil, true,
+    "the message names the status")
+
+  -- Without a reason, the last journal note is the detail, flagged as such.
+  local conflict = recover.classify(nil, {
+    phase = "merge",
+    status = "merging",
+    note = "merge conflict (repairable): a.js, b.js",
+  })
+  eq(conflict.cause, "unknown", "a nil error with context is unknown")
+  assert_diagnostic(conflict.message, "merge conflict")
+  eq(conflict.message:find("phase merge", 1, true) ~= nil, true,
+    "the message names the merge phase")
+  eq(conflict.message:find("merge conflict (repairable): a.js, b.js", 1, true) ~= nil, true,
+    "the message carries the latest note")
+  eq(conflict.message:find("see note", 1, true) ~= nil, true,
+    "the message marks the note as a note")
+  eq(conflict.message:find("merging", 1, true) ~= nil, true,
+    "the message names the status")
+
+  -- Neither reason nor note: the message still names phase and status.
+  local bare = recover.classify("", { task_id = "T-1", phase = "deploy", status = "failed" })
+  assert_diagnostic(bare.message, "bare")
+  eq(bare.message:find("phase deploy", 1, true) ~= nil, true,
+    "the message names the deploy phase")
+  eq(bare.message:find("failed", 1, true) ~= nil, true,
+    "the message names the status")
+
+  -- No context at all: still a non-empty message that names a phase.
+  local blind = recover.classify("")
+  assert_diagnostic(blind.message, "no context")
+  eq(blind.message:find("phase", 1, true) ~= nil, true,
+    "the message names a phase even without context")
+
+  -- Global assertion: no empty diagnostic ever says "no error details".
+  for _, input in ipairs({
+    "",
+    nil,
+    42,
+    true,
+    {},
+    { message = "" },
+    { stderr = "" },
+  }) do
+    local got = recover.classify(input, { phase = "review", status = "failed" })
+    assert_diagnostic(got.message, "empty input " .. type(input))
+  end
+
+  -- record keeps the same contextual message and phase as classify.
+  local rec_opts = {
+    task_id = "T-1",
+    phase = "deploy",
+    status = "failed",
+    reason = "deploy script exited 2",
+    now = 0,
+  }
+  local rec = recover.record("", nil, rec_opts)
+  eq(rec.cause, "unknown", "the contextual record is unknown")
+  eq(rec.phase, "deploy", "the contextual record keeps the phase")
+  eq(rec.message, recover.classify("", rec_opts).message,
+    "record and classify build the same message")
+  assert_diagnostic(rec.message, "recorded")
+  eq(rec.message:find("deploy script exited 2", 1, true) ~= nil, true,
+    "the recorded message names the reason")
+
+  -- A prior record's phase is enough context, and describe stays one line.
+  local rec_prior = recover.record("", { phase = "review" }, { now = 0 })
+  eq(rec_prior.phase, "review", "the prior phase is carried over")
+  eq(rec_prior.message:find("phase review", 1, true) ~= nil, true,
+    "the recorded message names the carried-over phase")
+  local rec_line = recover.describe(rec)
+  eq(type(rec_line), "string", "describe of a contextual record is a string")
+  eq(rec_line:find("\n", 1, true), nil, "describe of a contextual record stays on one line")
+  eq(rec_line:find("unknown:", 1, true), 1, "describe starts with the unknown cause")
+  eq(rec_line:find("no error details", 1, true), nil, "describe never says 'no error details'")
+  eq(rec_line:find("(no message)", 1, true), nil, "describe never says '(no message)'")
 end
