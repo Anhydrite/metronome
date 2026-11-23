@@ -5,18 +5,10 @@
 return function()
   local state = load_module("state")
 
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree.
   local function tmp_root(label)
-    local base = maki.env.state_dir()
-    local root = maki.fs.joinpath(base, "metronome-tests", label)
-    -- Start clean so a rerun is not polluted by the previous one.
-    local entries = maki.fs.dir(root)
-    if entries then
-      for _, e in ipairs(entries) do
-        maki.fs.rm(maki.fs.joinpath(root, e[1]), { recursive = true })
-      end
-    end
-    maki.fs.mkdir(root, { parents = true })
-    return root
+    return test_dir(label)
   end
 
   -- Transitions -------------------------------------------------------------
@@ -479,7 +471,7 @@ return function()
 
   -- The schema accepts the new field, and refuses an unknown one inside it.
   local qualify = load_module("qualify")
-  local validate_tmp = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "state-validate")
+  local validate_tmp = test_dir("state-validate")
   local schema_ok, schema_err = qualify.validate_projection(after_failure.tasks["T-20261122-c001"], {
     tmp_dir = validate_tmp,
   })

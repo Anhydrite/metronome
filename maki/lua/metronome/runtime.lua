@@ -1310,6 +1310,10 @@ function M.new(deps)
         worktree = worktree,
         timeout_ms = (cfg.checks.timeout_secs or 600) * 1000,
         rollback = false,
+        -- Scope the checks' XDG_STATE_HOME to this task: parallel tasks must
+        -- not share the state their checks write to.
+        root = paths.root,
+        task_id = task_id,
       })
       if not verified or not verified.ok then
         return nil, {
