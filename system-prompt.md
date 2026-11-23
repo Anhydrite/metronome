@@ -200,7 +200,7 @@ You drive the pipeline through twelve tools:
 - `metronome_answer` — deliver answers to the pending question round.
 - `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase; the relaunch keeps the worktree, branch, checkpoints and transcript.
 - `metronome_abandon` — archive a task.
-- `metronome_prune` — reconcile GitHub with the journal: close PRs and delete branches of abandoned tasks or of tasks gone from the journal only. Failed and stalled tasks are kept intact, with their branch, PR and checkpoints, because they are retryable.
+- `metronome_prune` — reconcile GitHub with the journal: close PRs and delete branches of tasks that are failed, abandoned or gone.
 - `metronome_stop` — stop an in-flight task and park it as abandoned.
 - `metronome_delete` — remove a task from the panel and status, keeping the journal.
 - `metronome_archive` — list the snapshots kept for deleted tasks.
@@ -222,7 +222,7 @@ work starts, so a missing task id is refused in the input bar, not mid-run.
 - `/metronome calibrate` — analyze the repo and generate `review-rules.md`.
 - `/metronome retry <id>` — restart a failed task from its last stable phase. A relaunch of the workflow: worktree, branch, checkpoints and transcript are kept.
 - `/metronome abandon <id>` — archive a task.
-- `/metronome prune` — close PRs and delete branches of abandoned or vanished tasks only; failed and stalled tasks are preserved as retryable.
+- `/metronome prune` — close PRs and delete branches of failed, abandoned or vanished tasks.
 - `/metronome stop <id>` — stop an in-flight task and park it as abandoned.
 - `/metronome delete <id>` — remove a task from the panel and status.
 - `/metronome archive` — list the snapshots kept for deleted tasks.

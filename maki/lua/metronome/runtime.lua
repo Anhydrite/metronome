@@ -2933,7 +2933,7 @@ function M.new(deps)
   -- open PR because `metronome_retry` resumes from them. It runs after every
   -- abandon/stop, best effort: the decision to abandon already stands, and a
   -- GitHub failure must not turn it into an error.
-  local function prune_dead_task()
+  local function prune_after_abandon()
     local called, result = pcall(runtime.prune, {})
     if not called then
       return { ok = false, error = tostring(result) }
@@ -2967,7 +2967,7 @@ function M.new(deps)
     if not moved then
       return { ok = false, error = err }
     end
-    return { ok = true, task = moved, stopped = true, prune = prune_dead_task() }
+    return { ok = true, task = moved, stopped = true, prune = prune_after_abandon() }
   end
 
   function runtime.abandon(input)
@@ -2977,7 +2977,7 @@ function M.new(deps)
     if not moved then
       return { ok = false, error = err }
     end
-    return { ok = true, task = moved, prune = prune_dead_task() }
+    return { ok = true, task = moved, prune = prune_after_abandon() }
   end
 
   function runtime.delete(input)
