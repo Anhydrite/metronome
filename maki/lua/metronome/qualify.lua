@@ -414,8 +414,9 @@ local function first_line(text)
   return ""
 end
 
--- The object task.schema.json governs: the qualifier's own fields, with
--- `acceptance` removed (the schema forbids it) and an id the schema accepts.
+-- The object task.schema.json governs: the qualifier's own fields, with an id
+-- the schema accepts. `acceptance` is optional on the record and validated
+-- structurally by M.normalize, so it does not need to enter this shape check.
 -- A task that has not been applied yet has no id, so a placeholder that
 -- matches the pattern stands in: the validator must judge the shape, not the
 -- identity.
@@ -927,6 +928,17 @@ function M.sheet_markdown(task)
   line("## Questions")
   for _, question in ipairs(task.questions or {}) do
     line("- " .. tostring(question.id) .. ": " .. tostring(question.text))
+    -- An answered question is part of the contract the implementer reads: the
+    -- sheet is the only thing it sees, so an answer that stays in the journal
+    -- is an answer that never arrives. answered_at is rendered verbatim; a
+    -- missing one gets a stable placeholder instead of dropping the answer.
+    if type(question.answer) == "string" and trim(question.answer) ~= "" then
+      local answered_at = question.answered_at
+      if type(answered_at) ~= "string" or answered_at == "" then
+        answered_at = "unknown"
+      end
+      line("  - Réponse (" .. answered_at .. "): " .. question.answer)
+    end
   end
 
   return table.concat(out, "\n") .. "\n"
@@ -1046,6 +1058,7 @@ function M.apply(state, root, result, opts)
     end
 
     local questions = task.questions or {}
+    local acceptance = task.acceptance or {}
     -- maki.json.encode writes an empty Lua table as `{}`, which the task
     -- schema rejects where an array is required. Omit empty arrays instead:
     -- absence is legal, an object where an array belongs is not.
@@ -1058,6 +1071,9 @@ function M.apply(state, root, result, opts)
       checks = task.checks,
       status = "draft",
     }
+    if #acceptance > 0 then
+      record.acceptance = acceptance
+    end
     if resolved_depends then
       record.depends_on = resolved_depends
     end
@@ -1093,17 +1109,10 @@ function M.apply(state, root, result, opts)
       return nil, serr
     end
 
-    local sheet = M.sheet_markdown({
-      id = id,
-      title = task.title,
-      intent = task.intent or "",
-      origin = task.origin or "",
-      files = task.files,
-      checks = task.checks,
-      depends_on = resolved_depends or {},
-      acceptance = task.acceptance or {},
-      questions = questions,
-    })
+    -- The sheet is rendered from the persisted projection, not from an ad-hoc
+    -- copy of the record: the initial sheet and every later rewrite therefore
+    -- go through qualify.sheet_markdown and cannot drift apart.
+    local sheet = M.sheet_markdown(settled)
     local wrote, werr = fs.write(fs.joinpath(tasks_dir, id .. ".md"), sheet)
     if not wrote then
       return nil, "cannot write sheet for " .. id .. ": " .. tostring(werr)
@@ -1194,15 +1203,8 @@ function M.apply(state, root, result, opts)
       return nil, serr
     end
 
-    local sheet = M.sheet_markdown({
-      id = epic_id,
-      title = title,
-      intent = origin,
-      origin = origin,
-      files = files,
-      checks = checks,
-      depends_on = depends_on,
-    })
+    -- Same renderer as a subtask: the epic sheet comes from its projection.
+    local sheet = M.sheet_markdown(settled)
     local wrote, werr = fs.write(fs.joinpath(tasks_dir, epic_id .. ".md"), sheet)
     if not wrote then
       return nil, "cannot write sheet for " .. epic_id .. ": " .. tostring(werr)
