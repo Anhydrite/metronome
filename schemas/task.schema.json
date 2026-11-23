@@ -175,6 +175,14 @@
         "minLength": 1
       }
     },
+    "acceptance": {
+      "type": "array",
+      "description": "The observable outcomes that prove the task is done, kept from qualification so the sheet can be re-rendered from the task record alone.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
     "pr": {
       "type": "object",
       "description": "The pull request, once one exists.",

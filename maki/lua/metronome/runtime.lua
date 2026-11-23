@@ -2933,7 +2933,10 @@ function M.new(deps)
     if #own > 0 then
       local answers = (script and script.answers) or opts.answers or {}
       if next(answers) ~= nil then
-        deps.questions.answer(deps.state, paths.root, answers)
+        deps.questions.answer(deps.state, paths.root, answers, {
+          tasks_dir = paths.tasks,
+          qualify = deps.qualify,
+        })
       else
         return { ok = true, waiting_questions = own, tasks = applied.tasks }
       end
@@ -3280,7 +3283,10 @@ function M.new(deps)
   function runtime.answer(input, ctx)
     input = type(input) == "table" and input or {}
     local paths = p()
-    local applied, err = deps.questions.answer(deps.state, paths.root, input.answers or {})
+    local applied, err = deps.questions.answer(deps.state, paths.root, input.answers or {}, {
+      tasks_dir = paths.tasks,
+      qualify = deps.qualify,
+    })
     if not applied then
       return { ok = false, error = err }
     end
