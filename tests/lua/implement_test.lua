@@ -271,6 +271,125 @@ return function()
   eq(ctx4 and git.current_branch(ctx4.worktree), "metronome/add-feature-flag-e001",
     "the recreated worktree is on the task branch")
 
+  -- Git lock -----------------------------------------------------------------
+  --
+  -- Two maki processes on the same clone can still race for a ref lock even
+  -- though fetch is single-flight in process. A `git_lock` is contention, not a
+  -- broken task: prepare replays it with a short bounded backoff (three
+  -- attempts, ~200 ms with jitter) and only fails once the budget is spent. The
+  -- sleep is injected so the test proves the budget without waiting.
+
+  local function git_with(overrides)
+    local out = {}
+    for key, value in pairs(git) do
+      out[key] = value
+    end
+    for key, value in pairs(overrides or {}) do
+      out[key] = value
+    end
+    return out
+  end
+
+  local lock_diag = {
+    cause = "git_lock",
+    message = "another git process holds a ref lock",
+    hint = "wait for the other git process and retry",
+  }
+
+  local retry_id = "T-20261122-a048"
+  local retry_task = new_task(retry_id, "Retry a git lock", { "src/retry.lua" }, { "make test" })
+  local fetch_calls = 0
+  local retry_sleeps = {}
+  local flaky_fetch = git_with({
+    fetch = function()
+      fetch_calls = fetch_calls + 1
+      if fetch_calls < 3 then
+        return nil, "fetch failed [git_lock]: cannot lock ref", lock_diag
+      end
+      return true
+    end,
+  })
+  local retry_opts = {
+    task = retry_task,
+    repo = repo,
+    state = state,
+    root = root,
+    git = flaky_fetch,
+    worktree_root = worktree_root,
+    tasks_dir = tasks_dir,
+    remote = "origin",
+    base_ref = "main",
+    sleep = function(ms)
+      retry_sleeps[#retry_sleeps + 1] = ms
+    end,
+  }
+  local retry_ctx, retry_err = implement.prepare(retry_opts)
+  eq(retry_err, nil, "a git_lock on fetch is replayed: " .. tostring(retry_err))
+  eq(retry_ctx and retry_ctx.task_id, retry_id, "the replayed prepare returns its context")
+  eq(fetch_calls, 3, "the first git_lock is not fatal: prepare makes three attempts")
+  eq(#retry_sleeps, 2, "prepare backs off between the replay attempts")
+  eq(type(retry_sleeps[1]) == "number" and retry_sleeps[1] >= 200
+    and retry_sleeps[1] < 400, true, "the backoff is short and jittered around 200 ms")
+
+  -- The budget is bounded and the diagnostic reaches the caller, so it can
+  -- branch on `diag.cause == "git_lock"` instead of a raw string.
+  local exhausted_task = new_task("T-20261122-b048", "Exhaust a git lock",
+    { "src/lock.lua" }, { "make test" })
+  local exhausted_calls = 0
+  local exhausted_sleeps = {}
+  local locked_git = git_with({
+    fetch = function()
+      exhausted_calls = exhausted_calls + 1
+      return nil, "fetch failed [git_lock]: cannot lock ref", lock_diag
+    end,
+  })
+  local exhausted_opts = {
+    task = exhausted_task,
+    repo = repo,
+    state = state,
+    root = root,
+    git = locked_git,
+    worktree_root = worktree_root,
+    tasks_dir = tasks_dir,
+    remote = "origin",
+    base_ref = "main",
+    sleep = function(ms)
+      exhausted_sleeps[#exhausted_sleeps + 1] = ms
+    end,
+  }
+  local ectx, eerr, ediag = implement.prepare(exhausted_opts)
+  eq(ectx, nil, "an exhausted git_lock does not prepare a worktree")
+  eq(type(eerr), "string", "an exhausted git_lock reports an error")
+  eq(type(ediag) == "table" and ediag.cause, "git_lock",
+    "prepare propagates the git diagnostic as its third value")
+  eq(exhausted_calls, 3, "prepare stops after three bounded attempts")
+  eq(#exhausted_sleeps, 2, "an exhausted replay backs off twice")
+
+  -- A non-lock failure is permanent: it is not replayed.
+  local hard_calls = 0
+  local hard_sleeps = {}
+  local hard_git = git_with({
+    fetch = function()
+      hard_calls = hard_calls + 1
+      return nil, "fetch failed [auth_failed]: denied",
+        { cause = "auth_failed", message = "denied", hint = "login" }
+    end,
+  })
+  local hard_opts = {}
+  for key, value in pairs(exhausted_opts) do
+    hard_opts[key] = value
+  end
+  hard_opts.task = new_task("T-20261122-c048", "Auth failure", { "src/a.lua" }, { "make test" })
+  hard_opts.git = hard_git
+  hard_opts.sleep = function(ms)
+    hard_sleeps[#hard_sleeps + 1] = ms
+  end
+  local hctx, herr, hdiag = implement.prepare(hard_opts)
+  eq(hctx, nil, "a permanent failure does not prepare")
+  eq(hdiag and hdiag.cause, "auth_failed", "a permanent failure keeps its cause")
+  eq(hard_calls, 1, "a non-lock failure is not replayed")
+  eq(#hard_sleeps, 0, "a non-lock failure does not sleep")
+
   -- Checkpoints --------------------------------------------------------------
 
   local head = git.head_sha(ctx3.worktree)
@@ -329,6 +448,29 @@ return function()
       deadline_secs = 30,
     }
   end
+
+  -- implement.run surfaces the same diagnostic, so the runtime can name
+  -- git_lock on the task instead of losing it behind a string.
+  local run_lock_task = new_task("T-20261122-d048", "Run a git lock",
+    { "src/runlock.lua" }, { "make test" })
+  sheet_for("T-20261122-d048", "Run a git lock")
+  local run_lock_calls = 0
+  local run_lock_git = git_with({
+    fetch = function()
+      run_lock_calls = run_lock_calls + 1
+      return nil, "fetch failed [git_lock]: cannot lock ref", lock_diag
+    end,
+  })
+  local run_lock_opts = run_opts(run_lock_task, function()
+    return { ok = true, text = "should not run" }
+  end)
+  run_lock_opts.git = run_lock_git
+  run_lock_opts.sleep = function() end
+  local run_lock = implement.run(run_lock_opts)
+  eq(run_lock.ok, false, "an exhausted git_lock fails the turn")
+  eq(run_lock.diagnosis and run_lock.diagnosis.cause, "git_lock",
+    "run returns the git diagnostic for the caller")
+  eq(run_lock_calls, 3, "run respects the same three-attempt budget")
 
   -- Scenario A: the runner writes a file, twice, so checkpoints accumulate.
   local id2 = "T-20261114-e002"
