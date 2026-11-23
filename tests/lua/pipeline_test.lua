@@ -80,6 +80,51 @@ return function()
   eq(#started, 2, "two tasks sharing a file are both selected")
   eq(#skipped, 0, "sharing a file produces no skip")
 
+  -- slots: the one definition of the cap -------------------------------------
+  --
+  -- `max_parallel` is the single authority every entry point shares (a tick, a
+  -- retry, a resume). `slots` is the pure projection of that authority: it
+  -- counts the statuses the scheduler already treats as in flight, and it can
+  -- leave the candidate itself out of the count so a retry of a task that is
+  -- still active is not charged twice.
+  eq(pipeline.WAIT_SLOT, "waiting for a free slot", "the wait reason is one constant")
+
+  local projection = {
+    task("T-run", "running", { files = { "src/1" } }),
+    task("T-verify", "verifying"),
+    task("T-review", "reviewing"),
+    task("T-merge", "merging"),
+    task("T-deploy", "deploying"),
+    task("T-ready", "ready"),
+    task("T-failed", "failed"),
+    task("T-merged", "merged"),
+  }
+  local in_flight, max_parallel, free = pipeline.slots(projection, { max_parallel = 3 })
+  eq(in_flight, 5, "every ACTIVE status counts as in flight")
+  eq(max_parallel, 3, "slots reports the cap it was given")
+  eq(free, 0, "a saturated pipeline has no free slot")
+
+  local _, _, free_two = pipeline.slots(projection, { max_parallel = 7 })
+  eq(free_two, 2, "the free count is the cap minus what is in flight")
+
+  local excluded, _, free_excluded = pipeline.slots(projection, { max_parallel = 7, exclude = "T-run" })
+  eq(excluded, 4, "the candidate task is left out of the count")
+  eq(free_excluded, 3, "excluding the candidate frees its own slot")
+
+  local default_in_flight, default_max, default_free = pipeline.slots({})
+  eq(default_in_flight, 0, "an empty projection has nothing in flight")
+  eq(default_max, 2, "slots falls back to the same default cap as pick")
+  eq(default_free, 2, "an empty pipeline has every slot free")
+
+  -- A parked task is not in flight, even when its original status is active:
+  -- a task interrupted in `reviewing` keeps that status while it waits for a
+  -- slot, and counting it would make it wait on itself forever.
+  local parked_in_flight, _, parked_free = pipeline.slots({
+    task("T-parked", "reviewing", { slot_wait = true, slot_wait_since = "2026-11-22T22:00:00Z" }),
+  }, { max_parallel = 1 })
+  eq(parked_in_flight, 0, "a slot_wait task holds no slot")
+  eq(parked_free, 1, "its slot is free for the dispatch")
+
   -- schedule: max_parallel -------------------------------------------------
 
   local tasks = {
@@ -94,6 +139,17 @@ return function()
   eq(#skipped, 1, "the third task is skipped")
   eq(skipped[1].id, "T-3", "the skipped task is named")
   eq(skipped[1].reason:find("max_parallel", 1, true) ~= nil, true, "the skip reason is max_parallel")
+  eq(skipped[1].reason:find(pipeline.WAIT_SLOT, 1, true) ~= nil, true, "the skip reason names the wait reason")
+
+  -- The cap `pick` applies is the one `slots` reports: one in flight task and
+  -- a cap of two leaves exactly one free slot, and exactly one task starts.
+  local one_running = { task("T-run", "running") }
+  local slots_in_flight, slots_cap, slots_free = pipeline.slots(one_running, { max_parallel = 2 })
+  eq(slots_in_flight, 1, "one task is in flight")
+  eq(slots_cap, 2, "the cap is two")
+  eq(slots_free, 1, "one slot is free")
+  started = pipeline.schedule(tasks, one_running, { max_parallel = 2 })
+  eq(#started, slots_free, "pick starts exactly the free slots the helper reports")
 
   -- schedule: a running task never blocks on files -------------------------
 
@@ -246,6 +302,149 @@ return function()
   eq(after["T-20261114-a001"].status, "running", "the first task is running")
   eq(after["T-20261114-a002"].status, "running", "the second task is running")
   eq(after["T-20261114-a003"].status, "ready", "the third task is still ready")
+
+  -- Integration: a slot_wait task is a dispatch candidate --------------------
+  --
+  -- A retry and a resume keep the task's original status, so the persisted
+  -- `slot_wait` flag is what makes it a candidate. The dispatch clears the flag
+  -- and its timestamp in the same gesture, and a task interrupted in
+  -- `reviewing` is walked back to `running` through a legal path.
+  local slot_root = tmp_root("pipeline-slot-wait")
+  state.create(slot_root, {
+    id = "T-20261122-s001", title = "retry", status = "failed",
+    files = { "src/s1" }, slot_wait = true, slot_wait_since = "2026-11-22T22:00:00Z",
+  })
+  state.create(slot_root, {
+    id = "T-20261122-s002", title = "resume", status = "reviewing",
+    files = { "src/s2" }, slot_wait = true, slot_wait_since = "2026-11-22T22:00:01Z",
+  })
+
+  local slot_dispatched = {}
+  local slot_tick = pipeline.run({
+    state = state,
+    root = slot_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t, phase)
+      slot_dispatched[#slot_dispatched + 1] = { id = t.id, phase = phase }
+    end,
+  })
+  eq(slot_tick.ok, true, "a tick with a parked task succeeds")
+  eq(#slot_tick.started, 1, "the cap admits exactly one parked task")
+  eq(#slot_dispatched, 1, "exactly one parked task is dispatched")
+  eq(slot_dispatched[1].id, "T-20261122-s001", "the first parked task is dispatched")
+  local parked_after = state.load(slot_root).tasks
+  eq(parked_after["T-20261122-s001"].status, "running", "the dispatched task is running")
+  eq(parked_after["T-20261122-s001"].slot_wait, nil, "the dispatch clears slot_wait")
+  eq(parked_after["T-20261122-s001"].slot_wait_since, nil,
+    "the dispatch clears slot_wait_since")
+  eq(parked_after["T-20261122-s002"].status, "reviewing",
+    "the other parked task keeps its original status")
+  eq(parked_after["T-20261122-s002"].slot_wait, true,
+    "the other parked task still waits for the slot")
+  eq(#slot_tick.skipped, 1, "the other parked task is reported as skipped")
+
+  -- The slot frees: the reviewing task is walked changes_requested -> running
+  -- and clears its wait in the final move.
+  state.transition(slot_root, "T-20261122-s001", "abandoned", { reason = "done" })
+  local slot_second = pipeline.run({
+    state = state,
+    root = slot_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t)
+      slot_dispatched[#slot_dispatched + 1] = { id = t.id }
+    end,
+  })
+  eq(#slot_second.started, 1, "the freed slot admits the reviewing task")
+  eq(slot_dispatched[2] and slot_dispatched[2].id, "T-20261122-s002",
+    "the reviewing task is dispatched next")
+  local reviewing_after = state.load(slot_root).tasks["T-20261122-s002"]
+  eq(reviewing_after.status, "running", "the reviewing task reaches running")
+  eq(reviewing_after.slot_wait, nil, "the dispatch clears its slot wait")
+  eq(reviewing_after.slot_wait_since, nil, "the dispatch clears its wait timestamp")
+
+  -- An in-flight task that once waited is not dispatched a second time ------
+  --
+  -- A late review verdict or a delayed automatic retry moves a parked task to
+  -- `running`. The move clears the wait in the same transition, so the tick sees
+  -- an in-flight task, not a candidate: without it, `running -> running` is a
+  -- legal no-op and the same worktree would be spawned twice, invisible to
+  -- `max_parallel` because `M.slots` does not count a slot_wait task.
+  local dup_root = tmp_root("pipeline-slot-dup")
+  state.create(dup_root, {
+    id = "T-20261122-d001", title = "parked then moved", status = "reviewing",
+    files = { "src/d1" }, slot_wait = true, slot_wait_since = "2026-11-22T22:00:02Z",
+  })
+  -- The same legal path a late verdict takes: reviewing -> changes_requested ->
+  -- running.
+  state.transition(dup_root, "T-20261122-d001", "changes_requested", { phase = "review" })
+  state.transition(dup_root, "T-20261122-d001", "running", { phase = "implement" })
+  eq(state.load(dup_root).tasks["T-20261122-d001"].slot_wait, nil,
+    "the move to running clears the wait")
+  local dup_dispatched = {}
+  local dup_tick = pipeline.run({
+    state = state,
+    root = dup_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t)
+      dup_dispatched[#dup_dispatched + 1] = t.id
+    end,
+  })
+  eq(dup_tick.ok, true, "a tick over the in-flight task succeeds")
+  eq(#dup_tick.started, 0, "an in-flight task is not a dispatch candidate")
+  eq(#dup_dispatched, 0, "the in-flight task is never dispatched a second time")
+
+  -- A parked task that is abandoned is never resurrected ---------------------
+  --
+  -- `abandon`/`stop` move a parked task to `abandoned`, which is terminal but
+  -- not active. Without clearing the wait, the next drain would treat the
+  -- cancelled task as a candidate (`abandoned -> running` is legal) and spawn it
+  -- on the very slot its cancellation freed.
+  local dead_root = tmp_root("pipeline-slot-dead")
+  state.create(dead_root, {
+    id = "T-20261122-x001", title = "parked then abandoned", status = "failed",
+    files = { "src/x1" }, slot_wait = true, slot_wait_since = "2026-11-22T22:00:03Z",
+  })
+  state.transition(dead_root, "T-20261122-x001", "abandoned", { reason = "cancelled" })
+  eq(state.load(dead_root).tasks["T-20261122-x001"].slot_wait, nil,
+    "an abandoned parked task drops its wait")
+  local dead_dispatched = {}
+  local dead_tick = pipeline.run({
+    state = state,
+    root = dead_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t)
+      dead_dispatched[#dead_dispatched + 1] = t.id
+    end,
+  })
+  eq(dead_tick.ok, true, "a tick over the abandoned task succeeds")
+  eq(#dead_tick.started, 0, "an abandoned task is never a dispatch candidate")
+  eq(#dead_dispatched, 0, "an abandoned task is never resurrected")
+
+  -- An `abandoned` task carrying the wait is an explicit human retry, so the
+  -- drain must dispatch it. `metronome_retry` accepts `abandoned` and is the only
+  -- writer that sets the flag on one; the cancel paths clear it as shown above.
+  state.set_fields(dead_root, "T-20261122-x001", {
+    slot_wait = true, slot_wait_since = "2026-11-22T22:00:04Z",
+  })
+  local revived_tick = pipeline.run({
+    state = state,
+    root = dead_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t)
+      dead_dispatched[#dead_dispatched + 1] = t.id
+    end,
+  })
+  eq(revived_tick.ok, true, "a tick over a retried abandoned task succeeds")
+  eq(#revived_tick.started, 1, "a retried abandoned task is a dispatch candidate")
+  eq(dead_dispatched[1], "T-20261122-x001",
+    "the retried abandoned task is the one dispatched")
+  eq(state.load(dead_root).tasks["T-20261122-x001"].slot_wait, nil,
+    "the dispatch clears the abandoned task's wait")
 
   -- Integration: dependency in the state -----------------------------------
 

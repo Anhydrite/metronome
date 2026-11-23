@@ -32,6 +32,12 @@
 
 local M = {}
 
+-- The named wait reason for "no free slot". Every entry point that has to put
+-- a task back in the queue (a tick skip, a retry without a slot, a resume
+-- without a slot) writes this same sentence in the journal, so a human — and
+-- metronome_status — read one wording, not three.
+M.WAIT_SLOT = "waiting for a free slot"
+
 local ACTIVE = {
   running = true,
   verifying = true,
@@ -48,6 +54,19 @@ local DONE = {
 local DEAD = {
   failed = true,
   abandoned = true,
+}
+
+-- Statuses a `slot_wait` task can never be dispatched from. A parked task keeps
+-- its original status, and `failed` / `abandoned` are legitimate ones (a retried
+-- task keeps its original status while it waits), so this only refuses a task
+-- that already landed. `state.transition` clears the wait on terminal moves, so
+-- this is a second line of defence: a stale `slot_wait` on a landed task must
+-- never resurrect it on the next drain. An `abandoned` task carrying the wait
+-- is an explicit human retry — the only way to set the flag on one — so the
+-- drain must dispatch it (`abandoned -> running` is a legal transition).
+local NO_DISPATCH = {
+  merged = true,
+  deployed = true,
 }
 
 -- How a resumed task gets back to `running`, using only legal transitions.
@@ -328,18 +347,51 @@ end
 
 -- Scheduling ----------------------------------------------------------------
 
--- Pick the tasks to start from an already-filtered candidate list. `running`
--- is the tasks already in flight (a list or a map). Returns `started, skipped`;
--- every skipped task carries a reason, so the panel and the logs can say why it
--- waited. Shared by `schedule` (ready tasks) and `tick` (ready + retries).
-local function pick(candidates, tasks, running, opts)
+-- The slot accounting every entry point shares. `tasks` is a projection (a
+-- list or a map); `opts.max_parallel` is the cap, defaulting exactly like
+-- `pick()` does. Returns `in_flight` (how many tasks hold a slot),
+-- `max_parallel` (the cap, at least 1) and `free` (the remaining slots, never
+-- negative).
+--
+-- A slot is held by the statuses `pick()` already refuses to overbook: the
+-- active ones. `opts.exclude` names one task id left out of the count, so a
+-- retry of a task that is still active is not charged twice against the same
+-- budget.
+function M.slots(tasks, opts)
   opts = type(opts) == "table" and opts or {}
   local max_parallel = tonumber(opts.max_parallel) or 2
   if max_parallel < 1 then
     max_parallel = 1
   end
 
-  local in_flight = M.collect(running)
+  local exclude = opts.exclude
+  local in_flight = 0
+  for _, task in ipairs(M.collect(tasks)) do
+    -- A `slot_wait` task is parked, not in flight, even when its original
+    -- status is an active one (a task interrupted in `reviewing` keeps that
+    -- status while it waits). Counting it would charge the same task twice and
+    -- could starve the very slot it is waiting for.
+    if ACTIVE[task.status] and not task.slot_wait
+      and (exclude == nil or task.id ~= exclude) then
+      in_flight = in_flight + 1
+    end
+  end
+
+  local free = max_parallel - in_flight
+  if free < 0 then
+    free = 0
+  end
+  return in_flight, max_parallel, free
+end
+
+-- Pick the tasks to start from an already-filtered candidate list. `running`
+-- is the tasks already in flight (a list or a map). Returns `started, skipped`;
+-- every skipped task carries a reason, so the panel and the logs can say why it
+-- waited. Shared by `schedule` (ready tasks) and `tick` (ready + retries).
+local function pick(candidates, tasks, running, opts)
+  opts = type(opts) == "table" and opts or {}
+  local in_flight, max_parallel = M.slots(running, { max_parallel = opts.max_parallel })
+
   local selected = {}
   local skipped = {}
 
@@ -359,14 +411,17 @@ local function pick(candidates, tasks, running, opts)
     local met, reason = M.dependencies_met(task, tasks, opts)
     if not met then
       skipped[#skipped + 1] = { id = task.id, reason = reason }
-    elseif #in_flight + #selected >= max_parallel then
-      skipped[#skipped + 1] = { id = task.id, reason = "max_parallel reached" }
+    elseif in_flight + #selected >= max_parallel then
+      skipped[#skipped + 1] = {
+        id = task.id,
+        reason = M.WAIT_SLOT .. " (max_parallel reached)",
+      }
     else
       local files = type(task.files) == "table" and task.files or {}
       -- A task that declares no files has an unknown blast radius: it could
       -- touch anything, so it runs alone. It still starts on an empty
       -- pipeline; naming a file in the intention buys the parallelism back.
-      if #files == 0 and (#in_flight + #selected > 0) then
+      if #files == 0 and (in_flight + #selected > 0) then
         skipped[#skipped + 1] = {
           id = task.id,
           reason = "no declared files: runs alone (name a file to run it in parallel)",
@@ -648,17 +703,27 @@ function M.tick(opts)
   -- A failed but retryable task is a start candidate exactly like a ready one.
   -- Both compete for the same max_parallel budget and obey the same runs-alone
   -- rule, so a retry never wedges the drain.
+  --
+  -- A task carrying `slot_wait = true` is a candidate whatever its status: a
+  -- retry keeps the task's original status (`failed`, `stalled`, ...) and a
+  -- resume keeps the phase it was interrupted in (`reviewing`, `merging`, ...).
+  -- The field is what marks it parked, so it must be picked here — and nowhere
+  -- else — once a slot is free.
   local retries = M.retry_ready(loaded.tasks, schedule_opts)
   local retry_ids = {}
   local candidates = {}
   for _, task in ipairs(M.collect(loaded.tasks)) do
-    if task.status == "ready" then
+    if task.slot_wait and not NO_DISPATCH[task.status] then
+      candidates[#candidates + 1] = task
+    elseif task.status == "ready" then
       candidates[#candidates + 1] = task
     end
   end
   for _, task in ipairs(retries) do
-    retry_ids[task.id] = true
-    candidates[#candidates + 1] = task
+    if not task.slot_wait then
+      retry_ids[task.id] = true
+      candidates[#candidates + 1] = task
+    end
   end
 
   local started, skipped = pick(candidates, loaded.tasks, running, schedule_opts)
@@ -668,8 +733,30 @@ function M.tick(opts)
       local phase = "implement"
       if retry_ids[task.id] and type(task.failure) == "table" and is_non_empty(task.failure.phase) then
         phase = task.failure.phase
+      elseif task.slot_wait and is_non_empty(task.phase) then
+        phase = task.phase
       end
-      local moved, merr = state.transition(root, task.id, "running", { phase = phase })
+      -- A waiting task is walked back to `running` through the same legal path
+      -- a resume uses: `reviewing` and `merging` have no direct edge to
+      -- `running`, and forcing one would be the illegal transition the resume
+      -- guard exists to prevent. The slot is claimed by the final move, and the
+      -- wait is cleared in that same append.
+      local path = { "running" }
+      if task.slot_wait and task.status ~= "ready" then
+        path = RESUME_PATH[task.status] or path
+      end
+      local moved = nil
+      local merr = nil
+      for index, to in ipairs(path) do
+        local extra = { phase = phase }
+        if index == #path and task.slot_wait then
+          extra.fields = { slot_wait = false }
+        end
+        moved, merr = state.transition(root, task.id, to, extra)
+        if not moved then
+          break
+        end
+      end
       if not moved then
         -- A task that cannot move is reported, never fatal: the tick succeeded
         -- and the next one can try again.

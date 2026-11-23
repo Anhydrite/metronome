@@ -209,6 +209,15 @@
         "deploy"
       ]
     },
+    "slot_wait": {
+      "type": "boolean",
+      "description": "True while the task waits for a free max_parallel slot after a retry or a resume. A slot wait is not a failure: it keeps the task's status and phase, never writes failure_reason, and is cleared by the dispatch that moves the task back to running."
+    },
+    "slot_wait_since": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When slot_wait was set, ISO 8601 UTC. Persisted with slot_wait so a /reload replays the wait instead of losing it, and cleared with it on dispatch."
+    },
     "branch": {
       "type": "string",
       "description": "Git branch the task works on.",

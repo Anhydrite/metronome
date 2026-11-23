@@ -21,27 +21,45 @@ local TERMINAL = {
   abandoned = true,
 }
 
+-- The statuses that mean a task holds a scheduling slot. They are the ones
+-- `pipeline.slots` counts and `pick` refuses to overbook. A task that moves into
+-- one of them is in flight, so it can never still claim to be parked: the wait
+-- fields are cleared in the same append as the status move.
+local ACTIVE = {
+  running = true,
+  verifying = true,
+  reviewing = true,
+  merging = true,
+  deploying = true,
+}
+
 -- Legal transitions. Anything else is a bug in the caller, so it raises rather
 -- than silently corrupting the journal.
+--
+-- `ready` is a legal target from every status a task can be parked in, not
+-- only from `qualifying`: `runtime.retry` and `runtime.resume` requeue a task
+-- instead of starting it behind max_parallel's back, and a task recovered by
+-- /reload has no pilot any more. `run_task` restarts at implement for every
+-- non-epic task, so requeueing mid-pipeline costs no work.
 local TRANSITIONS = {
   draft = { qualifying = true, abandoned = true },
   qualifying = { awaiting_answers = true, ready = true, failed = true, abandoned = true },
   awaiting_answers = { qualifying = true, abandoned = true },
   ready = { running = true, failed = true, abandoned = true },
-  running = { verifying = true, failed = true, stalled = true, abandoned = true },
-  verifying = { running = true, reviewing = true, failed = true, abandoned = true },
-  reviewing = { changes_requested = true, pr_open = true, failed = true, abandoned = true },
+  running = { verifying = true, failed = true, stalled = true, abandoned = true, ready = true },
+  verifying = { running = true, reviewing = true, failed = true, abandoned = true, ready = true },
+  reviewing = { changes_requested = true, pr_open = true, failed = true, abandoned = true, ready = true },
   changes_requested = { running = true, failed = true, abandoned = true },
   pr_open = { merging = true, merged = true, failed = true, abandoned = true },
-  merging = { merged = true, failed = true },
+  merging = { merged = true, failed = true, ready = true },
   merged = { deploying = true, deployed = true },
-  deploying = { deployed = true, failed = true },
+  deploying = { deployed = true, failed = true, ready = true },
   deployed = {},
-  failed = { running = true, abandoned = true },
-  stalled = { running = true, failed = true, abandoned = true },
+  failed = { running = true, abandoned = true, ready = true },
+  stalled = { running = true, failed = true, abandoned = true, ready = true },
   -- A retried task that re-enters review can hit the round limit while it is
   -- still abandoned; escalation must be able to fail it, not error out.
-  abandoned = { running = true, failed = true },
+  abandoned = { running = true, failed = true, ready = true },
 }
 
 -- An epic task owns the single PR from the epic branch to the project base.
@@ -149,6 +167,12 @@ end
 -- deadline any more, and the attempt budget starts again from zero.
 local RESUME_STATUSES = { running = true, verifying = true, reviewing = true, merged = true }
 
+-- A status event may carry a reason. Only a status that *is* a failure writes
+-- it into `failure_reason`; a move carries why the task moved (a free-slot
+-- wait, a review round), and reading that back as a cause would make the
+-- status report invent an `unknown` error on a healthy task.
+local REASON_AS_FAILURE = { failed = true, abandoned = true }
+
 local function settle_failure(task)
   local failure = task.failure
   if type(failure) ~= "table" then
@@ -242,7 +266,7 @@ function M.replay(text)
           if event.kind == "status" then
             task.status = event.status
             task.phase = event.phase or task.phase
-            if type(event.reason) == "string" and event.reason ~= "" then
+            if type(event.reason) == "string" and event.reason ~= "" and REASON_AS_FAILURE[event.status] then
               task.failure_reason = event.reason
             end
             -- A failure is only rewritten by a failure event: branch, worktree,
@@ -254,7 +278,16 @@ function M.replay(text)
             end
           elseif event.kind == "field" then
             for k, v in pairs(event.fields or {}) do
-              task[k] = v
+              -- `slot_wait = false` is the dispatch clearing the wait. JSON has
+              -- no null, so the field event carries false and both wait fields
+              -- are dropped here: a projection must never keep a stale
+              -- `slot_wait` or its timestamp once the task is dispatched.
+              if k == "slot_wait" and v == false then
+                task.slot_wait = nil
+                task.slot_wait_since = nil
+              else
+                task[k] = v
+              end
             end
           elseif event.kind == "quarantine_cleared" then
             -- The marker is set by a field event and dropped by its own event,
@@ -633,6 +666,44 @@ function M.transition(root, task_id, to, extra)
     phase = extra.phase or nil,
     reason = extra.reason or nil,
   }
+  -- A caller may clear or patch fields in the same append as the status move:
+  -- the dispatch of a slot-waiting task clears `slot_wait` atomically with
+  -- `running`, so a reader never sees a running task still claiming the wait.
+  --
+  -- Moving into an active status implies the same clearing, whether or not the
+  -- caller remembered it: a task that holds a slot is by definition not parked.
+  -- Without this invariant a late review verdict, an automatic retry or any
+  -- other transition to `running` would leave `slot_wait` on an in-flight task,
+  -- and the next tick would see it as a candidate and dispatch the same
+  -- worktree a second time, invisible to `max_parallel`.
+  --
+  -- A terminal status clears the wait too. `abandon` and `stop` move a parked
+  -- (`slot_wait`) task to `abandoned`; if the flag survived, the next tick would
+  -- treat the cancelled task as a dispatch candidate — `abandoned -> running` is
+  -- a legal transition — and resurrect it on the very slot its cancellation
+  -- freed. A dead task is never waiting for a slot.
+  --
+  -- Only a task that actually carries the wait emits the clearing event: an
+  -- ordinary move into an active or terminal status has nothing to clear, and
+  -- appending an empty `slot_wait = false` to every journal move would grow the
+  -- journal (and the projection write) for no state change.
+  local fields = type(extra.fields) == "table" and extra.fields or nil
+  if (ACTIVE[to] or TERMINAL[to]) and task.slot_wait
+    and not (fields and fields.slot_wait ~= nil) then
+    local merged = {}
+    for key, value in pairs(fields or {}) do
+      merged[key] = value
+    end
+    merged.slot_wait = false
+    fields = merged
+  end
+  if fields then
+    events[#events + 1] = {
+      kind = "field",
+      task_id = task_id,
+      fields = fields,
+    }
+  end
 
   local new_state, err = M.append(root, events)
   if not new_state then
