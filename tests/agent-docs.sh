@@ -87,6 +87,31 @@ for cmd in init submit status answer calibrate retry abandon config panel resume
 done
 ok commands
 
+# --- answer propagation (T-20261123-000d) -------------------------------
+# An answer must reach the implementer: it is rewritten into the task sheet
+# with its date and rendered in the implementer prompt as binding. Both
+# documents must say so, so the contract cannot be silently dropped.
+
+answer_contract() {
+  local name="$1" file="$2"
+  grep -Fq 'tasks/<id>.md' "$file" \
+    || fail "answers:$name:sheet" "$file does not name the task sheet answers are rewritten into"
+  grep -Fq 'Réponses aux questions (contraignantes)' "$file" \
+    || fail "answers:$name:prompt" "$file does not name the binding answers section of the implementer prompt"
+  grep -Eiq 'rewritten into the task sheet|written into every source task' "$file" \
+    || fail "answers:$name:rewrite" "$file does not state that answers are rewritten into the task sheet"
+  grep -Eiq 'binding' "$file" \
+    || fail "answers:$name:binding" "$file does not state that the implementer treats answers as binding"
+  grep -Eiq 'overrides? the intent' "$file" \
+    || fail "answers:$name:override" "$file does not state that an answer overrides the intent"
+  grep -Eiq 'failed sheet rewrite is an error' "$file" \
+    || fail "answers:$name:error" "$file does not state that a failed sheet rewrite is an error"
+}
+
+answer_contract prompt "$PROMPT"
+answer_contract agent "$AGENT"
+ok answers
+
 # --- report format in system-prompt.md ----------------------------------
 
 for part in "requested" "done" "evidence" "next steps"; do

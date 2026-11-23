@@ -57,6 +57,8 @@ The pipeline runs in order; each transition is an event in `state.jsonl`.
 
 Synthesize the raw set into one answerable round: deduplicate, put blockers first, cap at 15, and send every answer back to every task that asked it. Never invent an answer to keep moving — a blocking question stays blocking.
 
+An answer is rewritten into the task sheet (`tasks/<id>.md`, with its date) and rendered in the implementer's prompt under « Réponses aux questions (contraignantes) », which treats it as binding: an answer overrides the intent when they contradict. A failed sheet rewrite is an error, never a silent loss.
+
 ## Report format
 
 Every transition: task id, phase, result, cost, PR link. Every completed task:

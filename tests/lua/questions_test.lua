@@ -7,6 +7,7 @@
 
 return function()
   local questions = load_module("questions")
+  local qualify = load_module("qualify")
   local state = load_module("state")
 
   -- test_dir() empties and recreates the per-test workspace, so two runs (or
@@ -16,6 +17,30 @@ return function()
 
   local root = maki.fs.joinpath(base, "state")
   local journal_path = maki.fs.joinpath(root, "state.jsonl")
+  local tasks_dir = maki.fs.joinpath(root, "tasks")
+
+  -- The sheet a task starts with. Every answer the loop applies must rewrite
+  -- this file, through the same renderer qualify.apply used.
+  local function sheet_path(id)
+    return maki.fs.joinpath(tasks_dir, id .. ".md")
+  end
+
+  local function write_sheet(id)
+    local task = state.load(root).tasks[id]
+    return maki.fs.write(sheet_path(id), qualify.sheet_markdown(task))
+  end
+
+  maki.fs.mkdir(tasks_dir, { parents = true })
+
+  -- Every answer call injects the one sheet renderer and the sheet directory:
+  -- questions.answer refuses to run without them.
+  local function answer_opts(extra)
+    local opts = { qualify = qualify, tasks_dir = tasks_dir }
+    for key, value in pairs(extra or {}) do
+      opts[key] = value
+    end
+    return opts
+  end
 
   -- dedup_key --------------------------------------------------------------
 
@@ -175,6 +200,17 @@ return function()
   })
   eq(type(d), "table", "task D is created")
 
+  for _, id in ipairs({
+    "T-20261114-aaaa",
+    "T-20261114-bbbb",
+    "T-20261114-cccc",
+    "T-20261114-dddd",
+  }) do
+    write_sheet(id)
+  end
+  local untouched_sheet = maki.fs.read(sheet_path("T-20261114-dddd"))
+  eq(type(untouched_sheet), "string", "the unrelated task has an initial sheet")
+
   local round, rerr = questions.round(state, root, { max_questions = 2 })
   eq(rerr, nil, "round has no error")
   eq(round and round.total, 3, "round sees three groups")
@@ -193,9 +229,10 @@ return function()
 
   -- answer: the deduped canonical id writes to both sources -----------------
 
-  local ans, anserr = questions.answer(state, root, { ["T-20261114-aaaa/q1"] = "OAuth" }, {
-    now = "2026-11-14T12:00:00Z",
-  })
+  local ans, anserr = questions.answer(
+    state, root, { ["T-20261114-aaaa/q1"] = "OAuth" },
+    answer_opts({ now = "2026-11-14T12:00:00Z" })
+  )
   eq(anserr, nil, "answer has no error")
   eq(ans and ans.answered, 1, "one answer was given")
   eq(ans and ans.applied, 2, "the answer is applied to both sources")
@@ -214,6 +251,19 @@ return function()
   eq(after.tasks["T-20261114-bbbb"].questions[1].answer, "OAuth", "task B keeps the answer")
   eq(after.tasks["T-20261114-bbbb"].questions[1].answered_at, "2026-11-14T12:00:00Z", "task B records answered_at")
 
+  -- the sheet the implementer reads carries the answer ---------------------
+
+  local sheet_a = maki.fs.read(sheet_path("T-20261114-aaaa"))
+  has(sheet_a or "", "- q1: Which AUTH?", "task A's sheet keeps the question line")
+  has(sheet_a or "", "  - Réponse (2026-11-14T12:00:00Z): OAuth",
+    "task A's sheet renders the answer under its question")
+  local sheet_b = maki.fs.read(sheet_path("T-20261114-bbbb"))
+  has(sheet_b or "", "OAuth", "the duplicate source's sheet carries the answer too")
+  eq(maki.fs.read(sheet_path("T-20261114-dddd")), untouched_sheet,
+    "a task whose questions got no answer keeps its sheet bytes")
+  eq(sheet_a, qualify.sheet_markdown(after.tasks["T-20261114-aaaa"]),
+    "the rewritten sheet is exactly what sheet_markdown renders")
+
   -- the answer must survive journal replay, not just the projection --------
 
   maki.fs.rm(maki.fs.joinpath(root, "state.json"))
@@ -224,9 +274,10 @@ return function()
 
   -- a remaining question on an already-qualifying task ---------------------
 
-  local rest, resterr = questions.answer(state, root, { ["T-20261114-aaaa/q2"] = "Postgres" }, {
-    now = "2026-11-14T12:05:00Z",
-  })
+  local rest, resterr = questions.answer(
+    state, root, { ["T-20261114-aaaa/q2"] = "Postgres" },
+    answer_opts({ now = "2026-11-14T12:05:00Z" })
+  )
   eq(resterr, nil, "answering a remaining question on a qualifying task does not fail")
   eq(rest and rest.answered, 1, "the remaining answer is counted")
   eq(rest and rest.applied, 1, "the remaining answer is written once")
@@ -240,7 +291,9 @@ return function()
   local before_journal = maki.fs.read(journal_path)
   eq(type(before_journal), "string", "the journal exists before the refusals")
 
-  local unknown, uerr = questions.answer(state, root, { ["T-20261114-aaaa/nope"] = "x" })
+  local unknown, uerr = questions.answer(
+    state, root, { ["T-20261114-aaaa/nope"] = "x" }, answer_opts()
+  )
   eq(unknown, nil, "an unknown id returns nil")
   eq(uerr ~= nil and uerr:find("unknown question id", 1, true) ~= nil, true, "the unknown id explains itself")
   eq(maki.fs.read(journal_path), before_journal, "a refused answer writes nothing")
@@ -248,21 +301,25 @@ return function()
   local mixed, merr = questions.answer(state, root, {
     ["T-20261114-cccc/q1"] = "redis",
     ["T-20261114-zzzz/q1"] = "x",
-  })
+  }, answer_opts())
   eq(mixed, nil, "a partially invalid batch returns nil")
   eq(merr ~= nil and merr:find("unknown question id", 1, true) ~= nil, true, "the invalid entry is named")
   eq(maki.fs.read(journal_path), before_journal, "a partially invalid batch writes nothing")
 
-  local empty, eerr = questions.answer(state, root, { ["T-20261114-cccc/q1"] = "   " })
+  local empty, eerr = questions.answer(
+    state, root, { ["T-20261114-cccc/q1"] = "   " }, answer_opts()
+  )
   eq(empty, nil, "an empty answer returns nil")
   eq(eerr ~= nil and eerr:find("non-empty string", 1, true) ~= nil, true, "the empty answer explains itself")
   eq(maki.fs.read(journal_path), before_journal, "an empty answer writes nothing")
 
-  local notstr, nserr = questions.answer(state, root, { ["T-20261114-cccc/q1"] = 42 })
+  local notstr, nserr = questions.answer(
+    state, root, { ["T-20261114-cccc/q1"] = 42 }, answer_opts()
+  )
   eq(notstr, nil, "a non-string answer returns nil")
   eq(nserr ~= nil and nserr:find("non-empty string", 1, true) ~= nil, true, "the non-string answer explains itself")
 
-  local bad, baderr = questions.answer(state, root, nil)
+  local bad, baderr = questions.answer(state, root, nil, answer_opts())
   eq(bad, nil, "nil answers returns nil")
   eq(baderr, "answers must be a table", "nil answers explains itself")
 
@@ -270,7 +327,7 @@ return function()
 
   local listed, lerr = questions.answer(state, root, {
     { id = "T-20261114-cccc/q1", answer = "redis" },
-  }, { now = "2026-11-14T12:10:00Z" })
+  }, answer_opts({ now = "2026-11-14T12:10:00Z" }))
   eq(lerr, nil, "the list form has no error")
   eq(listed and listed.answered, 1, "the list form counts the answer")
   eq(listed and listed.applied, 1, "the list form applies the answer")
@@ -278,4 +335,29 @@ return function()
   local after_list = state.load(root)
   eq(after_list.tasks["T-20261114-cccc"].questions[1].answer, "redis", "the list form stores the answer")
   eq(after_list.tasks["T-20261114-cccc"].status, "qualifying", "the list form moves the task to qualifying")
+
+  -- a failing sheet write is an error, not a silent success ----------------
+
+  local e = state.create(root, {
+    id = "T-20261114-eeee",
+    title = "Sheet failure task",
+    status = "awaiting_answers",
+    created_at = "2026-11-14T00:00:05Z",
+    questions = { { id = "q1", text = "Which region?" } },
+  })
+  eq(type(e), "table", "task E is created")
+
+  -- A regular file where the sheet directory should be: every write fails.
+  local blocked = maki.fs.joinpath(base, "blocked")
+  maki.fs.write(blocked, "not a directory")
+  local unwritten, unwritten_err = questions.answer(
+    state, root, { ["T-20261114-eeee/q1"] = "eu-west" },
+    { qualify = qualify, tasks_dir = maki.fs.joinpath(blocked, "tasks") }
+  )
+  eq(unwritten, nil, "a failing sheet write returns nil")
+  eq(
+    unwritten_err ~= nil and unwritten_err:find("cannot write sheet for T-20261114-eeee", 1, true) ~= nil,
+    true,
+    "the sheet failure names the task"
+  )
 end

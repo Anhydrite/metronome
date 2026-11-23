@@ -7,6 +7,7 @@
 return function()
   local q = load_module("qualify")
   local state = load_module("state")
+  local questions = load_module("questions")
 
   -- test_dir() empties and recreates the per-test workspace, so two runs (or
   -- two tests) never share a journal, a temporary repository or a worktree. The
@@ -409,6 +410,58 @@ return function()
   eq(loaded.tasks[id1] and loaded.tasks[id1].checks[1], "npm test", "state keeps the checks")
   eq(loaded.tasks[id1] and loaded.tasks[id1].questions[1].id, "q1", "state keeps the questions")
   eq(loaded.tasks[id2] and loaded.tasks[id2].status, "ready", "state keeps the final status")
+  eq(
+    loaded.tasks[id1] and loaded.tasks[id1].acceptance and loaded.tasks[id1].acceptance[1],
+    "the first task works",
+    "apply persists acceptance on the record"
+  )
+  has(sheet1 or "", "the first task works", "the initial sheet renders the acceptance")
+  -- The initial sheet is exactly what the one renderer produces from the
+  -- persisted projection, which is what makes a later rewrite byte-identical.
+  eq(sheet1, q.sheet_markdown(loaded.tasks[id1]), "the initial sheet comes from sheet_markdown")
+
+  -- sheet_markdown renders an answered question under its question line -----
+
+  local answered_sheet = q.sheet_markdown({
+    id = "T-20261123-0001",
+    title = "Answered",
+    files = { "a" },
+    checks = { "c" },
+    questions = {
+      {
+        id = "q1",
+        text = "Which auth?",
+        answer = "persist the slot",
+        answered_at = "2026-11-23T16:27:00Z",
+      },
+      { id = "q2", text = "Which database?" },
+      { id = "q3", text = "Which region?", answer = "eu-west" },
+    },
+  })
+  has(answered_sheet, "- q1: Which auth?", "an answered question keeps its question line")
+  has(answered_sheet, "  - Réponse (2026-11-23T16:27:00Z): persist the slot",
+    "the answer and its date follow the question")
+  has(answered_sheet, "- q2: Which database?", "an unanswered question is rendered alone")
+  has(answered_sheet, "  - Réponse (unknown): eu-west",
+    "a missing answered_at gets a stable fallback instead of dropping the answer")
+
+  -- apply then answer: the rewrite goes through sheet_markdown too ---------
+
+  local answer_ok, answer_err = questions.answer(
+    state, root, { [id1 .. "/q1"] = "OAuth" },
+    { now = "2026-11-23T16:27:00Z", tasks_dir = maki.fs.joinpath(root, "tasks"), qualify = q }
+  )
+  eq(answer_err, nil, "the answer applies")
+  eq(answer_ok and answer_ok.applied, 1, "one answer was written")
+
+  local after_answer = state.load(root)
+  local rewritten = maki.fs.read(maki.fs.joinpath(root, "tasks", id1 .. ".md"))
+  eq(rewritten, q.sheet_markdown(after_answer.tasks[id1]),
+    "the rewrite is sheet_markdown of the reloaded projection")
+  has(rewritten or "", "OAuth", "the rewritten sheet carries the answer")
+  has(rewritten or "", "2026-11-23T16:27:00Z", "the rewritten sheet carries answered_at")
+  eq(maki.fs.read(maki.fs.joinpath(root, "tasks", id2 .. ".md")), sheet2,
+    "the task that answered nothing keeps its sheet bytes")
 
   -- A dependency expressed as a batch position ("1") resolves to the real id
   -- assigned to the task at that position, both in the record and the sheet.

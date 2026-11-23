@@ -121,7 +121,10 @@ check(round ~= nil and #round.questions == 1, "questions: one blocking question"
 if round and #round.questions > 0 then
   local answers = {}
   answers[round.questions[1].id] = "English"
-  local answered, answer_err = questions.answer(state, STATE_ROOT, answers)
+  local answered, answer_err = questions.answer(state, STATE_ROOT, answers, {
+    tasks_dir = TASKS_DIR,
+    qualify = qualify,
+  })
   check(answered ~= nil, "questions: the answer applies", answer_err)
   check(answered ~= nil and answered.applied >= 1, "questions: one answer was written")
 end

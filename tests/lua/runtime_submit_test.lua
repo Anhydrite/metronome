@@ -26,6 +26,7 @@ return function()
   }
 
   local captured
+  local captured_answer
   local ticked = false
   local deps = {
     config = {
@@ -52,7 +53,8 @@ return function()
     end,
     wait_turn_end = false,
     questions = {
-      answer = function()
+      answer = function(_, _, answers, opts)
+        captured_answer = { answers = answers, opts = opts }
         return { applied = 1, answered = 1, tasks = { "T-20261114-0001" } }
       end,
     },
@@ -193,6 +195,23 @@ return function()
   eq(ans and ans.ok, true, "answer resumes the pipeline")
   eq(ans and ans.applied and ans.applied.applied, 1, "answer reports the applied count")
   eq(ticked, true, "answer runs the scheduler instead of leaving tasks in qualifying")
+  eq(captured_answer and captured_answer.opts and captured_answer.opts.tasks_dir, paths.tasks,
+    "answer hands questions.answer the project tasks directory")
+  eq(captured_answer and captured_answer.opts and captured_answer.opts.qualify, deps.qualify,
+    "answer hands questions.answer the qualify module")
+
+  -- A sheet rewrite failure fails metronome_answer --------------------------
+
+  local real_answer = deps.questions.answer
+  deps.questions.answer = function()
+    return nil, "cannot write sheet for T-20261114-0001: read-only file system"
+  end
+  local failed_answer = rt.answer({ answers = { q1 = "yes" } }, ctx)
+  eq(failed_answer and failed_answer.ok, false, "a sheet write failure fails the answer")
+  eq(failed_answer and failed_answer.error,
+    "cannot write sheet for T-20261114-0001: read-only file system",
+    "the answer error names the task whose sheet failed")
+  deps.questions.answer = real_answer
 
   -- Qualification remaps dependency titles to task ids ---------------------
 

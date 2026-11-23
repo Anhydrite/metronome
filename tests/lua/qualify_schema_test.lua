@@ -4,8 +4,11 @@
 -- pass. This file proves the missing half: the answer is validated against the
 -- REAL schemas/task.schema.json, through tools/validate-task.py, and a
 -- schema-illegal answer triggers the same repair pass a broken JSON answer
--- does. The projection is the object the schema actually governs, so
--- `acceptance` (which the schema forbids) never reaches the validator.
+-- does. The projection is the object the schema actually governs: `acceptance`
+-- is optional on the task schema but is structurally validated by
+-- `M.normalize` before it ever becomes a record, so `task_projection` still
+-- omits it (the assertion below pins that), while a schema-illegal projection
+-- is still caught by the real validator.
 
 return function()
   local q = load_module("qualify")
@@ -84,7 +87,10 @@ return function()
   eq(rok, true, "the real validator accepts a legal projection: " .. tostring(rerr))
   eq(rerr, nil, "the real validator returns no error for a legal projection")
 
-  local illegal = {
+  -- The schema now carries an optional `acceptance` array: a record that keeps
+  -- it (as qualify.apply does) must stay schema-legal. task_projection omits
+  -- it, so the field is added by hand to prove the schema side of the contract.
+  local with_acc = {
     id = "T-20261114-abcd",
     title = "t",
     status = "draft",
@@ -92,10 +98,24 @@ return function()
     checks = { "c" },
     acceptance = { "works" },
   }
+  local aok, aerr = q.validate_projection(with_acc, { tmp_dir = validate_tmp })
+  eq(aok, true, "the real validator accepts an acceptance array: " .. tostring(aerr))
+  eq(aerr, nil, "the acceptance array is schema-legal")
+
+  -- The rejection proof stays meaningful with a projection that is illegal for
+  -- a real reason: an unknown property the schema does not declare.
+  local illegal = {
+    id = "T-20261114-abcd",
+    title = "t",
+    status = "draft",
+    files = { "f" },
+    checks = { "c" },
+    bogus_property = { "works" },
+  }
   local iok, ierr = q.validate_projection(illegal, { tmp_dir = validate_tmp })
-  eq(iok, nil, "the real validator rejects an acceptance field")
+  eq(iok, nil, "the real validator rejects an unknown property")
   eq(ierr ~= nil and ierr:find("task.schema.json", 1, true) ~= nil, true, "the rejection names the schema")
-  eq(ierr ~= nil and ierr:find("acceptance", 1, true) ~= nil, true, "the rejection names the extra property")
+  eq(ierr ~= nil and ierr:find("bogus_property", 1, true) ~= nil, true, "the rejection names the extra property")
 
   local bidok, biderr = q.validate_projection(
     { id = "bad", title = "t", status = "draft", files = { "f" }, checks = { "c" } },

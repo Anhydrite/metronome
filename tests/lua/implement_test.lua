@@ -179,6 +179,37 @@ return function()
   eq(prompt:find("## Review feedback", 1, true), nil,
     "a first turn carries no feedback section")
 
+  -- Answered questions are binding, even when the sheet is missing or lagging:
+  -- the prompt renders task.questions[].answer on its own.
+  local answered_task = {}
+  for k, v in pairs(task) do
+    answered_task[k] = v
+  end
+  answered_task.questions = {
+    { id = "q1", text = "Which persistence strategy?",
+      answer = "persist slot_wait", answered_at = "2026-11-23T16:27:00Z" },
+    { id = "q2", text = "Still open?" },
+  }
+  local answered_prompt = implement.render_prompt(answered_task, "", ctx, {})
+  local binding_heading = "## Réponses aux questions (contraignantes)"
+  has(answered_prompt, binding_heading, "an answered question adds the binding section")
+  has(answered_prompt, "persist slot_wait", "the binding section carries the answer")
+  has(answered_prompt, "2026-11-23T16:27:00Z", "the binding section carries the answered date")
+  has(answered_prompt, "q1", "the binding section names the question id")
+  has(answered_prompt, "Which persistence strategy?", "the binding section carries the question text")
+  has(answered_prompt, "the answer wins", "the binding section states the answer wins")
+  has(answered_prompt, "intent is overridden", "the binding section states the answer overrides the intent")
+  eq(answered_prompt:find("Still open?", 1, true), nil,
+    "an unanswered question is not presented as binding")
+  local heading_at = answered_prompt:find(binding_heading, 1, true)
+  local rules_at = answered_prompt:find("## Rules", 1, true)
+  eq(heading_at ~= nil and rules_at ~= nil and heading_at < rules_at, true,
+    "the binding section comes before the rules")
+
+  -- A task with no answered question gains nothing.
+  eq(prompt:find(binding_heading, 1, true), nil,
+    "a task without answers has no binding section")
+
   -- Prepare ------------------------------------------------------------------
 
   local prep_opts = {
