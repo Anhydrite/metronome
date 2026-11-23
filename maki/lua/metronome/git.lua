@@ -1084,30 +1084,34 @@ end
 
 -- The whole step: open the PR, record it on the task, then move the task.
 --
--- When the task already carries an open PR, that PR is reused as is -- same
--- number, same url, same review threads -- and simply re-recorded, so a retry
--- of a failed task updates the preserved PR instead of replacing it.
+-- When the task already carries an open PR, that PR is confirmed with GitHub
+-- and reused as is -- same number, same url, same review threads -- and simply
+-- re-recorded, so a retry of a failed task updates the preserved PR instead of
+-- replacing it.
 --
 -- The PR is stored before the move so a refused transition still leaves the
 -- work visible: the caller can retry the move without opening a second PR.
 function M.pr_open(state, root, task_id, opts)
   opts = opts or {}
-  -- A retry reuses the PR the task already carries when it is still open: same
-  -- number, same review threads, no close and no create. The pipeline's push
-  -- keeps that PR up to date. Only a merged or closed PR is replaced, through
-  -- the normal create path.
+  -- A retry reuses the PR the task already carries when GitHub still reports
+  -- it open: same number, same review threads, no close and no create. The
+  -- pipeline's push keeps that PR up to date. A merged, closed, or no-longer-
+  -- open PR is replaced through the normal create path.
   local loaded = type(state.load) == "function" and state.load(root) or nil
   local existing = loaded and loaded.tasks and loaded.tasks[task_id]
     and loaded.tasks[task_id].pr or nil
+  -- The stored PR is only a cache: it may have been closed or merged out of
+  -- band since it was recorded, so it is re-read from GitHub before being
+  -- trusted. Only a live PR that GitHub still reports open is reused. A
+  -- missing state is not "open" either, so it goes through the create path.
   local pr
-  if existing and existing.number
-    and existing.state ~= "merged" and existing.state ~= "closed" then
-    local reused, nerr = M.normalize_pr(existing)
-    if not reused then
-      return nil, nerr
+  if existing and existing.number and existing.state == "open" then
+    local live = M.pr_view(existing.number, opts)
+    if live and live.state == "open" then
+      pr = live
     end
-    pr = reused
-  else
+  end
+  if not pr then
     local created, err = M.pr_create(opts)
     if not created then
       return nil, err
