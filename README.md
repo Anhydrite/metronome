@@ -68,11 +68,11 @@ All commands are subcommands of one `/metronome` dispatcher.
 | `/metronome status [id]` | Show every task, or one task in detail. |
 | `/metronome answer` | Open the pending question round. |
 | `/metronome calibrate` | Generate `review-rules.md` from the repository. |
-| `/metronome retry <id>` | Restart a failed task from its last stable phase. |
-| `/metronome abandon <id>` | Archive a task. |
-| `/metronome prune` | Reconcile GitHub with the journal: close PRs and delete branches of abandoned tasks or of tasks gone from the journal only; failed and stalled tasks are preserved as retryable. |
-| `/metronome stop <id>` | Cancel an in-flight task and park it as abandoned. |
-| `/metronome delete <id>` | Remove a task from the panel and status; a snapshot is kept in the archive and the slow cleanup runs in the background. |
+| `/metronome retry <id>` | Restart a failed task from its last stable phase; the kept branch and open PR are reused. |
+| `/metronome abandon <id>` | Archive a task, then prune its PR and branches. Explicit abandonment is the only cleanup trigger. |
+| `/metronome prune` | Reconcile GitHub with the journal. Only explicitly abandoned tasks, or tasks gone from the journal, are cleaned; every non-terminal task — including `failed` and `stalled` — is preserved whole with its branch, open PR and checkpoints so `metronome_retry` can resume it. The report names the reason per task: `kept (failed, retryable)`, `deleted (abandoned)` or `deleted (gone)`. |
+| `/metronome stop <id>` | Cancel an in-flight task, park it as abandoned, then prune its PR and branches. |
+| `/metronome delete <id>` | Remove a task from the panel and status; a snapshot is kept in the archive and its PR and branches are cleaned up in the background, since a deleted task is gone from the journal. |
 | `/metronome archive` | List the snapshots kept for deleted tasks. |
 | `/metronome config [key=value ...]` | Show the project configuration, or update it in place. |
 | `/metronome panel` | Open, close or toggle the live panel. |
@@ -82,6 +82,8 @@ All commands are subcommands of one `/metronome` dispatcher.
 | `/metronome off` | Turn natural-language routing off. |
 
 The same surface is exposed to the agent as twelve tools: `metronome_submit`, `metronome_status`, `metronome_answer`, `metronome_retry`, `metronome_abandon`, `metronome_prune`, `metronome_stop`, `metronome_delete`, `metronome_archive`, `metronome_calibrate`, `metronome_config`, `metronome_panel`. `metronome_config` reads the config and, with `answers`, updates it in place — merged with the config on disk, so changing one model does not reset the checks or the merge/deploy policy.
+
+Prune only ever removes the work of a task that was explicitly abandoned (`metronome_abandon`, `metronome_stop`, `metronome_delete`) or that has disappeared from the journal. A `failed` or `stalled` task is not dead: it keeps its branch, its open PR and its checkpoints, and `metronome_retry` resumes it and reuses the already-open PR instead of closing it and opening another. Each prune report line carries its reason, so a preserved task reads `kept (failed, retryable)` and a cleanup reads `deleted (abandoned)` or `deleted (gone)`.
 
 ### Natural-language mode
 

@@ -198,11 +198,11 @@ You drive the pipeline through twelve tools:
 - `metronome_submit` — create an intent and start qualification; returns at once, qualification runs in the background.
 - `metronome_status` — read the state of all tasks, or the detail of one. For a failed task, read its `checkpoint`, typed `last_error` and `retry_action` before acting.
 - `metronome_answer` — deliver answers to the pending question round.
-- `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase; the relaunch keeps the worktree, branch, checkpoints and transcript.
-- `metronome_abandon` — archive a task.
-- `metronome_prune` — reconcile GitHub with the journal: close PRs and delete branches of abandoned tasks or of tasks gone from the journal only. Failed and stalled tasks are kept intact, with their branch, PR and checkpoints, because they are retryable.
-- `metronome_stop` — stop an in-flight task and park it as abandoned.
-- `metronome_delete` — remove a task from the panel and status, keeping the journal.
+- `metronome_retry` — restart a failed, stalled or abandoned task from its last stable phase; the relaunch keeps the worktree, branch, checkpoints and transcript, and reuses the already-open PR instead of closing and recreating it.
+- `metronome_abandon` — archive a task and prune its PR and branches: abandoning a task is what authorizes prune to clean its work.
+- `metronome_prune` — reconcile GitHub with the journal. It cleans only explicitly abandoned tasks or tasks gone from the journal; every non-terminal task — including `failed` and `stalled` — is preserved whole (branch, open PR, checkpoints) because it is retryable, and `metronome_retry` reuses the preserved PR. The report names the reason per task: `kept (failed, retryable)`, `deleted (abandoned)`, `deleted (gone)`.
+- `metronome_stop` — stop an in-flight task, park it as abandoned and prune its PR and branches.
+- `metronome_delete` — remove a task from the panel and status, keeping the journal; its PR and branches are cleaned up because the task is gone from the journal.
 - `metronome_archive` — list the snapshots kept for deleted tasks.
 - `metronome_calibrate` — analyze the repository and generate `review-rules.md`.
 - `metronome_config` — read the project configuration, or update it with `answers` (merged with the config on disk, so a model change does not reset the checks or the merge/deploy policy).
@@ -220,11 +220,11 @@ work starts, so a missing task id is refused in the input bar, not mid-run.
 - `/metronome status [id]` — show task state, or one task in detail.
 - `/metronome answer` — open the pending question queue.
 - `/metronome calibrate` — analyze the repo and generate `review-rules.md`.
-- `/metronome retry <id>` — restart a failed task from its last stable phase. A relaunch of the workflow: worktree, branch, checkpoints and transcript are kept.
-- `/metronome abandon <id>` — archive a task.
-- `/metronome prune` — close PRs and delete branches of abandoned or vanished tasks only; failed and stalled tasks are preserved as retryable.
-- `/metronome stop <id>` — stop an in-flight task and park it as abandoned.
-- `/metronome delete <id>` — remove a task from the panel and status.
+- `/metronome retry <id>` — restart a failed task from its last stable phase. A relaunch of the workflow: worktree, branch, checkpoints and transcript are kept, and the already-open PR is reused.
+- `/metronome abandon <id>` — archive a task, then prune its PR and branches; explicit abandonment is a cleanup trigger.
+- `/metronome prune` — clean only explicitly abandoned tasks or tasks gone from the journal; every non-terminal task, including failed and stalled, is preserved whole and its PR stays open for the retry to reuse. The report gives the reason per task (`kept (failed, retryable)`, `deleted (abandoned)`, `deleted (gone)`).
+- `/metronome stop <id>` — stop an in-flight task, park it as abandoned and prune its PR and branches.
+- `/metronome delete <id>` — remove a task from the panel and status; it is gone from the journal, so its PR and branches are cleaned up.
 - `/metronome archive` — list the snapshots kept for deleted tasks.
 - `/metronome config [key=value ...]` — show `config.toml`, or update it in place (merged with the current config). An update runs the same preflight as `init` and is refused when it fails: relay the reported check, command and remedy verbatim instead of retrying blindly or claiming success.
 - `/metronome panel` — open or close the live panel.
