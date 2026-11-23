@@ -12,7 +12,7 @@ Every module returns a table and never raises into maki. Fallible functions retu
 | `state.lua` | Append-only journal, projection, task CRUD and the legal transition table. |
 | `roles.lua` | Resolve a role name to its model, thinking level, tool whitelist and prompt files. |
 | `runner.lua` | Open a maki subagent session for one role, with retry, timeout and logs. |
-| `git.lua` | Fetch, worktree, branch, commit, push, diff and the `gh` PR calls (`pr_create`, `pr_view`, `pr_close`, `pr_comment`). |
+| `git.lua` | Single-flight `fetch` (one in-process registry per repository + remote + arguments), worktree, branch, commit, push, diff, the `gh` PR calls (`pr_create`, `pr_view`, `pr_close`, `pr_comment`), and `classify`, which names ref-lock contention as the transient, retryable `git_lock`. |
 | `qualify.lua` | Turn an intention into task sheets, with a repair pass and a question list. |
 | `questions.lua` | Deduplicate, rank and cap a question round; write answers back to every source. |
 | `analyze.lua` | Cross-task structural and semantic analysis; gate `qualifying -> ready`. |
@@ -95,11 +95,20 @@ An intention that qualifies into more than one task does not merge those tasks i
 - **Stall detection** — an active task whose last progress is older than `stall_minutes` is stale. A stale `running` task moves to `stalled`; the other active statuses are flagged `stall.suspect`.
 - **Resume** — `/reload` kills in-flight sessions. Resume walks each interrupted task back to `running` through legal transitions only (`reviewing -> changes_requested -> running`, `merging -> failed -> running`) and re-dispatches its phase.
 
+## Git concurrency
+
+Several tasks in flight fetch the same clone at once, and the sandbox offers neither `io` nor `flock`. The protection is two-layered, and it does **not** claim mutual exclusion across processes:
+
+- **Single-flight fetch, in process.** `git.lua` keeps an in-memory registry (`INFLIGHT`) of fetches in flight, keyed by repository path + remote + arguments. A caller that asks for a fetch already running for the same key does not start a second `git fetch` child: it waits for the one in flight and reuses its outcome — success or failure. There is no lock file, no age, PID or takeover logic: the maki process is the sole owner of the registry. The entry is released on every path (success, error, exception) through `pcall`, so a failed fetch never poisons the next one.
+- **`git_lock` cause, and a bounded replay.** `classify` reports `git_lock` (`transient = true`, `retryable = true`) whenever a git command fails with `cannot lock ref`, `unable to update local ref` or `failed to update ref` — fetch, push and rebase alike — with a message naming the contention and a remedy. Every other failure stays `git_error` (or one of the other typed causes). Callers (`runtime.lua` and `implement.lua`) replay only a `git_lock` failure, with a short bounded backoff — 3 attempts, 200 ms plus jitter — before the task is allowed to fail. No task is marked `failed` on a first `git_lock`; a task that exhausts its attempts keeps its worktree, branch, checkpoints and transcript, and its failure names `git_lock` and the remedy.
+
+**Inter-process contention is not locked.** Two maki processes on the same clone can still race for the same `<ref>.lock`, and the registry above knows nothing about the other process. That case is deliberately **not** covered by a lock and there is no mutual exclusion between processes: it is covered by the `git_lock` classification plus the bounded replay, which turns a lost race into a short retry instead of a failed task.
+
 ## Recovery
 
 A task that fails is never lost: `failed` is resumable from its last stable state. The recovery loop is `recover.lua` → scheduler → per-task spawn, and it never runs a task synchronously in the scheduler's loop.
 
-1. **Typed diagnosis** — `recover.lua` classifies a run error into a closed set of causes (`nothing_to_commit`, `git_identity`, `network`, `binary_missing`, `timeout`, `killed`, `session_dead`, `quota`, `conflict`, `checks_failed`, `auth`, …) and attaches an actionable remedy. It is pure: no I/O, never raises. `nothing_to_commit` is benign — a tree already at the requested state is not a failure.
+1. **Typed diagnosis** — `recover.lua` classifies a run error into a closed set of causes (`nothing_to_commit`, `git_identity`, `network`, `binary_missing`, `timeout`, `killed`, `session_dead`, `quota`, `conflict`, `git_lock`, `checks_failed`, `auth`, …) and attaches an actionable remedy. It is pure: no I/O, never raises. `nothing_to_commit` is benign — a tree already at the requested state is not a failure. `git_lock` reaches here only after the caller's bounded replay is exhausted (see *Git concurrency*); it keeps the task's worktree, branch, checkpoints and transcript.
 2. **Bounded decision** — `recover.decide` returns `auto_retry`, `human` or `none` with an exponential backoff computed from `recover.DEFAULTS`:
 
    | Constant | Default | Meaning |
