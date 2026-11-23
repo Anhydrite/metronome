@@ -122,6 +122,12 @@ return function()
           if busy > env.peak then
             env.peak = busy
           end
+          -- A scripted failure, so a case can drive the real failure policy
+          -- (the automatic retry and its backoff) without a real error.
+          if type(env.fail_calls) == "number" and env.fail_calls > 0 then
+            env.fail_calls = env.fail_calls - 1
+            return { ok = false, error = env.fail_error or "timed out after 30s" }
+          end
           return {
             ok = true,
             ctx = { worktree = "/tmp/wt-" .. id, branch = "metronome/" .. id },
@@ -153,6 +159,14 @@ return function()
         env.queue[#env.queue + 1] = fn
         return { cancel = function() end }
       end,
+      -- A timer the test owns: an automatic retry's backoff lands here and fires
+      -- only when the case decides, which is what makes the race with a human
+      -- retry observable. Without a case-supplied timer the real fallback (an
+      -- immediate retry) is left in place.
+      defer = type(env.defer) == "table" and function(fn, ms)
+        env.defer[#env.defer + 1] = { fn = fn, ms = ms }
+        return { cancel = function() end }
+      end or nil,
       async = true,
       wait_turn_end = false,
       runner = { run = function() return { ok = true } end },
@@ -480,4 +494,65 @@ return function()
   pump_all(env4)
   eq(env4.peak <= 1, true, "a resume never exceeds max_parallel")
   eq(#env4.calls >= 2, true, "the drain starts the other task once the slot frees")
+
+  -- A parked retry disarms the automatic retry that was still armed ---------
+  --
+  -- A transient failure arms a deferred automatic retry. A human retry then
+  -- parks the task as `failed` + `slot_wait` while another task holds the only
+  -- slot. The delayed job must not walk the task to `running` and spawn it
+  -- itself: that is the exact `max_parallel` bypass this task fixes, and it
+  -- would also leave a running task still claiming the wait.
+  reset()
+  local env5 = new_env()
+  env5.defer = {}
+  env5.fail_calls = 1
+  local rt5 = build(env5)
+  local I = "T-20261122-0009"
+  local J = "T-20261122-0010"
+  create_failed(I, "echec transitoire")
+
+  local retried5 = rt5.retry({ id = I }, { session = "S1" })
+  eq(retried5 and retried5.ok, true, "the first retry is accepted")
+  pump_calls(env5, 1)
+  eq(#env5.calls, 1, "the retried task ran once and failed transiently")
+  local failed_once = state.load(root).tasks[I]
+  eq(failed_once.status, "failed", "the transient failure leaves the task failed")
+  eq(#env5.defer, 1, "the transient failure arms one deferred automatic retry")
+  eq(env5.defer[1].ms > 0, true, "the automatic retry waits for its backoff")
+  eq(env5.defer[1].fn ~= nil, true, "the backoff job is held for the test to fire")
+
+  -- Another task now occupies the only slot.
+  create_running(J, "occupe le seul slot")
+
+  -- The human retry parks the failed task: its status stays `failed`, so the
+  -- delayed job's status-only guard would let it through.
+  local parked = rt5.retry({ id = I }, { session = "S1" })
+  eq(parked and parked.ok, true, "the human retry is accepted")
+  eq(parked and parked.waiting, true, "the human retry waits for the slot")
+  local parked_task = state.load(root).tasks[I]
+  eq(parked_task.status, "failed", "the parked task keeps its original status")
+  eq(parked_task.slot_wait, true, "the parked task carries the persisted wait")
+
+  -- Fire the armed automatic retry: it must stand down. The timer only enqueues
+  -- the job; the drain the enqueue arms is what would run it, so pump it.
+  env5.defer[1].fn()
+  pump_all(env5)
+  eq(#env5.calls, 1, "the delayed automatic retry opens no implementer turn")
+  local after_job = state.load(root).tasks[I]
+  eq(after_job.status, "failed", "the delayed automatic retry does not move the task to running")
+  eq(after_job.slot_wait, true, "the delayed automatic retry does not clear the wait")
+  eq(after_job.failure_reason, parked_task.failure_reason,
+    "the delayed automatic retry does not rewrite the failure reason")
+
+  -- The slot frees: the drain dispatches the parked task exactly once and the
+  -- dispatch clears both wait fields in the same transition.
+  state.transition(root, J, "abandoned", { reason = "termine" })
+  rt5.resume()
+  pump_all(env5)
+  eq(#env5.calls, 2, "the parked task starts exactly once when the slot frees")
+  eq(env5.calls[2], I, "the task that starts is the parked one")
+  eq(env5.peak <= 1, true, "the parked retry never exceeds max_parallel")
+  local dispatched5 = state.load(root).tasks[I]
+  eq(dispatched5.slot_wait, nil, "the dispatch clears slot_wait")
+  eq(dispatched5.slot_wait_since, nil, "the dispatch clears slot_wait_since")
 end

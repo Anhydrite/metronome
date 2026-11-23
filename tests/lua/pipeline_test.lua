@@ -371,6 +371,38 @@ return function()
   eq(reviewing_after.slot_wait, nil, "the dispatch clears its slot wait")
   eq(reviewing_after.slot_wait_since, nil, "the dispatch clears its wait timestamp")
 
+  -- An in-flight task that once waited is not dispatched a second time ------
+  --
+  -- A late review verdict or a delayed automatic retry moves a parked task to
+  -- `running`. The move clears the wait in the same transition, so the tick sees
+  -- an in-flight task, not a candidate: without it, `running -> running` is a
+  -- legal no-op and the same worktree would be spawned twice, invisible to
+  -- `max_parallel` because `M.slots` does not count a slot_wait task.
+  local dup_root = tmp_root("pipeline-slot-dup")
+  state.create(dup_root, {
+    id = "T-20261122-d001", title = "parked then moved", status = "reviewing",
+    files = { "src/d1" }, slot_wait = true, slot_wait_since = "2026-11-22T22:00:02Z",
+  })
+  -- The same legal path a late verdict takes: reviewing -> changes_requested ->
+  -- running.
+  state.transition(dup_root, "T-20261122-d001", "changes_requested", { phase = "review" })
+  state.transition(dup_root, "T-20261122-d001", "running", { phase = "implement" })
+  eq(state.load(dup_root).tasks["T-20261122-d001"].slot_wait, nil,
+    "the move to running clears the wait")
+  local dup_dispatched = {}
+  local dup_tick = pipeline.run({
+    state = state,
+    root = dup_root,
+    max_parallel = 1,
+    stall = false,
+    dispatch = function(t)
+      dup_dispatched[#dup_dispatched + 1] = t.id
+    end,
+  })
+  eq(dup_tick.ok, true, "a tick over the in-flight task succeeds")
+  eq(#dup_tick.started, 0, "an in-flight task is not a dispatch candidate")
+  eq(#dup_dispatched, 0, "the in-flight task is never dispatched a second time")
+
   -- Integration: dependency in the state -----------------------------------
 
   local dep_root = tmp_root("pipeline-dep")

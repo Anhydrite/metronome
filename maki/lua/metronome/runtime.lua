@@ -2601,9 +2601,24 @@ function M.new(deps)
           .. " skipped: the task is no longer failed")
         return nil
       end
+      -- A human retry parks a task as `failed` + `slot_wait` while the drain
+      -- waits for a slot, so the status guard alone would let this delayed job
+      -- through: it would move the task to `running` and spawn it directly,
+      -- past `max_parallel`, while another task still holds the slot. The
+      -- persisted wait means the drain owns the dispatch: this job must stand
+      -- down, not race it.
+      if current and current.slot_wait then
+        log(paths, "automatic retry of " .. tostring(task_id)
+          .. " skipped: the task is parked waiting for a free slot")
+        return nil
+      end
       -- The legal `failed -> running` edge is the resume: it also settles the
-      -- attempt deadline so the next failure counts from this attempt.
-      local moved, merr = deps.state.transition(paths.root, task_id, "running", { phase = phase })
+      -- attempt deadline so the next failure counts from this attempt. The
+      -- dispatch also clears any residual wait atomically with the move.
+      local moved, merr = deps.state.transition(paths.root, task_id, "running", {
+        phase = phase,
+        fields = { slot_wait = false },
+      })
       if not moved then
         log(paths, "automatic retry of " .. tostring(task_id) .. " refused: " .. tostring(merr))
         return nil

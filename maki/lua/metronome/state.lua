@@ -21,6 +21,18 @@ local TERMINAL = {
   abandoned = true,
 }
 
+-- The statuses that mean a task holds a scheduling slot. They are the ones
+-- `pipeline.slots` counts and `pick` refuses to overbook. A task that moves into
+-- one of them is in flight, so it can never still claim to be parked: the wait
+-- fields are cleared in the same append as the status move.
+local ACTIVE = {
+  running = true,
+  verifying = true,
+  reviewing = true,
+  merging = true,
+  deploying = true,
+}
+
 -- Legal transitions. Anything else is a bug in the caller, so it raises rather
 -- than silently corrupting the journal.
 --
@@ -652,11 +664,27 @@ function M.transition(root, task_id, to, extra)
   -- A caller may clear or patch fields in the same append as the status move:
   -- the dispatch of a slot-waiting task clears `slot_wait` atomically with
   -- `running`, so a reader never sees a running task still claiming the wait.
-  if type(extra.fields) == "table" then
+  --
+  -- Moving into an active status implies the same clearing, whether or not the
+  -- caller remembered it: a task that holds a slot is by definition not parked.
+  -- Without this invariant a late review verdict, an automatic retry or any
+  -- other transition to `running` would leave `slot_wait` on an in-flight task,
+  -- and the next tick would see it as a candidate and dispatch the same
+  -- worktree a second time, invisible to `max_parallel`.
+  local fields = type(extra.fields) == "table" and extra.fields or nil
+  if ACTIVE[to] and not (fields and fields.slot_wait ~= nil) then
+    local merged = {}
+    for key, value in pairs(fields or {}) do
+      merged[key] = value
+    end
+    merged.slot_wait = false
+    fields = merged
+  end
+  if fields then
     events[#events + 1] = {
       kind = "field",
       task_id = task_id,
-      fields = extra.fields,
+      fields = fields,
     }
   end
 

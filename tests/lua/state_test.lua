@@ -582,6 +582,31 @@ return function()
     "clearing the wait drops slot_wait_since too")
   eq(cleared_slot and cleared_slot.status, "reviewing", "clearing the wait keeps the status")
 
+  -- A move into an active status is a dispatch by definition: the wait is
+  -- cleared in the same append, even when the caller forgot to ask for it. A
+  -- late review verdict or an automatic retry transitions a parked task to
+  -- `running`; without this invariant the flag would linger on an in-flight
+  -- task and the next tick would dispatch the same worktree twice.
+  state.set_fields(slot_root, "T-20261122-w001", {
+    slot_wait = true,
+    slot_wait_since = "2026-11-22T22:00:02Z",
+  })
+  state.transition(slot_root, "T-20261122-w001", "changes_requested", { phase = "review" })
+  local moved_passive = state.load(slot_root).tasks["T-20261122-w001"]
+  eq(moved_passive and moved_passive.slot_wait, true,
+    "a move to a non-active status keeps the wait")
+  local moved_active = state.transition(slot_root, "T-20261122-w001", "running", {
+    phase = "implement",
+  })
+  eq(moved_active and moved_active.slot_wait, nil,
+    "a transition to an active status clears slot_wait without being asked")
+  eq(moved_active and moved_active.slot_wait_since, nil,
+    "a transition to an active status clears slot_wait_since too")
+  maki.fs.rm(state.paths(slot_root).projection)
+  local replayed_active = state.load(slot_root).tasks["T-20261122-w001"]
+  eq(replayed_active and replayed_active.slot_wait, nil,
+    "the cleared wait stays cleared after a replay")
+
   local qualify = load_module("qualify")
   local validate_tmp = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "state-validate")
   local wait_schema, wait_schema_err = qualify.validate_projection(replayed_slot, {
