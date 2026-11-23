@@ -1099,9 +1099,9 @@ function M.list_branches(repo, remote, opts)
   return names
 end
 
--- Close a pull request without merging it. A failed, stopped or abandoned task
--- must not leave an open PR nobody will ever merge, nor a branch nobody will
--- look at.
+-- Close a pull request without merging it. This is only for a task a human has
+-- explicitly abandoned or deleted: a failed task is retryable by construction,
+-- so it keeps its open PR (and its review threads) for the retry to update.
 function M.pr_close(ref, opts)
   opts = type(opts) == "table" and opts or {}
   if ref == nil or tostring(ref) == "" then
@@ -1217,6 +1217,11 @@ function M.pr_attach(state, root, task_id, pr)
 end
 
 -- The whole step: open the PR, record it on the task, then move the task.
+--
+-- When the task already carries an open PR, that PR is confirmed with GitHub
+-- and reused as is -- same number, same url, same review threads -- and simply
+-- re-recorded, so a retry of a failed task updates the preserved PR instead of
+-- replacing it.
 --
 -- The PR is stored before the move so a refused transition still leaves the
 -- work visible: the caller can retry the move without opening a second PR.
