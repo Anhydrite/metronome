@@ -1975,7 +1975,7 @@ local function case_prune(env)
       load = function()
         return { tasks = {
           LIVE = { id = "LIVE", status = "running", branch = "metronome/live" },
-          DEAD = { id = "DEAD", status = "failed", branch = "metronome/dead" },
+          FAILED = { id = "FAILED", status = "failed", branch = "metronome/failed" },
         } }
       end,
     },
@@ -1984,13 +1984,13 @@ local function case_prune(env)
         prune_repo = opts and opts.repo
         return {
           { number = 10, head = "metronome/live", url = "u", title = "live" },
-          { number = 11, head = "metronome/dead", url = "u", title = "dead" },
+          { number = 11, head = "metronome/failed", url = "u", title = "failed" },
           { number = 12, head = "someone/else", url = "u", title = "not ours" },
         }
       end,
       list_branches = function(_, _, opts)
         eq(opts and opts.pattern, "metronome/*", "prune lists only task branches")
-        return { "metronome/live", "metronome/dead", "metronome/orphan" }
+        return { "metronome/live", "metronome/failed", "metronome/orphan" }
       end,
       pr_close = function(ref)
         prune_closed[#prune_closed + 1] = ref
@@ -2016,16 +2016,28 @@ local function case_prune(env)
   eq(pruned and pruned.ok, true, "prune succeeds")
   eq(prune_repo, "/tmp/repo",
     "git runs on the project repo from the config, not the plugin checkout")
-  eq(#pruned.closed, 1, "prune closes the PR of a dead task")
-  eq(pruned.closed[1] and pruned.closed[1].number, 11, "the dead task's PR is the one closed")
-  eq(#pruned.kept, 1, "prune keeps the PR of a live task")
-  eq(pruned.kept[1] and pruned.kept[1].task, "LIVE", "the live task keeps its PR")
-  has(table.concat(pruned.deleted, ","), "metronome/dead", "the dead PR's branch is deleted")
-  has(table.concat(pruned.deleted, ","), "metronome/orphan", "a branch with no task is deleted")
-  eq(table.concat(pruned.deleted, ","):find("metronome/live", 1, true), nil,
+  eq(#pruned.closed, 0, "prune never closes a failed or live task's PR")
+  local kept_failed = nil
+  for _, entry in ipairs(pruned.kept or {}) do
+    if entry.task == "FAILED" then kept_failed = entry end
+  end
+  eq(type(kept_failed), "table", "a failed task is kept")
+  eq(kept_failed and kept_failed.reason, "failed (retryable)",
+    "a failed task is kept because it is retryable")
+  eq(kept_failed and kept_failed.number, 11, "the failed task keeps its open PR")
+  local deleted_branches = {}
+  for _, entry in ipairs(pruned.deleted or {}) do
+    deleted_branches[#deleted_branches + 1] = entry.branch
+  end
+  has(table.concat(deleted_branches, ","), "metronome/orphan", "a branch with no task is deleted")
+  eq(table.concat(deleted_branches, ","):find("metronome/failed", 1, true), nil,
+    "a failed task's branch is kept")
+  eq(table.concat(deleted_branches, ","):find("metronome/live", 1, true), nil,
     "a live task's branch is kept")
+  eq(table.concat(prune_closed, ","):find("11", 1, true), nil,
+    "the failed task's PR is never closed")
 
-  -- Stop and abandon prune the dead task's GitHub debris automatically ------
+  -- Stop and abandon prune the explicitly abandoned task's GitHub debris -----
   local auto_tasks = {
     STOPME = { id = "STOPME", status = "running", branch = "metronome/stopme" },
     ABANDONME = { id = "ABANDONME", status = "failed", branch = "metronome/abandonme" },
@@ -2065,6 +2077,10 @@ local function case_prune(env)
   eq(stopped.prune and stopped.prune.ok, true, "stop prunes automatically")
   has(table.concat(auto_closed, ","), "21", "stop closes the orphan PR")
   has(table.concat(auto_deleted, ","), "metronome/stopme", "stop deletes the dead branch")
+  local stop_deleted = stopped.prune and stopped.prune.deleted and stopped.prune.deleted[1] or nil
+  eq(type(stop_deleted), "table", "the stop prune reports structured deletions")
+  eq(stop_deleted and stop_deleted.reason, "abandoned",
+    "the stop prune names the task abandoned, not dead")
 
   local abandoned = rt12.abandon({ id = "ABANDONME" })
   eq(abandoned.ok, true, "abandon succeeds")
@@ -3290,7 +3306,7 @@ local function case_failure_policy(env)
     checkpoints = { "c1", "c2" },
     pr = { number = 3, url = "u", state = "open" },
   }
-  local transient_impl = 0
+  local transient_meta = { impl = 0, closed = 0, deleted = 0 }
   local transient_tick_opts = nil
   local transient_deps = {
     config = {
@@ -3310,7 +3326,7 @@ local function case_failure_policy(env)
     state = mem_state(transient_record),
     implement = {
       run = function()
-        transient_impl = transient_impl + 1
+        transient_meta.impl = transient_meta.impl + 1
         return { ok = false, error = "fatal: unable to access 'https://github.com/x/y': could not resolve host: github.com" }
       end,
       read_sheet = function() return {} end,
@@ -3320,7 +3336,14 @@ local function case_failure_policy(env)
     review = { review = function() return { ok = true, approved = true } end },
     git = {
       pr_open = function() return { number = 1, url = "u", state = "open" } end,
-      pr_close = function() error("a retryable failure must not close the PR") end,
+      pr_close = function()
+        transient_meta.closed = transient_meta.closed + 1
+        return { closed = true }
+      end,
+      delete_branch = function()
+        transient_meta.deleted = transient_meta.deleted + 1
+        return { ok = true }
+      end,
     },
     merge = { run = function() return { ok = true } end },
     deploy = { run = function() return { ok = true } end },
@@ -3354,7 +3377,7 @@ local function case_failure_policy(env)
   local rt_transient = runtime.new(transient_deps)
   rt_transient.submit({ intention = "x", fast = false }, { session = "S1" })
   rt_transient.run_pending()
-  eq(transient_impl, 1, "the failing task ran once")
+  eq(transient_meta.impl, 1, "the failing task ran once")
   eq(transient_record.status, "failed", "the failure is persisted on the task")
   eq(type(transient_record.failure), "table", "the failure is a typed record, not a string")
   eq(transient_record.failure and transient_record.failure.cause, "network",
@@ -3370,6 +3393,9 @@ local function case_failure_policy(env)
   eq(transient_record.run_dir, "/tmp/runs/T1", "the failure keeps the run directory")
   eq(#(transient_record.checkpoints or {}), 2, "the failure keeps the checkpoints")
   eq(transient_record.pr and transient_record.pr.state, "open", "the failure leaves the PR open")
+  eq(transient_record.branch, "metronome/t1", "the failure keeps the branch for metronome_retry")
+  eq(transient_meta.closed, 0, "the failure never closes the PR: metronome_retry resumes from it")
+  eq(transient_meta.deleted, 0, "the failure never deletes the branch: metronome_retry resumes from it")
   has(tostring(transient_record.failure_reason), "network",
     "the persisted reason names the cause")
   eq(transient_tick_opts and transient_tick_opts.max_attempts, 0,
@@ -3392,7 +3418,7 @@ local function case_failure_policy(env)
   -- exhausts the budget, which is the only thing that escalates.
   deferred[1].fn()
   rt_transient.run_pending()
-  eq(transient_impl, 2, "the automatic retry re-dispatches the task")
+  eq(transient_meta.impl, 2, "the automatic retry re-dispatches the task")
   eq(#notified, 1, "the exhausted budget escalates exactly once")
   has(tostring(notified[1]), "network", "the escalation names the cause")
   has(tostring(notified[1]), "check the network", "the escalation names the remedy")

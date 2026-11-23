@@ -70,7 +70,7 @@ function M.definitions()
     },
     {
       name = "metronome_retry",
-      description = "Restart a failed, stalled or abandoned task from its last stable phase.",
+      description = "Restart a failed, stalled or abandoned task from its last stable phase. The worktree, branch, checkpoints and transcript are kept, and an open PR is reused instead of being closed and recreated.",
       permission = "run",
       schema = {
         type = "object",
@@ -85,7 +85,7 @@ function M.definitions()
     },
     {
       name = "metronome_abandon",
-      description = "Archive a task, then prune orphan pull requests and branches.",
+      description = "Archive a task, then prune its pull request and branches: abandoning a task is what authorizes prune to clean its work.",
       permission = "run",
       schema = {
         type = "object",
@@ -100,13 +100,13 @@ function M.definitions()
     },
     {
       name = "metronome_prune",
-      description = "Reconcile GitHub with the journal: close open pull requests and delete remote branches whose task is failed, abandoned or gone. Reports what it closed, deleted and kept.",
+      description = "Reconcile GitHub with the journal. It cleans only tasks that were explicitly abandoned (metronome_abandon / metronome_stop / metronome_delete) or that are gone from the journal, and only those: every non-terminal task (running, verifying, reviewing, merging, ready, qualifying, failed, stalled) is preserved whole — remote branch, open PR and checkpoints. A failed task is retryable by construction, so its PR stays open and metronome_retry reuses it. The report names the reason per task: kept (failed, retryable), kept (in progress), deleted (abandoned) or deleted (gone), with the matching closed (reason) entries for PRs.",
       permission = "run",
       schema = { type = "object", properties = {} },
     },
     {
       name = "metronome_stop",
-      description = "Stop an in-flight task: cancel its session and park it as abandoned with a reason. The task can be restarted with metronome_retry. Orphan pull requests and branches are pruned automatically.",
+      description = "Stop an in-flight task: cancel its session and park it as abandoned with a reason. The task can be restarted with metronome_retry. Its pull request and branches are pruned automatically, because stop is an explicit abandonment.",
       permission = "run",
       schema = {
         type = "object",
@@ -121,7 +121,7 @@ function M.definitions()
     },
     {
       name = "metronome_delete",
-      description = "Remove a task from the panel and status. A snapshot is kept in the archive; the journal keeps the history.",
+      description = "Remove a task from the panel and status, then clean up its open PR and branches in the background: a deleted task is gone from the journal, which is the other cleanup trigger. A snapshot is kept in the archive; the journal keeps the history.",
       permission = "run",
       schema = {
         type = "object",

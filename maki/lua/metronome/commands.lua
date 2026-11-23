@@ -112,7 +112,7 @@ M.COMMANDS = {
   },
   {
     name = "retry",
-    description = "Restart a failed task from its last stable phase.",
+    description = "Restart a failed task from its last stable phase; the kept branch and open PR are reused.",
     usage = "/metronome retry <id>",
     build = function(rest)
       return need_id(rest, "retry")
@@ -120,7 +120,7 @@ M.COMMANDS = {
   },
   {
     name = "abandon",
-    description = "Archive a task, then prune orphan PRs and branches.",
+    description = "Archive a task, then prune its PR and branches; explicit abandonment is the only cleanup trigger.",
     usage = "/metronome abandon <id>",
     build = function(rest)
       return need_id(rest, "abandon")
@@ -128,7 +128,7 @@ M.COMMANDS = {
   },
   {
     name = "prune",
-    description = "Close open PRs and delete branches whose task is no longer alive.",
+    description = "Reconcile GitHub with the journal. Clean only explicitly abandoned tasks or tasks gone from the journal; every non-terminal task, including failed and stalled, is preserved whole with its branch, open PR and checkpoints, so metronome_retry resumes it and reuses its PR. The report names the reason per task: kept (failed, retryable), deleted (abandoned), deleted (gone).",
     usage = "/metronome prune",
     build = function(rest)
       return {}
@@ -136,7 +136,7 @@ M.COMMANDS = {
   },
   {
     name = "stop",
-    description = "Stop an in-flight task: cancel its session and park it as abandoned, then prune orphan PRs and branches.",
+    description = "Stop an in-flight task: cancel its session and park it as abandoned, then prune its PR and branches.",
     usage = "/metronome stop <id>",
     build = function(rest)
       return need_id(rest, "stop")
@@ -144,7 +144,7 @@ M.COMMANDS = {
   },
   {
     name = "delete",
-    description = "Remove a task from the panel and status; a snapshot is kept in the archive.",
+    description = "Remove a task from the panel and status; its PR and branches are cleaned up in the background, since a deleted task is gone from the journal. A snapshot is kept in the archive.",
     usage = "/metronome delete <id>",
     build = function(rest)
       return need_id(rest, "delete")
