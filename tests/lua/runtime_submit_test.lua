@@ -3555,7 +3555,9 @@ local function case_failure_policy(env)
     deploy = transient_deps.deploy,
     pipeline = {
       tick = function(opts)
-        if held_record.status == "ready" then
+        if held_record.slot_wait or held_record.status == "ready" then
+          held_record.slot_wait = nil
+          held_record.status = "running"
           opts.dispatch({ id = "T1" })
         end
         return { ok = true, started = {} }
@@ -3625,10 +3627,10 @@ local function case_failure_policy(env)
   -- The resume path applies the same guard: a `/reload` walks the interrupted
   -- reviewing task back to running and re-dispatches it; a second invalid
   -- review holds it again instead of destroying it.
-  held_deps.pipeline.resume = function(_, _, ropts)
-    held_state.transition(nil, "T1", "running", { phase = "review" })
-    ropts.dispatch({ id = "T1" })
-    return { ok = true, resumed = { "T1" }, errors = {} }
+  held_deps.pipeline.resume = function()
+    -- The runtime parks the selected entry with `slot_wait` and lets the drain
+    -- dispatch it; the fake hands back the entry shaped like the scheduler's.
+    return { ok = true, resumed = { { id = "T1", from = "reviewing" } }, errors = {} }
   end
   local held_resume = rt_held.resume({})
   eq(held_resume and held_resume.ok, true, "the resume accepts a reviewing task")

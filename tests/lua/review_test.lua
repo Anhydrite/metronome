@@ -505,6 +505,9 @@ return function()
   has(raise_result.error, "boom", "a raising runner explains itself")
   eq(state.load(root).tasks[id_raise].review, nil, "a raising runner stores no review")
 
+  -- Keep the malformed-answer cases in their own scope: the enclosing case is
+  -- long, and Lua 5.1 caps a function at 200 active locals.
+  do
   -- A malformed first answer is replayed once with the exact defect in the
   -- prompt. The same SHA and round are kept, so the second answer is stored as
   -- the round's only review.
@@ -580,6 +583,8 @@ return function()
   local fb_dir = maki.fs.joinpath(run_state_root, "runs", id_fb, "review", "1")
   eq(maki.fs.read(maki.fs.joinpath(fb_dir, "review-raw-1.txt")), "fallback invalid answer",
     "a missing run_dir falls back to state_root")
+
+  end
 
   -- review: no runner --------------------------------------------------------
 
@@ -912,6 +917,9 @@ return function()
   eq(after_loop.review and after_loop.review.commit_sha, git.head_sha(wt_loop),
     "the loop stores the fixed sha")
 
+  -- Keep the tail of this long case in its own scope so the function stays
+  -- under the Lua 5.1 limit of 200 active locals.
+  do
   -- loop: a fix that does nothing escalates --------------------------------
 
   local wt_noop, id_noop = seed_worktree({ ["src/noop.lua"] = "return 13\n" })
@@ -981,4 +989,5 @@ return function()
 
   -- The base directory is deliberately kept: tests/run-lua.sh validates the
   -- journal this test wrote.
+  end
 end
