@@ -9,9 +9,9 @@ return function()
   local analyze = load_module("analyze")
   local state = load_module("state")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "analyze")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree.
+  local base = test_dir("analyze")
 
   local root = maki.fs.joinpath(base, "state")
 

@@ -13,9 +13,9 @@ return function()
   local git = load_module("git")
   local fence = load_module("fence")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "deploy")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree.
+  local base = test_dir("deploy")
 
   local repo = maki.fs.joinpath(base, "repo")
   local root = maki.fs.joinpath(base, "state")

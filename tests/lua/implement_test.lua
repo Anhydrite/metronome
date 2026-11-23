@@ -20,9 +20,9 @@ return function()
   eq(implement.assert_task_branch("master", "main"), nil, "master is refused too")
   eq(implement.assert_task_branch(nil, "main"), nil, "a missing branch is refused")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "implement")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree.
+  local base = test_dir("implement")
 
   local remote = maki.fs.joinpath(base, "remote.git")
   local repo = maki.fs.joinpath(base, "repo")
