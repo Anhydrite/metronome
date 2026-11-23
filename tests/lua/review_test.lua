@@ -527,6 +527,43 @@ return function()
   has(esc_note, "escalated", "the escalation leaves a note")
   has(esc_note, "3 rounds", "the note names the round count")
 
+  -- The failed transition itself must carry a reason: a mute `failed` is what
+  -- made T-20261122-0043 unreadable, because recover could only synthesize an
+  -- empty "no error details" from it. The reason names the task, the phase,
+  -- the escalation and the round count, and it is what `failure_reason`
+  -- persists — the runtime adopts it verbatim instead of writing a second
+  -- transition.
+  local esc_expected_note = "review escalated after 3 rounds: human review required"
+  local esc_reason = after_esc.failure_reason
+  eq(type(esc_reason), "string", "the escalation persists a failure reason")
+  has(esc_reason or "", id_esc, "the escalation reason names the task")
+  has(esc_reason or "", "phase review", "the escalation reason names the phase")
+  has(esc_reason or "", "review escalated after 3 rounds", "the escalation reason names the escalation")
+  has(esc_reason or "", "(see note)", "the escalation reason points at the journaled note")
+
+  -- The journal, not only the projection: one `status failed` event for this
+  -- task, carrying the same reason, and it comes after the note so the note
+  -- survives a refused transition.
+  local esc_journal = maki.fs.read(state.paths(root).journal) or ""
+  local index, note_at, failed_at, journal_reason = 0, nil, nil, nil
+  for line in (esc_journal .. "\n"):gmatch("([^\n]*)\n") do
+    local event = state.parse_line(line)
+    if event and event.task_id == id_esc then
+      index = index + 1
+      if event.kind == "note" and event.text == esc_expected_note then
+        note_at = note_at or index
+      elseif event.kind == "status" and event.status == "failed" then
+        failed_at = index
+        journal_reason = event.reason
+      end
+    end
+  end
+  eq(type(journal_reason), "string", "the failed transition carries a reason")
+  eq(journal_reason, esc_reason, "the journal reason is the persisted failure_reason")
+  eq(type(note_at), "number", "the escalation note is in the journal")
+  eq(note_at < failed_at, true, "the note is written before the failed transition")
+  has(esc_note, esc_expected_note, "the note keeps its exact text")
+
   -- review: a verdict that arrives after the task left reviewing --------------
   --
   -- The same review round can be applied twice: another driver moved the task
