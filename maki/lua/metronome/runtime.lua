@@ -2455,8 +2455,24 @@ function M.new(deps)
     local already_failed = type(now) == "table" and now.status == "failed"
     local reason
     if already_failed then
-      reason = is_non_empty(now.failure_reason) and now.failure_reason
-        or describe_failure(failure, decision)
+      -- The typed diagnosis is persisted in both branches: it does not move the
+      -- task, and a module-initiated failure that writes neither a reason nor a
+      -- failure record would otherwise leave `task.failure` missing, which is
+      -- what the panel and a resume (`state.failure_of`) read.
+      if is_non_empty(now.failure_reason) then
+        reason = now.failure_reason
+        pcall(deps.state.set_fields, paths.root, task_id, { failure = failure })
+      else
+        -- The module wrote the transition without a reason (`review.escalate`
+        -- and `merge` both do). The journal event stays as the module wrote it,
+        -- but persist the synthesized reason beside it so the projection, the
+        -- log and the panel agree instead of showing a mute `failed`.
+        reason = describe_failure(failure, decision)
+        pcall(deps.state.set_fields, paths.root, task_id, {
+          failure = failure,
+          failure_reason = reason,
+        })
+      end
     else
       reason = describe_failure(failure, decision)
       pcall(deps.state.set_fields, paths.root, task_id, { failure = failure })

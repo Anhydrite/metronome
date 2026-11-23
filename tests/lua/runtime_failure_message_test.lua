@@ -79,6 +79,9 @@ return function()
       for key, value in pairs(fields or {}) do
         task[key] = value
       end
+      -- The real journal writes a `field` event; keep it so a case can find the
+      -- reason persisted beside a module-written `status failed` event.
+      api.events[#api.events + 1] = { kind = "field", task_id = id, fields = fields }
       return task
     end
     api.append = function(_, event)
@@ -136,12 +139,31 @@ return function()
     return table.concat(parts, "\n")
   end
 
+  -- The reason the journal carries for the turn's failure. A runtime-written
+  -- `status failed` event carries it inline; a module-written one has none, and
+  -- the runtime persists it in a `field` event right beside it, exactly as the
+  -- real state module does (which is how `failure_reason` is rebuilt).
+  local function journal_reason(env)
+    local found = nil
+    for _, event in ipairs(env.state.events) do
+      if event.kind == "status" and event.status == "failed"
+        and type(event.reason) == "string" and event.reason ~= "" then
+        found = event.reason
+      elseif event.kind == "field" and type(event.fields) == "table"
+        and type(event.fields.failure_reason) == "string"
+        and event.fields.failure_reason ~= "" then
+        found = event.fields.failure_reason
+      end
+    end
+    return found
+  end
+
   -- The journal reason, the runtime.log reason and the projection's
   -- failure_reason must be one and the same string.
   local function assert_same_reason(env, tasks, label)
     local events = failed_events(env)
     eq(#events, 1, label .. ": exactly one `status failed` event is journaled")
-    local journaled = events[1] and events[1].reason or nil
+    local journaled = journal_reason(env)
     local logged = log_reason("T1")
     eq(type(journaled), "string", label .. ": the journaled failure carries a reason")
     eq(logged, journaled, label .. ": the runtime.log line carries the journal reason")
@@ -262,7 +284,7 @@ return function()
     return rt, rt.last_background
   end
 
-  -- (a) An escalated review without `error` names the escalation and its rounds
+  -- (a) An escalated review names the escalation and its rounds, end to end
   do
     local tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } }
     local env = {
@@ -270,6 +292,9 @@ return function()
       pipeline = { tick = tick_dispatching({ "T1" }) },
       review = {
         review = function()
+          -- `run_task` turns this verdict into `error = "review escalated after
+          -- 3 round(s)"` before the failure policy runs, so this case pins the
+          -- user-visible outcome; the synthesis branch itself is covered by (a2).
           return { ok = false, escalated = true, round = 3, approved = false }
         end,
       },
@@ -284,6 +309,31 @@ return function()
       "the review escalation reason is not the generic text")
     eq(log_text():find("no error details", 1, true), nil,
       "the runtime.log of the review escalation carries no generic text")
+  end
+
+  -- (a2) A result carrying only `escalated`/`round` reaches the synthesis path
+  do
+    local tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } }
+    local env = {
+      state = fake_state(tasks),
+      pipeline = { tick = tick_dispatching({ "T1" }) },
+      -- No `error`, no `reason`: `run_and_handle` hands the result table itself
+      -- to the failure policy, which is exactly where `synthesize_failure` has
+      -- to name the escalation instead of `tostring(result)`.
+      implement_run = function()
+        return { ok = false, escalated = true, round = 3 }
+      end,
+    }
+    local _, drain = drive(env)
+    local result = type(drain) == "table" and drain or {}
+    eq(result.ok, false, "a bare escalation fails the task")
+    local reason = assert_same_reason(env, tasks, "bare escalation")
+    has(reason, "review escalated after 3 round(s)",
+      "the synthesized reason names the escalation and its rounds")
+    eq(reason:find("table: ", 1, true), nil,
+      "the reason is not a stringified table")
+    eq(reason:find("no error details", 1, true), nil,
+      "the synthesized escalation reason is not the generic text")
   end
 
   -- (b) A conflict without `error` names the files, the base and the command
@@ -338,7 +388,7 @@ return function()
       "the defect is visible to a reader")
   end
 
-  -- (d) A module that already wrote `failed` owns the transition and the reason
+  -- (d) A module that already wrote `failed` with a reason owns that reason
   do
     local escalated_reason = "review escalated after 3 rounds: human review required"
     local tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } }
@@ -348,8 +398,8 @@ return function()
     }
     env.review = {
       review = function()
-        -- The review module writes the one `failed` transition of the turn,
-        -- exactly like `review.escalate` does, then reports the escalation.
+        -- The review module writes the one `failed` transition of the turn and
+        -- persists its own reason, then reports the escalation.
         env.state.transition(paths.root, "T1", "failed", {
           reason = escalated_reason,
           phase = "review",
@@ -363,6 +413,40 @@ return function()
     local reason = assert_same_reason(env, tasks, "single failed transition")
     eq(reason, escalated_reason,
       "the runtime adopts the reason the review module already persisted")
+    local failed_count = 0
+    for _, move in ipairs(env.state.transitions) do
+      if move.status == "failed" then
+        failed_count = failed_count + 1
+      end
+    end
+    eq(failed_count, 1, "the runtime writes no second `failed` transition")
+  end
+
+  -- (d2) A module that wrote `failed` WITHOUT a reason — the real
+  -- `review.escalate` and `merge` do exactly that — still gets one persisted
+  do
+    local tasks = { T1 = { id = "T1", status = "ready", title = "t", checks = { "true" } } }
+    local env = {
+      state = fake_state(tasks),
+      pipeline = { tick = tick_dispatching({ "T1" }) },
+    }
+    env.review = {
+      review = function()
+        -- Mirror `review.escalate`: the transition carries only a phase.
+        env.state.transition(paths.root, "T1", "failed", { phase = "review" })
+        return { ok = false, escalated = true, round = 3 }
+      end,
+    }
+    local _, drain = drive(env)
+    local result = type(drain) == "table" and drain or {}
+    eq(result.ok, false, "an escalated review fails the task")
+    local reason = assert_same_reason(env, tasks, "reasonless module transition")
+    has(reason, "review escalated", "the synthesized reason names the escalation")
+    has(reason, "3", "the synthesized reason names the number of rounds")
+    eq(reason:find("no error details", 1, true), nil,
+      "the synthesized reason is not the generic text")
+    eq(type(tasks.T1.failure), "table",
+      "the typed failure record is persisted even when the module already failed the task")
     local failed_count = 0
     for _, move in ipairs(env.state.transitions) do
       if move.status == "failed" then
