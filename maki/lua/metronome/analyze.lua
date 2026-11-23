@@ -1240,7 +1240,6 @@ function M.gate(state, root, opts)
     selected_by_id[id] = task
   end
   table.sort(selected_ids)
-  end
 
   -- Everything outside the sheets that can change a finding: the known ids, the
   -- declared files' existence, and the semantic prompt's intention/repo/ref.
@@ -1373,6 +1372,68 @@ function M.gate(state, root, opts)
     return nil, report_err
   end
 
+  -- Attribution: a blocking finding blocks the selected tasks it names. One
+  -- that names none of them is unattributable and blocks the whole batch.
+  local per_task = {}
+  local unattributable = {}
+  for _, finding in ipairs(result.findings or {}) do
+    if finding.severity == "blocking" then
+      local attributed = false
+      for _, id in ipairs(string_list(finding.tasks)) do
+        if selected_by_id[id] then
+          attributed = true
+          per_task[id] = per_task[id] or {}
+          table.insert(per_task[id], finding)
+        end
+      end
+      if not attributed then
+        unattributable[#unattributable + 1] = finding
+      end
+    end
+  end
+
+  local function dedupe_order(list)
+    local seen = {}
+    local out = {}
+    for _, item in ipairs(list) do
+      if not seen[item] then
+        seen[item] = true
+        out[#out + 1] = item
+      end
+    end
+    return out
+  end
+
+  -- The marker a task carries. `rules` keeps report order (the schema says so)
+  -- and the findings are copied without their empty `tasks` list so they stay
+  -- schema-legal in the journal.
+  local function quarantine_payload(findings_list, existing)
+    local rules = {}
+    local copies = {}
+    for _, finding in ipairs(findings_list) do
+      rules[#rules + 1] = is_non_empty(finding.rule) and trim(finding.rule) or "semantic"
+      local copy = { severity = finding.severity, message = finding.message }
+      if is_non_empty(finding.rule) then
+        copy.rule = trim(finding.rule)
+      end
+      local named = string_list(finding.tasks)
+      if #named > 0 then
+        copy.tasks = named
+      end
+      copies[#copies + 1] = copy
+    end
+    local since = type(existing) == "table" and existing.since or (opts.now or now_iso())
+    return {
+      reason = "analysis_blocked",
+      rules = dedupe_order(rules),
+      findings = copies,
+      since = since,
+    }
+  end
+
+  local fresh = state.load(root)
+  local current_tasks = type(fresh) == "table" and type(fresh.tasks) == "table" and fresh.tasks or {}
+
   local ready = {}
   local quarantined = {}
   local blocked = {}
@@ -1433,7 +1494,7 @@ function M.gate(state, root, opts)
           rules = payload.rules,
           findings = payload.findings,
         }
-      elseif result.ok and current.status == "qualifying" then
+      elseif current.status == "qualifying" then
         local moved_ok, transitioned, transition_err = pcall(
           state.transition, root, id, "ready", { phase = "analyze" }
         )

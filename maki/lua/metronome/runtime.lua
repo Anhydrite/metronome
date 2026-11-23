@@ -3851,8 +3851,6 @@ function M.new(deps)
     table.sort(quarantined, function(a, b)
       return tostring(a.id) < tostring(b.id)
     end)
-    return { ok = true, tasks = tasks, events = loaded.events, quarantined = quarantined }
-
     -- A ready task the scheduler would not start is otherwise invisible in the
     -- panel: name why it waits, next to the quarantine summary.
     local waiting = {}

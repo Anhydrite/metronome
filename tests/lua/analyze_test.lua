@@ -1104,7 +1104,11 @@ return function()
   local after_demotion = state.load(gate_root)
   eq(after_demotion.tasks["T-20261114-n001"].status, "qualifying", "the unresolved ready task goes back to qualifying")
   eq(after_demotion.tasks["T-20261114-n001"].phase, "analyze", "the demotion carries the analyze phase")
-  eq(after_demotion.tasks["T-20261114-n001"].failure_reason, "unresolved dependency: T1", "the demotion names the dependency")
+  -- A demotion is a status move, not a failure: the reason is journaled on the
+  -- status event and named by the finding in analysis.json, never written into
+  -- failure_reason (a non-failure move must not invent a failure cause).
+  eq(after_demotion.tasks["T-20261114-n001"].failure_reason, nil,
+    "a demotion is not recorded as a failure")
   eq(after_demotion.tasks["T-20261114-n002"].status, "ready", "a ready task whose dependency is known stays ready")
 
   local demotion_report_text = maki.fs.read(maki.fs.joinpath(gate_root, "analysis.json"))

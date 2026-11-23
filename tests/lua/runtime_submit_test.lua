@@ -4150,6 +4150,10 @@ return function()
     repo = "/tmp/repo",
     root = status_root,
     config = maki.fs.joinpath(status_root, "config.toml"),
+    -- The status view derives the worktree it would use for a task, so the
+    -- fixture must carry the directory the real paths table always has.
+    worktrees = maki.fs.joinpath(status_root, "worktrees"),
+    runs = maki.fs.joinpath(status_root, "runs"),
   }
   local status_tasks = {
     T1 = { id = "T1", title = "ghost", status = "ready", files = { "a" },
