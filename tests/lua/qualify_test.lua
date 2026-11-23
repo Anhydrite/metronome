@@ -8,28 +8,10 @@ return function()
   local q = load_module("qualify")
   local state = load_module("state")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "qualify")
-
-  -- Remove only what we must: a previous run must not pollute this one.
-  local function wipe(path)
-    local entries = maki.fs.dir(path)
-    if entries then
-      for _, e in ipairs(entries) do
-        local name = e.name or e[1]
-        local kind = e.kind or e[2]
-        local child = maki.fs.joinpath(path, name)
-        if kind == "directory" then
-          wipe(child)
-        else
-          maki.fs.rm(child)
-        end
-      end
-    end
-    maki.fs.rm(path)
-  end
-
-  wipe(base)
-  maki.fs.mkdir(base, { parents = true })
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree. The
+  -- base itself is kept, because run-lua.sh validates the journal left in it.
+  local base = test_dir("qualify")
 
   -- A tiny repository with the traps the walker must avoid.
   local repo = maki.fs.joinpath(base, "repo")

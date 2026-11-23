@@ -15,9 +15,9 @@
 return function()
   local preflight = load_module("preflight")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "preflight-integration")
-  maki.fs.rm(base, { recursive = true })
-  maki.fs.mkdir(base, { parents = true })
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree.
+  local base = test_dir("preflight-integration")
 
   local repo = maki.fs.joinpath(base, "repo")
   local remote = maki.fs.joinpath(base, "remote.git")
