@@ -2621,6 +2621,34 @@ function M.new(deps)
           .. " skipped: the task is parked waiting for a free slot")
         return nil
       end
+      -- `max_parallel` is the only bound, and this job is a second dispatch
+      -- authority beside the drain's `tick`. Nothing above consults the cap, so
+      -- without this check a deferred retry fires while another task holds the
+      -- only slot and spawns beside it — the exact parallel-checks collision
+      -- this change removes. When no slot is free the task is parked like a
+      -- human retry (`slot_wait`, its reason, its timestamp; status and phase
+      -- untouched) and the drain — which sees `slot_wait` as a candidate and
+      -- moves the task to `running` through a legal path — dispatches it once a
+      -- slot frees. The count is read and the `failed -> running` move made in
+      -- one uninterrupted job step, so two jobs cannot both take the last slot.
+      local tasks_now = loaded and loaded.tasks or {}
+      local in_flight, cap, free = slot_counts(tasks_now, max_parallel_of(cfg), task_id)
+      if free <= 0 then
+        local reason = wait_slot_reason()
+        local marked, werr = mark_slot_wait(paths, task_id, reason)
+        if not marked then
+          log(paths, "automatic retry of " .. tostring(task_id)
+            .. " cannot be queued: " .. tostring(werr))
+          return nil
+        end
+        log(paths, string.format(
+          "task %s: automatic retry parked (%s: %d in flight, max_parallel %d)",
+          tostring(task_id), reason, in_flight, cap))
+        -- The persisted wait is the dispatch ticket: arm the drain, the single
+        -- authority that starts a parked task.
+        schedule_job(opts, paths, cfg, runner, session)
+        return nil
+      end
       -- An automatic retry calls `run_and_handle` from this scheduler job, not
       -- through `dispatch_one`, so it owns no spawn handle. Register one anyway:
       -- a mid-session resume reads `task_handles` to tell a live task from an
@@ -3324,6 +3352,19 @@ function M.new(deps)
   -- A normalised view of one task for the status tools. The raw fields are
   -- copied untouched, so an existing caller keeps reading them; the enriched
   -- fields are what the panel and the agent need to resume the task.
+  --
+  -- The two wait fields are a documented pair, not two spellings of one value:
+  --   * `slot_wait_flag` — the persisted task flag (`true` while the task is
+  --     parked, `nil` otherwise). This is the stable name for the boolean; the
+  --     raw task data is copied into the view, but `view.slot_wait` is *not* it.
+  --   * `slot_wait` — the live structured wait, `{ reason, in_flight,
+  --     max_parallel }`, or `nil` when the cap leaves the task no reason to
+  --     wait. A parked task whose slot is already free is a hand-off to the
+  --     drain: `slot_wait_flag` is still `true` but `slot_wait` is `nil`, since
+  --     reporting "0 in flight, max_parallel N" as a wait would contradict
+  --     itself. A consumer that only needs "is it parked?" must read
+  --     `slot_wait_flag`; one that wants to explain a wait reads `wait_reason`
+  --     (dependency first, then the slot) or `slot_wait.reason`.
   local function status_view(paths, task, opts, projection, max_parallel)
     local view = {}
     for key, value in pairs(task) do

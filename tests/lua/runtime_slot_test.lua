@@ -759,4 +759,61 @@ return function()
   eq(retried10 and retried10.waiting, nil,
     "a parked task does not occupy the only slot")
   eq(state.load(root).tasks[S].slot_wait, true, "the retried task is queued for the drain")
+
+  -- An automatic retry respects the cap -------------------------------------
+  --
+  -- A transient failure arms a deferred automatic retry. When it fires while
+  -- another task holds the only slot, the job must not walk the task to
+  -- `running` and spawn it inline: that is a second dispatch authority beside
+  -- the drain, and it oversubscribes `max_parallel` exactly like the human
+  -- retry used to (the four-tasks-at-once reproduction). It parks the task
+  -- with the same persisted wait and lets the drain start it once the slot
+  -- frees.
+  reset()
+  local env11 = new_env()
+  env11.defer = {}
+  env11.fail_calls = 1
+  local rt11 = build(env11)
+  local U = "T-20261122-0019"
+  local V = "T-20261122-0020"
+  create_failed(U, "echec transitoire automatique")
+
+  local seeded = rt11.retry({ id = U }, { session = "S1" })
+  eq(seeded and seeded.ok, true, "the seeding retry is accepted")
+  pump_calls(env11, 1)
+  eq(#env11.calls, 1, "the seeding run opens one implementer turn")
+  eq(state.load(root).tasks[U].status, "failed", "the transient failure leaves the task failed")
+  eq(#env11.defer, 1, "the transient failure arms one deferred automatic retry")
+
+  -- Another task holds the only slot when the automatic retry fires.
+  create_running(V, "occupe le seul slot")
+  env11.defer[1].fn()
+  pump_all(env11)
+  eq(#env11.calls, 1, "the automatic retry opens no implementer turn past the cap")
+  eq(env11.peak <= 1, true, "the automatic retry never exceeds max_parallel")
+  local parked_auto = state.load(root).tasks[U]
+  eq(parked_auto.status, "failed", "the parked automatic retry keeps its status")
+  eq(parked_auto.phase ~= nil, true, "the parked automatic retry keeps its phase")
+  eq(parked_auto.slot_wait, true, "the parked automatic retry carries the persisted wait")
+  eq(type(parked_auto.slot_wait_since), "string",
+    "the parked automatic retry carries its timestamp")
+  eq(journal_slot_wait(U) ~= nil, true, "the automatic retry's wait is journaled")
+  eq(journal_note(U, pipeline.WAIT_SLOT), true,
+    "the automatic retry's wait is journaled with the named reason")
+  local auto_view = rt11.status({ id = U })
+  has(tostring(auto_view and auto_view.task and auto_view.task.wait_reason), pipeline.WAIT_SLOT,
+    "the status names the automatic retry's slot wait")
+
+  -- The slot frees: the drain dispatches the automatic retry exactly once.
+  state.transition(root, V, "abandoned", { reason = "termine" })
+  local auto_resume = rt11.resume()
+  eq(auto_resume and auto_resume.ok, true, "the resume drains the queue")
+  pump_calls(env11, 2)
+  eq(#env11.calls, 2, "the freed slot runs the automatic retry exactly once")
+  eq(env11.calls[2], U, "the implementer turn belongs to the automatically retried task")
+  eq(env11.peak <= 1, true,
+    "the automatic retry never runs beside the task that held the slot")
+  eq(state.load(root).tasks[U].slot_wait, nil, "the dispatch clears the automatic retry's wait")
+  eq(state.load(root).tasks[U].slot_wait_since, nil,
+    "the dispatch clears the automatic retry's wait timestamp")
 end
