@@ -48,6 +48,21 @@ cat >"$TMP/valid.json" <<'JSON'
 JSON
 accept valid-task "$TMP/valid.json"
 
+# A quarantined task keeps its status and carries why it is set aside. The
+# analyzer writes this object, so the schema must accept it rather than fail a
+# task the pipeline deliberately parked.
+cat >"$TMP/quarantine.json" <<'JSON'
+{"id":"T-20261122-b4c1","title":"wire the importer","status":"qualifying","quarantine":{"reason":"analysis_blocked","rules":["missing_dependency"],"findings":[{"severity":"blocking","rule":"missing_dependency","message":"task T-20261122-b4c1 depends on an unknown task","tasks":["T-20261122-b4c1"]}],"since":"2026-11-22T11:00:00Z"}}
+JSON
+accept quarantine "$TMP/quarantine.json"
+
+# The quarantine object is closed: a key the runtime does not write inside it is
+# a typo, not an extension the panel should silently carry.
+cat >"$TMP/quarantine-extra.json" <<'JSON'
+{"id":"T-20261122-b4c1","title":"x","status":"qualifying","quarantine":{"reason":"analysis_blocked","blocked_by":"someone"}}
+JSON
+reject quarantine-extra "$TMP/quarantine-extra.json" "blocked_by"
+
 # acceptance is not a task field: the schema forbids it, and this is the exact
 # mistake the old hand-copied subset let through.
 cat >"$TMP/acceptance.json" <<'JSON'

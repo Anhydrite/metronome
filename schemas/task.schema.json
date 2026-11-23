@@ -97,6 +97,78 @@
         }
       }
     },
+    "quarantine": {
+      "type": "object",
+      "description": "Why the analyzer blocks this task, when it does. A puzzling task is set aside instead of stopping the pipeline: it keeps its status and carries this object until a clean re-analysis clears it with a quarantine_cleared event. Absent means the task is not quarantined.",
+      "additionalProperties": false,
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The named reason the panel shows, so a freeze is never silent.",
+          "examples": [
+            "analysis_blocked"
+          ]
+        },
+        "rules": {
+          "type": "array",
+          "description": "The analyzer rules that blocked the task, in report order.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "findings": {
+          "type": "array",
+          "description": "The blocking findings themselves, as the analyst reported them, so the quarantine is actionable without re-running the analysis.",
+          "items": {
+            "type": "object",
+            "required": [
+              "severity",
+              "message"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "blocking",
+                  "major",
+                  "minor",
+                  "nit"
+                ]
+              },
+              "rule": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string",
+                "minLength": 1
+              },
+              "tasks": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
+        "since": {
+          "description": "When the task was quarantined: ISO 8601 UTC, or epoch seconds as the runtime records it.",
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        }
+      }
+    },
     "origin": {
       "type": "string",
       "description": "The intention the user submitted, kept verbatim. Every task a submission produced carries the same origin, which is what the panel groups requests by. Absent on tasks created before this field existed; readers fall back to `intent`."

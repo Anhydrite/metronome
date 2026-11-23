@@ -9,13 +9,14 @@
   "properties": {
     "kind": {
       "type": "string",
-      "description": "What happened. task_created carries the initial task; status moves it; field patches fields; note appends prose; task_deleted hides the task on replay. deploy_pending records the base a merge produced; deploy_pending_cleared means a deployer drained it; deploy_lock_acquired/deploy_lock_released are the single-flight guard around the deployer.",
+      "description": "What happened. task_created carries the initial task; status moves it; field patches fields; note appends prose; task_deleted hides the task on replay; quarantine_cleared drops the task's quarantine after a clean re-analysis. deploy_pending records the base a merge produced; deploy_pending_cleared means a deployer drained it; deploy_lock_acquired/deploy_lock_released are the single-flight guard around the deployer.",
       "enum": [
         "task_created",
         "status",
         "field",
         "note",
         "task_deleted",
+        "quarantine_cleared",
         "deploy_pending",
         "deploy_pending_cleared",
         "deploy_lock_acquired",
@@ -91,7 +92,7 @@
   },
   "allOf": [
     {
-      "if": { "properties": { "kind": { "enum": ["task_created", "status", "field", "note", "task_deleted"] } }, "required": ["kind"] },
+      "if": { "properties": { "kind": { "enum": ["task_created", "status", "field", "note", "task_deleted", "quarantine_cleared"] } }, "required": ["kind"] },
       "then": { "required": ["task_id"] }
     },
     {
