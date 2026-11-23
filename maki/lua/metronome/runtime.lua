@@ -1110,6 +1110,11 @@ function M.new(deps)
             and deps.git.rev_parse(worktree, "origin/" .. base) or nil
           if is_non_empty(base_sha) then
             details.base_sha = details.base_sha or base_sha
+          elseif is_non_empty(details.base_sha) then
+            -- The remote ref may be unresolvable (never fetched, or pruned from
+            -- this worktree): the SHA the merge already carried names the same
+            -- fresh base, so reset onto it instead of breaking to escalation.
+            base_sha = details.base_sha
           end
           details.base = details.base or base
           -- `merging` has no edge back to `running`: the repair continues the

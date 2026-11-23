@@ -1522,6 +1522,18 @@ return function()
     "an epic repair turn says to recover the branch content from origin/<branch>")
   eq(epic_conflict_prompt:find("origin/main", 1, true) ~= nil, true,
     "an epic repair turn says to compare against origin/<base>")
+  -- The runtime passes `push = false` for the epic turn and pushes the branch
+  -- itself once the redo is verified: a prompt that still told the implementer
+  -- to push could force origin/<branch> back onto the fresh base.
+  eq(epic_conflict_prompt:find("Do not push", 1, true) ~= nil, true,
+    "an epic repair turn tells the implementer not to push")
+  eq(epic_conflict_prompt:find("Commit the reconciliation and leave the push to the runtime",
+    1, true) ~= nil, true,
+    "an epic repair turn says the runtime does the push")
+  eq(epic_conflict_prompt:find("commit and push again", 1, true), nil,
+    "an epic repair turn does not tell the implementer to push")
+  eq(conflict_prompt:find("commit and push again", 1, true) ~= nil, true,
+    "a subtask repair turn still tells the implementer to push")
   local plain_prompt = implement.render_prompt(
     { id = "T1", title = "t", files = {}, checks = {} }, "sheet",
     { repo = "/tmp/repo", worktree = "/tmp/wt", branch = "b", base_ref = "main" }, {})
@@ -2629,6 +2641,24 @@ auto_deploy = false
   eq(epic_no_sha.record.conflict_retries, 1, "the table form is counted like any conflict")
   eq(epic_no_sha.resets[1] and epic_no_sha.resets[1].sha, "fed321",
     "the reset follows the base SHA the runtime resolved, not the branch tip")
+
+  -- When `origin/<base>` cannot be resolved but the merge result already
+  -- carried a usable `base_sha`, the repair still proceeds on that SHA instead
+  -- of breaking to escalation on a base it could have reset onto.
+  local epic_sha_fallback = epic_conflict_deps(2, 1, {
+    shas = { ["origin/metronome/epic/demo-0001"] = "tip999" },
+  })
+  local rt_epic_sha_fallback = runtime.new(epic_sha_fallback.deps)
+  rt_epic_sha_fallback.submit({ intention = "x", fast = false }, { session = "S1" })
+  rt_epic_sha_fallback.run_pending()
+  eq(epic_sha_fallback.resets[1] and epic_sha_fallback.resets[1].sha, "base123",
+    "an unresolvable origin/<base> falls back to the base SHA the merge carried")
+  eq(epic_sha_fallback.impl_calls(), 1,
+    "the repair turn runs when the base SHA comes from the merge result")
+  eq(epic_sha_fallback.merge_calls(), 2, "the merge is retried after the fallback repair")
+  eq(epic_sha_fallback.pr_opens(), 1, "the fallback repair reuses the single PR")
+  eq(epic_sha_fallback.record.status, "deployed",
+    "a repair on the carried base SHA does not escalate the epic")
 
   -- A repair turn that keeps failing re-enters the cycle under the bound: the
   -- epic is not failed after the first failed turn, and the merge is never
