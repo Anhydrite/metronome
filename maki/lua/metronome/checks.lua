@@ -48,22 +48,71 @@ end
 -- inherited variable (HOME, PATH, GIT_*) survives untouched.
 local LOCALE_PREFIX = { "env", "LC_ALL=C", "LANG=C" }
 
-local function with_c_locale(args)
-  local argv = {}
+-- Two tasks running at once must not share the state their checks write to
+-- (journals, caches, scratch files under XDG_STATE_HOME). The prefix gains a
+-- per-task directory, derived from the state root and the task id, so the same
+-- task always gets the same home and two tasks never do.
+--
+-- The decision is read from the command TEXT, never from the inherited
+-- environment: a check that already sets XDG_STATE_HOME= itself (either as a
+-- `VAR=... cmd` assignment or through `env VAR=... cmd`) is left alone, while
+-- a merely inherited value changes nothing -- otherwise the shell's value
+-- would silently disable the isolation.
+local STATE_HOME_VAR = "XDG_STATE_HOME="
+local STATE_HOME_DIR = "checks-state"
+
+-- The directory a check sees as XDG_STATE_HOME: <root>/checks-state/<task_id>.
+-- Without a root the state dir is the base; without a task id there is no way
+-- to keep tasks apart, so nothing is injected (callers that want isolation,
+-- runtime.lua and merge.lua, always pass both).
+function M.state_home(root, task_id)
+  if not is_non_empty(task_id) then
+    return nil
+  end
+
+  local base = is_non_empty(root) and root or nil
+  if not base then
+    local ok_dir, dir = pcall(function()
+      return maki.env.state_dir()
+    end)
+    if not ok_dir or not is_non_empty(dir) then
+      return nil
+    end
+    base = dir
+  end
+
+  local slug = tostring(task_id):gsub("[^%w._-]", "_")
+  return fs.joinpath(base, STATE_HOME_DIR, slug)
+end
+
+-- The command already pins XDG_STATE_HOME: rewriting it would fight the author.
+local function fixes_state_home(check)
+  return type(check) == "string" and check:find(STATE_HOME_VAR, 1, true) ~= nil
+end
+
+local function env_prefix(check, state_home)
+  local prefix = {}
   for i = 1, #LOCALE_PREFIX do
-    argv[i] = LOCALE_PREFIX[i]
+    prefix[i] = LOCALE_PREFIX[i]
   end
-  for i = 1, #args do
-    argv[#argv + 1] = args[i]
+  if state_home and not fixes_state_home(check) then
+    prefix[#prefix + 1] = STATE_HOME_VAR .. state_home
   end
-  return argv
+  return prefix
 end
 
 -- jobstart raises (rather than returning nil) when there is no active task to
 -- own the job, which happens at plugin top level. Retrying with a plugin scope
 -- keeps the same code usable from a tool handler and from a test.
-local function start(args, cwd)
-  local argv = with_c_locale(args)
+local function start(check, cwd, state_home)
+  local prefix = env_prefix(check, state_home)
+  local argv = {}
+  for i = 1, #prefix do
+    argv[i] = prefix[i]
+  end
+  argv[#argv + 1] = "sh"
+  argv[#argv + 1] = "-c"
+  argv[#argv + 1] = check
   local job_opts = { cwd = cwd }
   local ok_start, job, err = pcall(maki.fn.jobstart, argv, job_opts)
   if not ok_start then
@@ -87,6 +136,10 @@ end
 
 -- Run every declared check, in order, and stop early when asked.
 --
+-- `opts.root` and `opts.task_id` scope the checks' XDG_STATE_HOME: passed both,
+-- each check runs with a state home private to the task (created first), so two
+-- tasks can run their checks at the same time without colliding.
+--
 -- A check that never returns is a failure, not a hang: jobwait is bounded by
 -- timeout_ms and the job is stopped so it cannot outlive the verdict.
 function M.run(checks, opts)
@@ -105,6 +158,14 @@ function M.run(checks, opts)
   local results = {}
   local failed = {}
 
+  local state_home = M.state_home(opts.root, opts.task_id)
+  if state_home then
+    local made, mkerr = fs.mkdir(state_home, { parents = true })
+    if not made then
+      return nil, "cannot create the check state home: " .. tostring(mkerr)
+    end
+  end
+
   for i = 1, #checks do
     local check = checks[i]
     if not is_non_empty(check) then
@@ -112,7 +173,7 @@ function M.run(checks, opts)
     end
 
     local started = os.time()
-    local job, jerr = start({ "sh", "-c", check }, opts.worktree)
+    local job, jerr = start(check, opts.worktree, state_home)
     if not job then
       return nil, jerr
     end
