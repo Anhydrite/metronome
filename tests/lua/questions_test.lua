@@ -9,29 +9,10 @@ return function()
   local questions = load_module("questions")
   local state = load_module("state")
 
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", "questions")
-
-  -- Remove only what we must: a previous run must not pollute this one. The
+  -- test_dir() empties and recreates the per-test workspace, so two runs (or
+  -- two tests) never share a journal, a temporary repository or a worktree. The
   -- base itself is kept, because run-lua.sh validates the journal left in it.
-  local function wipe(path)
-    local entries = maki.fs.dir(path)
-    if entries then
-      for _, e in ipairs(entries) do
-        local name = e.name or e[1]
-        local kind = e.kind or e[2]
-        local child = maki.fs.joinpath(path, name)
-        if kind == "directory" then
-          wipe(child)
-        else
-          maki.fs.rm(child)
-        end
-      end
-    end
-    maki.fs.rm(path)
-  end
-
-  wipe(base)
-  maki.fs.mkdir(base, { parents = true })
+  local base = test_dir("questions")
 
   local root = maki.fs.joinpath(base, "state")
   local journal_path = maki.fs.joinpath(root, "state.jsonl")
