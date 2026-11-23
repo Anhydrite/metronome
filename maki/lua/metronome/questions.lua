@@ -11,6 +11,8 @@
 
 local M = {}
 
+local fs = maki.fs
+
 M.MAX_PER_ROUND_DEFAULT = 15
 
 local function trim(s)
@@ -232,10 +234,17 @@ local function normalize_answers(answers)
 end
 
 -- Apply answers to every task that asked the same question, then move each
--- affected task back to qualifying.
+-- affected task back to qualifying, and rewrite the sheet of every task whose
+-- questions changed.
 --
 -- The whole batch is validated before the first write: a form with one bad
 -- answer must not leave half its answers in the journal.
+--
+-- `opts.qualify` is required: the sheet is rendered by qualify.sheet_markdown
+-- only, so a second renderer cannot drift from the sheet apply wrote. A sheet
+-- that cannot be written fails the call — an answer applied in the journal but
+-- invisible in the sheet is worse than a refused answer, because the
+-- implementer reads only the sheet.
 function M.answer(state, root, answers, opts)
   opts = opts or {}
   if type(state) ~= "table"
@@ -247,6 +256,11 @@ function M.answer(state, root, answers, opts)
   if type(root) ~= "string" or root == "" then
     return nil, "state root is required"
   end
+  local qualify = opts.qualify
+  if type(qualify) ~= "table" or type(qualify.sheet_markdown) ~= "function" then
+    return nil, "answer needs opts.qualify (the sheet renderer)"
+  end
+  local tasks_dir = opts.tasks_dir or fs.joinpath(root, "tasks")
 
   local list, lerr = normalize_answers(answers)
   if not list then
@@ -367,6 +381,35 @@ function M.answer(state, root, answers, opts)
         return nil, terr
       end
       moved[#moved + 1] = task_id
+    end
+  end
+
+  -- Rewrite the sheet of every task that received an answer, from the reloaded
+  -- projection and through the one renderer. A task whose questions were left
+  -- untouched is not rewritten, so its sheet bytes stay identical.
+  if #affected > 0 then
+    local latest_ok, latest = pcall(state.load, root)
+    if not latest_ok or type(latest) ~= "table" then
+      return nil, "cannot load state"
+    end
+    for _, task_id in ipairs(affected) do
+      local projected = latest.tasks and latest.tasks[task_id] or nil
+      if type(projected) ~= "table" then
+        return nil, "cannot write sheet for " .. task_id .. ": task is missing from the projection"
+      end
+      local rendered, sheet = pcall(qualify.sheet_markdown, projected)
+      if not rendered or type(sheet) ~= "string" then
+        return nil, "cannot write sheet for " .. task_id .. ": " .. tostring(sheet)
+      end
+      local write_ok, wrote, werr = pcall(
+        fs.write, fs.joinpath(tasks_dir, task_id .. ".md"), sheet
+      )
+      if not write_ok then
+        return nil, "cannot write sheet for " .. task_id .. ": " .. tostring(wrote)
+      end
+      if not wrote then
+        return nil, "cannot write sheet for " .. task_id .. ": " .. tostring(werr)
+      end
     end
   end
 
