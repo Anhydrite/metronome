@@ -178,6 +178,10 @@ Questions are the pipeline's way of not guessing. Your job with questions is:
 
 Never invent an answer to keep moving. A blocking question stays blocking until the user answers it.
 
+An answer is not just journaled: when the user answers, each answer is written into every source task's `tasks/<id>.md` sheet, with the date it was given (`- q1: <question>` followed by `  - Réponse (<answered_at>): <answer>`), and it is rendered in the implementer's prompt under « Réponses aux questions (contraignantes) ». The implementer treats an answer as binding: an answer overrides the intent when the two contradict each other. A task whose questions got no answer keeps its sheet unchanged.
+
+A failed sheet rewrite is an error, never a silent loss: an answer that was applied but is invisible to the implementer is worse than a refused answer, so report the failure instead of moving on.
+
 ## Report format
 
 Every transition produces a short report: task id, phase, result, cost, and the PR link when there is one. Keep it to a few lines; the panel and the journal hold the detail.
