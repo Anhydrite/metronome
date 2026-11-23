@@ -184,3 +184,22 @@ if [[ -f "$DEPLOY_JOURNAL" ]]; then
   }
   echo "PASS: journal written by the deploy test satisfies event and task schemas ($DEPLOY_JOURNAL)"
 fi
+
+# A failure is never journaled as a mute "no error details": that text is the
+# empty diagnostic this suite exists to rule out, and it hides the real cause
+# (an escalated review, a conflict, a journaled note) that the result carried.
+# Scan every journal the suite wrote and the runtime.log written beside it, and
+# fail the whole run if the generic text is back.
+TESTS_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/maki/metronome-tests"
+if [[ -d "$TESTS_STATE" ]]; then
+  GENERIC_HITS="$(
+    find "$TESTS_STATE" -type f \( -name 'state.jsonl' -o -name 'runtime.log' \) \
+      -exec grep -l 'no error details' {} + 2>/dev/null || true
+  )"
+  if [[ -n "$GENERIC_HITS" ]]; then
+    echo "FAIL: 'no error details' reached a journal or a runtime.log written by the suite:" >&2
+    printf '%s\n' "$GENERIC_HITS" >&2
+    exit 1
+  fi
+  echo "PASS: no journal or runtime.log written by the suite says 'no error details'"
+fi

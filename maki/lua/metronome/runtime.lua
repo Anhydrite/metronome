@@ -2261,6 +2261,74 @@ function M.new(deps)
   -- a transient failure would loop forever.
   retry_attempts = {}
 
+  -- The failure text the result itself carries. A result with no `error` is not
+  -- a task without a cause: a conflict names its files, base and command, an
+  -- escalated review names its rounds, and the last journaled note names what
+  -- the step was doing. Build the message from that, in that order, so a failure
+  -- is never journaled as a mute "no error details".
+  --
+  -- Returns nil when the result really carries nothing: that is a defect of the
+  -- runtime (see `handle_failure`), not a failure of the task.
+  local function synthesize_failure(result, task, phase)
+    result = type(result) == "table" and result or {}
+    phase = is_non_empty(phase) and phase or "unknown phase"
+
+    local function text(value)
+      if type(value) ~= "string" then
+        return nil
+      end
+      local line = one_line(value, 300)
+      return line ~= "" and line or nil
+    end
+
+    local failure = type(result.failure) == "table" and result.failure or nil
+    local direct = text(result.error) or text(result.reason)
+      or text(failure and failure.message)
+    if direct then
+      return direct
+    end
+
+    -- The conflict facts, in the shape the journal note already uses: the files
+    -- the branch could not replay, the base it was replayed on and the command.
+    local files = result.conflict_files or result.conflict
+    if type(files) == "table" then
+      local names = {}
+      for _, name in ipairs(files) do
+        names[#names + 1] = tostring(name)
+      end
+      files = table.concat(names, ", ")
+    end
+    if is_non_empty(files) then
+      local base = is_non_empty(result.conflict_base) and result.conflict_base
+        or (is_non_empty(result.base) and result.base
+        or ("origin/" .. tostring(is_non_empty(result.base_ref) and result.base_ref or "main")))
+      local command = is_non_empty(result.rebase_command) and result.rebase_command
+        or (is_non_empty(result.command) and result.command or ("git rebase " .. base))
+      return string.format("conflict in phase %s: files %s, base %s, command %s",
+        phase, files, base, command)
+    end
+
+    if result.escalated then
+      local review = type(result.review) == "table" and result.review or nil
+      local round = tonumber(review and review.round) or tonumber(result.round)
+      return string.format("review escalated after %s round(s)",
+        round and tostring(round) or "?")
+    end
+
+    -- Nothing typed: the last journaled note is what the step was doing when it
+    -- gave up, and it is more informative than any generic string.
+    local notes = type(task) == "table" and task.notes or nil
+    if type(notes) == "table" then
+      for i = #notes, 1, -1 do
+        local note = text(notes[i])
+        if note then
+          return note
+        end
+      end
+    end
+    return nil
+  end
+
   -- Persist a typed failure and decide what happens next. Nothing is
   -- destroyed: the worktree, the branch, the checkpoints and the run directory
   -- stay exactly where the failure found them, and the pull request is left
@@ -2276,23 +2344,40 @@ function M.new(deps)
     local loaded = deps.state.load(paths.root)
     local task = loaded and loaded.tasks and loaded.tasks[task_id]
     local prior = task and task.failure
-    local message = tostring(err or "")
-    if message == "" then
-      message = "task failed without an error message"
-    end
     local phase = (type(result) == "table" and result.phase)
       or (type(prior) == "table" and prior.phase)
       or (task and task.phase)
       or "implement"
     local diagnosis = type(result) == "table" and result.diagnosis or nil
 
+    -- `err` is only usable when it is text: `run_and_handle` falls back to the
+    -- result table itself, and `tostring` on it yields "table: 0x…", which would
+    -- be journaled as the reason. Synthesize from the result instead.
+    local raw = type(err) == "string" and one_line(err, 300) or ""
+    local message = raw ~= "" and raw or synthesize_failure(result, task, phase)
+    local empty_failure = message == nil
+    if empty_failure then
+      -- A result nothing can be said about is a runtime defect, and the journal
+      -- must say so: a silent task failure hides the bug that produced it.
+      message = "runtime returned an empty failure in phase " .. tostring(phase)
+      local defect = "runtime defect: " .. message
+      log(paths, "task " .. tostring(task_id) .. ": " .. defect)
+      if type(deps.state.append) == "function" then
+        pcall(deps.state.append, paths.root, {
+          kind = "note",
+          task_id = task_id,
+          text = defect,
+        })
+      end
+    end
+
     -- A transition the journal refused inside the runtime is a defect in the
     -- runtime's sequencing, not a fault of the task: another pilot already moved
     -- the task on. Failing the task for it would condemn work that is very
     -- likely in progress elsewhere. Journal it as a note, leave the status and
     -- the failure fields alone, and hand the caller a non-failing result.
-    if is_illegal_transition(message) then
-      local text = "illegal transition reconciled: " .. message
+    if is_illegal_transition(raw) then
+      local text = "illegal transition reconciled: " .. raw
       log(paths, "task " .. tostring(task_id) .. ": " .. text)
       if type(deps.state.append) == "function" then
         pcall(deps.state.append, paths.root, {
@@ -2310,8 +2395,20 @@ function M.new(deps)
       }
     end
 
+    -- The context the classifier needs to describe an empty error: the phase,
+    -- the task and the status it was in, the reason the result already carries
+    -- (the synthesized message otherwise) and the last journaled note. Without
+    -- it, a typed classifier can only answer "no error details".
+    local result_reason = type(result) == "table" and result.reason or nil
+    local notes = type(task) == "table" and type(task.notes) == "table" and task.notes or nil
+    local last_note = notes and notes[#notes] or nil
+
     local ropts = recover_opts(cfg)
     ropts.phase = phase
+    ropts.task_id = task_id
+    ropts.status = type(task) == "table" and task.status or nil
+    ropts.reason = is_non_empty(result_reason) and result_reason or message
+    ropts.note = is_non_empty(last_note) and last_note or nil
     ropts.now = type(opts) == "table" and tonumber(opts.now) or nil
 
     -- Count the attempt from the streak, not from the task: the `running`
@@ -2347,17 +2444,47 @@ function M.new(deps)
     if type(decision) ~= "table" then
       decision = { action = "human", delay_secs = 0, max_attempts = 1, phase = phase }
     end
-    local reason = describe_failure(failure, decision)
-
-    pcall(deps.state.set_fields, paths.root, task_id, { failure = failure })
-    if type(deps.state.transition) == "function" then
-      local moved, merr = deps.state.transition(paths.root, task_id, "failed", {
-        reason = reason,
-        failure = failure,
-        phase = phase,
-      })
-      if not moved then
-        log(paths, "cannot mark task " .. tostring(task_id) .. " failed: " .. tostring(merr))
+    -- One `failed` transition per turn. A module may already have written it —
+    -- `review.escalate`, a merge that gave up — and that module is the
+    -- authority: a second transition would add a reasonless event and split the
+    -- diagnosis between two journal lines. Re-read the projection and, when the
+    -- task is already failed, adopt the reason it persisted so the journal, the
+    -- log and `failure_reason` carry exactly the same string.
+    local current = deps.state.load(paths.root)
+    local now = current and current.tasks and current.tasks[task_id]
+    local already_failed = type(now) == "table" and now.status == "failed"
+    local reason
+    if already_failed then
+      -- The typed diagnosis is persisted in both branches: it does not move the
+      -- task, and a module-initiated failure that writes neither a reason nor a
+      -- failure record would otherwise leave `task.failure` missing, which is
+      -- what the panel and a resume (`state.failure_of`) read.
+      if is_non_empty(now.failure_reason) then
+        reason = now.failure_reason
+        pcall(deps.state.set_fields, paths.root, task_id, { failure = failure })
+      else
+        -- The module wrote the transition without a reason (`review.escalate`
+        -- and `merge` both do). The journal event stays as the module wrote it,
+        -- but persist the synthesized reason beside it so the projection, the
+        -- log and the panel agree instead of showing a mute `failed`.
+        reason = describe_failure(failure, decision)
+        pcall(deps.state.set_fields, paths.root, task_id, {
+          failure = failure,
+          failure_reason = reason,
+        })
+      end
+    else
+      reason = describe_failure(failure, decision)
+      pcall(deps.state.set_fields, paths.root, task_id, { failure = failure })
+      if type(deps.state.transition) == "function" then
+        local moved, merr = deps.state.transition(paths.root, task_id, "failed", {
+          reason = reason,
+          failure = failure,
+          phase = phase,
+        })
+        if not moved then
+          log(paths, "cannot mark task " .. tostring(task_id) .. " failed: " .. tostring(merr))
+        end
       end
     end
     log(paths, "task " .. tostring(task_id) .. " failed: " .. reason)
