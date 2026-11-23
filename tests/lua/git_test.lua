@@ -14,6 +14,11 @@ return function()
   local repo = maki.fs.joinpath(base, "repo")
   local remote = maki.fs.joinpath(base, "remote.git")
   local worktree = maki.fs.joinpath(base, "wt")
+  -- Worktrees created by the extracted case groups below: cleanup removes
+  -- them after every group ran, so the names live in this scope.
+  local commit_wt, rebase_wt, conflict_wt, detach_wt
+  -- The commit section creates the branch head the reset tests go back to.
+  local sha
 
   -- Locale pin (T-20261122-0012) ---------------------------------------------
   --
@@ -56,566 +61,809 @@ return function()
   code, out = sh({ "git", "push", "-u", "origin", "main" }, repo)
   eq(code, 0, "initial push: " .. out:sub(1, 80))
 
-  -- Repository checks -------------------------------------------------------
+  local function check_repository()
+    -- Repository checks -------------------------------------------------------
 
-  local is, ierr = git.is_repo(repo)
-  eq(is, true, "repo is recognised")
-  eq(ierr, nil, "no error for a real repo")
+    local is, ierr = git.is_repo(repo)
+    eq(is, true, "repo is recognised")
+    eq(ierr, nil, "no error for a real repo")
 
-  local not_repo, nerr = git.is_repo(base)
-  eq(not_repo, false, "a plain directory is not a repo")
-  eq(nerr ~= nil, true, "not-a-repo explains itself")
+    local not_repo, nerr = git.is_repo(base)
+    eq(not_repo, false, "a plain directory is not a repo")
+    eq(nerr ~= nil, true, "not-a-repo explains itself")
 
-  local branch, berr = git.current_branch(repo)
-  eq(berr, nil, "current_branch has no error")
-  eq(branch, "main", "current branch is main")
+    local branch, berr = git.current_branch(repo)
+    eq(berr, nil, "current_branch has no error")
+    eq(branch, "main", "current branch is main")
 
-  -- Branch naming -----------------------------------------------------------
+    -- Branch naming -----------------------------------------------------------
 
-  eq(git.branch_name("metronome/", "T-20261114-a3f2"), "metronome/T-20261114-a3f2", "branch name composed")
-  eq(git.branch_name(nil, "T-20261114-a3f2"), "metronome/T-20261114-a3f2", "default prefix applied")
+    eq(git.branch_name("metronome/", "T-20261114-a3f2"), "metronome/T-20261114-a3f2", "branch name composed")
+    eq(git.branch_name(nil, "T-20261114-a3f2"), "metronome/T-20261114-a3f2", "default prefix applied")
 
-  -- Conventional messages ---------------------------------------------------
+    -- Conventional messages ---------------------------------------------------
 
-  eq(git.conventional("feat", "export", "add CSV export"), "feat(export): add CSV export", "scoped message")
-  eq(git.conventional("fix", nil, "stop the leak"), "fix: stop the leak", "unscoped message")
-  eq(git.conventional("feat", "export", "add CSV export", "Because finance asked."),
-    "feat(export): add CSV export\n\nBecause finance asked.", "message with body")
-  local empty, eerr = git.conventional("feat", nil, "   ")
-  eq(empty, nil, "empty subject refused")
-  eq(eerr ~= nil, true, "empty subject explains itself")
+    eq(git.conventional("feat", "export", "add CSV export"), "feat(export): add CSV export", "scoped message")
+    eq(git.conventional("fix", nil, "stop the leak"), "fix: stop the leak", "unscoped message")
+    eq(git.conventional("feat", "export", "add CSV export", "Because finance asked."),
+      "feat(export): add CSV export\n\nBecause finance asked.", "message with body")
+    local empty, eerr = git.conventional("feat", nil, "   ")
+    eq(empty, nil, "empty subject refused")
+    eq(eerr ~= nil, true, "empty subject explains itself")
 
-  -- Fetch -------------------------------------------------------------------
+    -- Fetch -------------------------------------------------------------------
 
-  local fetched, ferr = git.fetch(repo, "origin")
-  eq(fetched, true, "fetch works")
-  eq(ferr, nil, "fetch has no error")
+    local fetched, ferr = git.fetch(repo, "origin")
+    eq(fetched, true, "fetch works")
+    eq(ferr, nil, "fetch has no error")
 
-  -- Worktree ----------------------------------------------------------------
+    -- Worktree ----------------------------------------------------------------
 
-  local wt, werr = git.worktree_add(repo, worktree, "metronome/T-20261114-a3f2", "main", { remote = "origin" })
-  eq(werr, nil, "worktree add has no error: " .. tostring(werr))
-  eq(wt, worktree, "worktree path returned")
+    local wt, werr = git.worktree_add(repo, worktree, "metronome/T-20261114-a3f2", "main", { remote = "origin" })
+    eq(werr, nil, "worktree add has no error: " .. tostring(werr))
+    eq(wt, worktree, "worktree path returned")
 
-  local listed, lerr = git.worktree_list(repo)
-  eq(lerr, nil, "worktree list has no error")
-  local found = false
-  for _, p in ipairs(listed) do
-    if p == worktree then found = true end
-  end
-  eq(found, true, "new worktree is listed")
-
-  local wt_branch = git.current_branch(worktree)
-  eq(wt_branch, "metronome/T-20261114-a3f2", "worktree is on the task branch")
-
-  -- A duplicate worktree must fail with a readable message, not crash.
-  local dup, derr = git.worktree_add(repo, worktree, "metronome/T-20261114-a3f2", "main")
-  eq(dup, nil, "duplicate worktree refused")
-  eq(derr ~= nil and derr:find("worktree add failed") ~= nil, true, "duplicate worktree explains itself")
-
-  -- Commit ------------------------------------------------------------------
-
-  maki.fs.write(maki.fs.joinpath(worktree, "export.csv"), "a,b\n1,2\n")
-  local sha, serr = git.commit(worktree, git.conventional("feat", "export", "add CSV export"))
-  eq(serr, nil, "commit has no error: " .. tostring(serr))
-  eq(type(sha), "string", "commit returns a sha")
-  eq(#sha, 40, "sha is full length")
-
-  local head = git.head_sha(worktree)
-  eq(head, sha, "head matches the commit")
-
-  -- An empty commit is reported as such, not as a crash.
-  local nothing, nerr2 = git.commit(worktree, "feat: nothing")
-  eq(nothing, nil, "empty commit returns nil")
-  eq(nerr2, "nothing to commit", "empty commit says so plainly")
-
-  -- Reset hard (REQ-20261114-28) --------------------------------------------
-  --
-  -- Going back to the last checkpoint must restore both the commit and the
-  -- files: a reset that only moved HEAD would leave the failed turn's edits.
-
-  local sha_a = sha
-  maki.fs.write(maki.fs.joinpath(worktree, "export.csv"), "a,b\n3,4\n")
-  local sha_b, berr2 = git.commit(worktree, "feat: second export")
-  eq(berr2, nil, "second commit has no error: " .. tostring(berr2))
-  eq(type(sha_b), "string", "second commit returns a sha")
-  eq(sha_b ~= sha_a, true, "second commit is a new commit")
-
-  local reset_sha, rserr = git.reset_hard(worktree, sha_a)
-  eq(rserr, nil, "reset_hard has no error: " .. tostring(rserr))
-  eq(reset_sha, sha_a, "reset_hard returns the target sha")
-  eq(git.head_sha(worktree), sha_a, "HEAD is back at A")
-  eq(maki.fs.read(maki.fs.joinpath(worktree, "export.csv")), "a,b\n1,2\n", "file content is back to A")
-
-  local bad_reset, brserr = git.reset_hard(worktree, "not-a-sha")
-  eq(bad_reset, nil, "invalid sha refused")
-  eq(brserr, "reset needs a commit sha", "invalid sha says so plainly")
-
-  -- Changed files -----------------------------------------------------------
-
-  local files, cferr = git.changed_files(worktree, "origin/main")
-  eq(cferr, nil, "changed_files has no error")
-  local saw_file = false
-  for _, f in ipairs(files) do
-    if f == "export.csv" then saw_file = true end
-  end
-  eq(saw_file, true, "changed file is reported")
-
-  -- Three-dot range (REQ-20261114-29) ----------------------------------------
-  --
-  -- `main...HEAD` compares the merge base to the branch head, so a commit made
-  -- on main after the branch was cut is not reported as a branch change. The
-  -- two-dot form compares main's tree to the working tree and does report it,
-  -- which is exactly why convergence asks for the three-dot range.
-
-  maki.fs.write(maki.fs.joinpath(repo, "main-only.txt"), "main\n")
-  sh({ "git", "add", "-A" }, repo)
-  local mcode, mout = sh({ "git", "commit", "-m", "chore: main moves on" }, repo)
-  eq(mcode, 0, "main advanced: " .. mout:sub(1, 80))
-
-  local two_dot, td_err = git.changed_files(worktree, "main")
-  eq(td_err, nil, "two-dot changed_files has no error")
-  local two_saw_main = false
-  for _, f in ipairs(two_dot or {}) do
-    if f == "main-only.txt" then two_saw_main = true end
-  end
-  eq(two_saw_main, true, "two-dot sees main's later change as a difference")
-
-  local three_dot, th_err = git.changed_files(worktree, "main", { three_dot = true })
-  eq(th_err, nil, "three-dot changed_files has no error")
-  local three_saw_export, three_saw_main = false, false
-  for _, f in ipairs(three_dot or {}) do
-    if f == "export.csv" then three_saw_export = true end
-    if f == "main-only.txt" then three_saw_main = true end
-  end
-  eq(three_saw_export, true, "three-dot sees the branch change")
-  eq(three_saw_main, false, "three-dot ignores main's later change")
-
-  -- Push --------------------------------------------------------------------
-
-  local pushed, perr = git.push(worktree, "metronome/T-20261114-a3f2", { remote = "origin" })
-  eq(pushed, true, "push works: " .. tostring(perr))
-  eq(perr, nil, "push has no error")
-
-  local code2, out2 = sh({ "git", "-C", remote, "rev-parse", "--verify", "metronome/T-20261114-a3f2" }, base)
-  eq(code2, 0, "branch exists on the remote: " .. out2:sub(1, 80))
-
-  -- Git failure diagnostics (REQ-20261114-20) -------------------------------
-  --
-  -- Each of the four real failures must produce a readable diagnostic AND leave
-  -- the task failed with the reason in its journal notes. Both halves are proven
-  -- here: a diagnostic nobody records is just a log line.
-
-  local stroot = maki.fs.joinpath(base, "state")
-
-  local function assert_diag(diag, cause, label)
-    eq(type(diag), "table", label .. ": diagnostic returned")
-    eq(diag and diag.cause, cause, label .. ": cause is " .. cause)
-    eq(type(diag and diag.message) == "string" and #diag.message > 0, true, label .. ": message non-empty")
-    eq(type(diag and diag.hint) == "string" and #diag.hint > 0, true, label .. ": hint non-empty")
-    eq(type(diag and diag.detail) == "string" and #diag.detail > 0, true, label .. ": detail non-empty")
-    eq(type(diag and diag.command) == "string" and #diag.command > 0, true, label .. ": command recorded")
-    local line = git.describe(diag)
-    eq(type(line), "string", label .. ": describe returns a line")
-    has(line, cause, label .. ": describe names the cause")
-    has(line, diag.message, label .. ": describe carries the message")
-  end
-
-  local function prove_failed(id, diag, label)
-    local created, cerr = state.create(stroot, { id = id, title = "git failure " .. id, status = "running" })
-    eq(cerr, nil, label .. ": running task created")
-    eq(created and created.status, "running", label .. ": task starts running")
-    local task, terr = git.fail_task(state, stroot, id, diag)
-    eq(terr, nil, label .. ": fail_task has no error: " .. tostring(terr))
-    eq(task and task.status, "failed", label .. ": task is failed")
-    local loaded = state.load(stroot)
-    local notes = loaded.tasks[id] and loaded.tasks[id].notes or {}
+    local listed, lerr = git.worktree_list(repo)
+    eq(lerr, nil, "worktree list has no error")
     local found = false
-    for _, note in ipairs(notes) do
-      if type(note) == "string" and note:find(diag.cause, 1, true) then
-        found = true
-      end
+    for _, p in ipairs(listed) do
+      if p == worktree then found = true end
     end
-    eq(found, true, label .. ": journal note records the failure")
+    eq(found, true, "new worktree is listed")
+
+    local wt_branch = git.current_branch(worktree)
+    eq(wt_branch, "metronome/T-20261114-a3f2", "worktree is on the task branch")
+
+    -- A duplicate worktree must fail with a readable message, not crash.
+    local dup, derr = git.worktree_add(repo, worktree, "metronome/T-20261114-a3f2", "main")
+    eq(dup, nil, "duplicate worktree refused")
+    eq(derr ~= nil and derr:find("worktree add failed") ~= nil, true, "duplicate worktree explains itself")
+
+    -- Commit ------------------------------------------------------------------
+
+    maki.fs.write(maki.fs.joinpath(worktree, "export.csv"), "a,b\n1,2\n")
+    local serr
+    sha, serr = git.commit(worktree, git.conventional("feat", "export", "add CSV export"))
+    eq(serr, nil, "commit has no error: " .. tostring(serr))
+    eq(type(sha), "string", "commit returns a sha")
+    eq(#sha, 40, "sha is full length")
+
+    local head = git.head_sha(worktree)
+    eq(head, sha, "head matches the commit")
+
+    -- An empty commit is reported as such, not as a crash.
+    local nothing, nerr2 = git.commit(worktree, "feat: nothing")
+    eq(nothing, nil, "empty commit returns nil")
+    eq(nerr2, "nothing to commit", "empty commit says so plainly")
   end
+  check_repository()
 
-  -- (a) The worktree path is already present.
-  local wt_dup, wt_err, wt_diag = git.worktree_add(repo, worktree, "metronome/other", "main")
-  eq(wt_dup, nil, "existing worktree path refused")
-  eq(type(wt_err), "string", "existing worktree path explains itself")
-  assert_diag(wt_diag, "worktree_exists", "worktree_exists")
-  prove_failed("T-20261114-b001", wt_diag, "worktree_exists")
+  local function check_reset_and_push()
+    -- Reset hard (REQ-20261114-28) --------------------------------------------
+    --
+    -- Going back to the last checkpoint must restore both the commit and the
+    -- files: a reset that only moved HEAD would leave the failed turn's edits.
 
-  -- (b) The task branch already exists.
-  local bcode, bout = sh({ "git", "branch", "metronome/dup", "main" }, repo)
-  eq(bcode, 0, "duplicate branch seeded: " .. bout:sub(1, 80))
-  local br_path = maki.fs.joinpath(base, "wt-dup")
-  local br_dup, br_err, br_diag = git.worktree_add(repo, br_path, "metronome/dup", "main")
-  eq(br_dup, nil, "existing branch refused")
-  eq(type(br_err), "string", "existing branch explains itself")
-  assert_diag(br_diag, "branch_exists", "branch_exists")
-  prove_failed("T-20261114-b002", br_diag, "branch_exists")
+    local sha_a = sha
+    maki.fs.write(maki.fs.joinpath(worktree, "export.csv"), "a,b\n3,4\n")
+    local sha_b, berr2 = git.commit(worktree, "feat: second export")
+    eq(berr2, nil, "second commit has no error: " .. tostring(berr2))
+    eq(type(sha_b), "string", "second commit returns a sha")
+    eq(sha_b ~= sha_a, true, "second commit is a new commit")
 
-  -- `existing` checks out the branch that already exists instead of creating
-  -- it: that is how a task re-attaches its worktree after one was removed.
-  local ex_wt, ex_err = git.worktree_add(repo, br_path, "metronome/dup", "main", { existing = true })
-  eq(ex_err, nil, "existing branch checked out: " .. tostring(ex_err))
-  eq(ex_wt, br_path, "existing worktree path returned")
-  eq(git.current_branch(br_path), "metronome/dup", "existing worktree is on the existing branch")
+    local reset_sha, rserr = git.reset_hard(worktree, sha_a)
+    eq(rserr, nil, "reset_hard has no error: " .. tostring(rserr))
+    eq(reset_sha, sha_a, "reset_hard returns the target sha")
+    eq(git.head_sha(worktree), sha_a, "HEAD is back at A")
+    eq(maki.fs.read(maki.fs.joinpath(worktree, "export.csv")), "a,b\n1,2\n", "file content is back to A")
 
-  -- (c) The remote has a commit the task branch does not: the push is rejected.
-  local rcode, rout = sh({ "git", "checkout", "-q", "-b", "metronome/rejected", "main" }, repo)
-  eq(rcode, 0, "rejected branch seeded: " .. rout:sub(1, 80))
-  maki.fs.write(maki.fs.joinpath(repo, "remote-only.txt"), "remote\n")
-  sh({ "git", "add", "-A" }, repo)
-  local rccode, rcout = sh({ "git", "commit", "-m", "feat: remote only" }, repo)
-  eq(rccode, 0, "remote-only commit: " .. rcout:sub(1, 80))
-  local rpcode, rpout = sh({ "git", "push", "origin", "metronome/rejected" }, repo)
-  eq(rpcode, 0, "remote-only push: " .. rpout:sub(1, 80))
-  sh({ "git", "checkout", "-q", "main" }, repo)
-  local dcode, dout = sh({ "git", "branch", "-D", "metronome/rejected" }, repo)
-  eq(dcode, 0, "local seeded branch removed: " .. dout:sub(1, 80))
+    local bad_reset, brserr = git.reset_hard(worktree, "not-a-sha")
+    eq(bad_reset, nil, "invalid sha refused")
+    eq(brserr, "reset needs a commit sha", "invalid sha says so plainly")
 
-  local wcode, wout = sh({ "git", "checkout", "-q", "-b", "metronome/rejected", "main" }, worktree)
-  eq(wcode, 0, "worktree branch cut from stale main: " .. wout:sub(1, 80))
-  maki.fs.write(maki.fs.joinpath(worktree, "local-only.txt"), "local\n")
-  local lsha, lserr = git.commit(worktree, "feat: local only")
-  eq(lserr, nil, "local-only commit: " .. tostring(lserr))
-  eq(type(lsha), "string", "local-only commit returns a sha")
-  local rej, rej_err, rej_diag = git.push(worktree, "metronome/rejected")
-  eq(rej, nil, "diverged push refused")
-  eq(type(rej_err), "string", "diverged push explains itself")
-  assert_diag(rej_diag, "push_rejected", "push_rejected")
-  prove_failed("T-20261114-b003", rej_diag, "push_rejected")
-  -- The refusal names the reason, not only git's "To <url>" preamble.
-  has(rej_err or "", "rejected", "the push refusal reports why")
-  eq((rej_err or ""):find("^To ", 1) ~= nil, false, "the refusal is not git's preamble")
+    -- Changed files -----------------------------------------------------------
 
-  -- The pipeline rewrites its own branches (rebase onto the fresh base,
-  -- rollback to a checkpoint), so a task branch is pushed with a lease: the
-  -- same diverged push succeeds, and the remote now holds the local commit.
-  local forced, forced_err = git.push(worktree, "metronome/rejected", { force = true })
-  eq(forced, true, "a leased push replaces a rewritten branch: " .. tostring(forced_err))
-  local remote_sha_code, remote_sha = sh({ "git", "-C", remote, "rev-parse", "metronome/rejected" })
-  eq(remote_sha_code, 0, "remote branch readable")
-  eq((remote_sha:gsub("%s+$", "")), lsha, "the remote branch holds the rewritten commit")
+    local files, cferr = git.changed_files(worktree, "origin/main")
+    eq(cferr, nil, "changed_files has no error")
+    local saw_file = false
+    for _, f in ipairs(files) do
+      if f == "export.csv" then saw_file = true end
+    end
+    eq(saw_file, true, "changed file is reported")
 
-  -- (d) The remote does not exist.
-  local fetched_missing, fm_err, fm_diag = git.fetch(repo, "nope")
-  eq(fetched_missing, nil, "missing remote refused")
-  eq(type(fm_err), "string", "missing remote explains itself")
-  assert_diag(fm_diag, "remote_missing", "remote_missing")
-  prove_failed("T-20261114-b004", fm_diag, "remote_missing")
+    -- Three-dot range (REQ-20261114-29) ----------------------------------------
+    --
+    -- `main...HEAD` compares the merge base to the branch head, so a commit made
+    -- on main after the branch was cut is not reported as a branch change. The
+    -- two-dot form compares main's tree to the working tree and does report it,
+    -- which is exactly why convergence asks for the three-dot range.
 
-  -- Rebase and detached worktrees (REQ-20261114-31) --------------------------
-  --
-  -- A task branch is rebased onto the fresh base before the PR is merged, and
-  -- the post-merge checks run in a detached worktree cut from that base. Both
-  -- shapes are proven here, including the conflict path, which must leave the
-  -- worktree clean and the branch head untouched.
+    maki.fs.write(maki.fs.joinpath(repo, "main-only.txt"), "main\n")
+    sh({ "git", "add", "-A" }, repo)
+    local mcode, mout = sh({ "git", "commit", "-m", "chore: main moves on" }, repo)
+    eq(mcode, 0, "main advanced: " .. mout:sub(1, 80))
 
-  local mcode3, mout3 = sh({ "git", "push", "origin", "main" }, repo)
-  eq(mcode3, 0, "main pushed before the rebase tests: " .. mout3:sub(1, 80))
+    local two_dot, td_err = git.changed_files(worktree, "main")
+    eq(td_err, nil, "two-dot changed_files has no error")
+    local two_saw_main = false
+    for _, f in ipairs(two_dot or {}) do
+      if f == "main-only.txt" then two_saw_main = true end
+    end
+    eq(two_saw_main, true, "two-dot sees main's later change as a difference")
 
-  local rebase_wt = maki.fs.joinpath(base, "wt-rebase")
-  local rebase_branch = "metronome/T-20261114-r001"
-  local rwt, rwerr = git.worktree_add(repo, rebase_wt, rebase_branch, "main", { remote = "origin" })
-  eq(rwerr, nil, "rebase worktree created: " .. tostring(rwerr))
-  eq(rwt, rebase_wt, "rebase worktree path returned")
+    local three_dot, th_err = git.changed_files(worktree, "main", { three_dot = true })
+    eq(th_err, nil, "three-dot changed_files has no error")
+    local three_saw_export, three_saw_main = false, false
+    for _, f in ipairs(three_dot or {}) do
+      if f == "export.csv" then three_saw_export = true end
+      if f == "main-only.txt" then three_saw_main = true end
+    end
+    eq(three_saw_export, true, "three-dot sees the branch change")
+    eq(three_saw_main, false, "three-dot ignores main's later change")
 
-  maki.fs.write(maki.fs.joinpath(rebase_wt, "branch.txt"), "branch\n")
-  local rsha, rserr = git.commit(rebase_wt, "feat: branch work")
-  eq(rserr, nil, "rebase branch commit: " .. tostring(rserr))
-  eq(type(rsha), "string", "rebase branch commit returns a sha")
+    -- Push --------------------------------------------------------------------
 
-  -- main advances on the remote after the branch was cut.
-  maki.fs.write(maki.fs.joinpath(repo, "later.txt"), "later\n")
-  sh({ "git", "add", "-A" }, repo)
-  local lcode, lout = sh({ "git", "commit", "-m", "chore: main later" }, repo)
-  eq(lcode, 0, "main advanced for rebase: " .. lout:sub(1, 80))
-  local lpcode, lpout = sh({ "git", "push", "origin", "main" }, repo)
-  eq(lpcode, 0, "main pushed for rebase: " .. lpout:sub(1, 80))
-  local ms_code, ms_out = sh({ "git", "-C", repo, "rev-parse", "HEAD" })
-  eq(ms_code, 0, "main sha read for rebase: " .. ms_out:sub(1, 80))
-  local main_sha = (ms_out:gsub("%s+$", ""))
+    local pushed, perr = git.push(worktree, "metronome/T-20261114-a3f2", { remote = "origin" })
+    eq(pushed, true, "push works: " .. tostring(perr))
+    eq(perr, nil, "push has no error")
 
-  local fetched3, ferr3 = git.fetch(repo, "origin")
-  eq(fetched3, true, "fetch before rebase: " .. tostring(ferr3))
-
-  local rebased, rberr = git.rebase(rebase_wt, "origin/main")
-  eq(rberr, nil, "rebase has no error: " .. tostring(rberr))
-  eq(type(rebased), "string", "rebase returns the new head")
-  eq(#rebased, 40, "rebased head is full length")
-  eq(rebased ~= rsha, true, "rebase rewrote the branch head")
-
-  local anc_code, anc_out = sh({ "git", "-C", rebase_wt, "merge-base", "--is-ancestor", main_sha, "HEAD" })
-  eq(anc_code, 0, "the base commit is in the branch history: " .. anc_out:sub(1, 80))
-
-  -- A conflicting rebase is refused, aborted, and leaves the tree clean.
-  local conflict_wt = maki.fs.joinpath(base, "wt-conflict")
-  local conflict_branch = "metronome/T-20261114-r002"
-  local cwt, cwerr = git.worktree_add(repo, conflict_wt, conflict_branch, "main", { remote = "origin" })
-  eq(cwerr, nil, "conflict worktree created: " .. tostring(cwerr))
-
-  maki.fs.write(maki.fs.joinpath(conflict_wt, "README.md"), "# branch edit\n")
-  local ccsha, ccserr = git.commit(conflict_wt, "feat: branch edit")
-  eq(ccserr, nil, "conflict branch commit: " .. tostring(ccserr))
-  eq(type(ccsha), "string", "conflict branch commit returns a sha")
-
-  maki.fs.write(maki.fs.joinpath(repo, "README.md"), "# main edit\n")
-  sh({ "git", "add", "-A" }, repo)
-  local ccode, cout = sh({ "git", "commit", "-m", "chore: main edit" }, repo)
-  eq(ccode, 0, "main edited for the conflict: " .. cout:sub(1, 80))
-  local cpcode, cpout = sh({ "git", "push", "origin", "main" }, repo)
-  eq(cpcode, 0, "main pushed for the conflict: " .. cpout:sub(1, 80))
-  git.fetch(repo, "origin")
-
-  local before_conflict = git.head_sha(conflict_wt)
-  local conf, conferr, confinfo = git.rebase(conflict_wt, "origin/main")
-  eq(conf, nil, "conflicting rebase refused")
-  eq(type(conferr), "string", "conflict explains itself")
-  has(conferr, "conflict", "conflict message names the conflict")
-  has(conferr, "README.md", "conflict message names the file")
-  -- The repair needs the fresh base and the exact command, not only git's raw
-  -- output: they are what the human or the implementer is told to re-run.
-  has(conferr, "origin/main", "conflict message names the upstream base")
-  has(conferr, "git rebase origin/main", "conflict message names the exact command")
-
-  eq(type(confinfo), "table", "the conflict details are returned for the repair")
-  eq(confinfo and confinfo.conflict and confinfo.conflict[1], "README.md",
-    "the conflicting file is reported")
-  eq(confinfo and confinfo.upstream, "origin/main", "the upstream base is reported")
-  eq(confinfo and confinfo.command, "git rebase origin/main", "the exact command is reported")
-  -- git names the commit it could not replay as an abbreviated sha; it must be
-  -- a prefix of the branch commit, and it must not be invented when absent.
-  eq(type(confinfo and confinfo.commit), "string", "the failed commit is reported")
-  eq(ccsha:sub(1, #(confinfo and confinfo.commit or "")) == (confinfo and confinfo.commit),
-    true, "the failed commit is the branch commit")
-
-  -- The marked-up blocks are captured before the abort removes them.
-  local hunks = confinfo and confinfo.hunks or {}
-  eq(#hunks >= 1, true, "at least one conflict hunk is reported")
-  local hunk = hunks[1] or {}
-  eq(hunk.file, "README.md", "the hunk names its file")
-  local hunk_text = tostring(hunk.text or "")
-  eq(hunk_text:find("<<<<<<<", 1, true) ~= nil, true, "the hunk has the opening marker")
-  eq(hunk_text:find("=======", 1, true) ~= nil, true, "the hunk has the separator")
-  eq(hunk_text:find(">>>>>>>", 1, true) ~= nil, true, "the hunk has the closing marker")
-  has(hunk_text, "# branch edit", "the hunk holds the branch side")
-  has(hunk_text, "# main edit", "the hunk holds the upstream side")
-
-  local st_code, st_out = sh({ "git", "-C", conflict_wt, "status", "--porcelain" })
-  eq(st_code, 0, "status ran after the abort")
-  eq((st_out:gsub("%s+$", "")), "", "worktree is clean after the abort")
-  eq(git.head_sha(conflict_wt), before_conflict, "branch head unchanged after the abort")
-
-  -- A rebase that fails without naming any conflicting file still explains
-  -- itself: the message is never empty and invents neither a file nor a commit.
-  local broken, broken_err, broken_info = git.rebase(conflict_wt, "origin/no-such-base")
-  eq(broken, nil, "a rebase onto a missing upstream is refused")
-  eq(type(broken_err), "string", "the refusal explains itself")
-  eq(#broken_err > 0, true, "the refusal is never empty")
-  has(broken_err, "origin/no-such-base", "the refusal names the upstream")
-  has(broken_err, "git rebase origin/no-such-base", "the refusal names the command")
-  eq(broken_info and broken_info.conflict, nil, "no conflicting file is invented")
-  eq(broken_info and broken_info.commit, nil, "no failed commit is invented")
-  eq(broken_info and broken_info.hunks, nil, "no hunk is invented")
-
-  -- A detached worktree has no branch: that is what the post-merge checks need.
-  local detach_wt = maki.fs.joinpath(base, "wt-detach")
-  local dwt, dwerr = git.worktree_add(repo, detach_wt, nil, "origin/main", { detach = true })
-  eq(dwerr, nil, "detached worktree created: " .. tostring(dwerr))
-  eq(dwt, detach_wt, "detached worktree path returned")
-  eq(git.current_branch(detach_wt), "HEAD", "detached worktree has no branch")
-
-  -- rev_parse resolves a ref for reset_hard, which only takes a sha --------
-  local head_now = git.head_sha(repo)
-  local resolved, rperr = git.rev_parse(repo, "main")
-  eq(rperr, nil, "rev_parse resolves a branch: " .. tostring(rperr))
-  eq(resolved, head_now, "rev_parse returns the commit sha")
-  local bad_reset, bad_reset_err = git.reset_hard(repo, "origin/main")
-  eq(bad_reset, nil, "reset_hard refuses a ref")
-  eq(type(bad_reset_err), "string", "the refusal explains itself")
-  local bad_ref, bad_ref_err = git.rev_parse(repo, "no-such-ref")
-  eq(bad_ref, nil, "rev_parse refuses an unknown ref")
-  eq(type(bad_ref_err), "string", "the refusal explains itself")
-
-  -- ls_tree / show_file: the qualifier reads the committed tree -------------
-  --
-  -- The qualifier must describe `origin/<base>`, not whatever the local
-  -- checkout holds. These two read git, so a dirty working tree cannot leak
-  -- into a task sheet.
-
-  maki.fs.mkdir(maki.fs.joinpath(repo, "src"), { parents = true })
-  maki.fs.write(maki.fs.joinpath(repo, "src", "lib.js"), "module.exports = 1\n")
-  sh({ "git", "add", "-A" }, repo)
-  code, out = sh({ "git", "commit", "-m", "feat: add lib" }, repo)
-  eq(code, 0, "lib committed: " .. out:sub(1, 80))
-  code, out = sh({ "git", "push", "origin", "main" }, repo)
-  eq(code, 0, "lib pushed: " .. out:sub(1, 80))
-
-  local tree, terr = git.ls_tree(repo, "origin/main")
-  eq(terr, nil, "ls_tree has no error: " .. tostring(terr))
-  local in_tree = {}
-  for _, path in ipairs(tree or {}) do
-    in_tree[path] = true
+    local code2, out2 = sh({ "git", "-C", remote, "rev-parse", "--verify", "metronome/T-20261114-a3f2" }, base)
+    eq(code2, 0, "branch exists on the remote: " .. out2:sub(1, 80))
   end
-  eq(in_tree["README.md"], true, "ls_tree lists a committed file")
-  eq(in_tree["src/lib.js"], true, "ls_tree lists a nested committed file")
+  check_reset_and_push()
 
-  -- A dirty working tree must not change what the ref says.
-  maki.fs.write(maki.fs.joinpath(repo, "src", "lib.js"), "module.exports = 2\n")
-  maki.fs.write(maki.fs.joinpath(repo, "uncommitted.js"), "nope\n")
-  local dirty_tree = git.ls_tree(repo, "origin/main")
-  local dirty = {}
-  for _, path in ipairs(dirty_tree or {}) do
-    dirty[path] = true
+  local function check_failure_diagnostics()
+    -- Git failure diagnostics (REQ-20261114-20) -------------------------------
+    --
+    -- Each of the four real failures must produce a readable diagnostic AND leave
+    -- the task failed with the reason in its journal notes. Both halves are proven
+    -- here: a diagnostic nobody records is just a log line.
+
+    local stroot = maki.fs.joinpath(base, "state")
+
+    local function assert_diag(diag, cause, label)
+      eq(type(diag), "table", label .. ": diagnostic returned")
+      eq(diag and diag.cause, cause, label .. ": cause is " .. cause)
+      eq(type(diag and diag.message) == "string" and #diag.message > 0, true, label .. ": message non-empty")
+      eq(type(diag and diag.hint) == "string" and #diag.hint > 0, true, label .. ": hint non-empty")
+      eq(type(diag and diag.detail) == "string" and #diag.detail > 0, true, label .. ": detail non-empty")
+      eq(type(diag and diag.command) == "string" and #diag.command > 0, true, label .. ": command recorded")
+      local line = git.describe(diag)
+      eq(type(line), "string", label .. ": describe returns a line")
+      has(line, cause, label .. ": describe names the cause")
+      has(line, diag.message, label .. ": describe carries the message")
+    end
+
+    local function prove_failed(id, diag, label)
+      local created, cerr = state.create(stroot, { id = id, title = "git failure " .. id, status = "running" })
+      eq(cerr, nil, label .. ": running task created")
+      eq(created and created.status, "running", label .. ": task starts running")
+      local task, terr = git.fail_task(state, stroot, id, diag)
+      eq(terr, nil, label .. ": fail_task has no error: " .. tostring(terr))
+      eq(task and task.status, "failed", label .. ": task is failed")
+      local loaded = state.load(stroot)
+      local notes = loaded.tasks[id] and loaded.tasks[id].notes or {}
+      local found = false
+      for _, note in ipairs(notes) do
+        if type(note) == "string" and note:find(diag.cause, 1, true) then
+          found = true
+        end
+      end
+      eq(found, true, label .. ": journal note records the failure")
+    end
+
+    -- (a) The worktree path is already present.
+    local wt_dup, wt_err, wt_diag = git.worktree_add(repo, worktree, "metronome/other", "main")
+    eq(wt_dup, nil, "existing worktree path refused")
+    eq(type(wt_err), "string", "existing worktree path explains itself")
+    assert_diag(wt_diag, "worktree_exists", "worktree_exists")
+    prove_failed("T-20261114-b001", wt_diag, "worktree_exists")
+
+    -- (b) The task branch already exists.
+    local bcode, bout = sh({ "git", "branch", "metronome/dup", "main" }, repo)
+    eq(bcode, 0, "duplicate branch seeded: " .. bout:sub(1, 80))
+    local br_path = maki.fs.joinpath(base, "wt-dup")
+    local br_dup, br_err, br_diag = git.worktree_add(repo, br_path, "metronome/dup", "main")
+    eq(br_dup, nil, "existing branch refused")
+    eq(type(br_err), "string", "existing branch explains itself")
+    assert_diag(br_diag, "branch_exists", "branch_exists")
+    prove_failed("T-20261114-b002", br_diag, "branch_exists")
+
+    -- `existing` checks out the branch that already exists instead of creating
+    -- it: that is how a task re-attaches its worktree after one was removed.
+    local ex_wt, ex_err = git.worktree_add(repo, br_path, "metronome/dup", "main", { existing = true })
+    eq(ex_err, nil, "existing branch checked out: " .. tostring(ex_err))
+    eq(ex_wt, br_path, "existing worktree path returned")
+    eq(git.current_branch(br_path), "metronome/dup", "existing worktree is on the existing branch")
+
+    -- (c) The remote has a commit the task branch does not: the push is rejected.
+    local rcode, rout = sh({ "git", "checkout", "-q", "-b", "metronome/rejected", "main" }, repo)
+    eq(rcode, 0, "rejected branch seeded: " .. rout:sub(1, 80))
+    maki.fs.write(maki.fs.joinpath(repo, "remote-only.txt"), "remote\n")
+    sh({ "git", "add", "-A" }, repo)
+    local rccode, rcout = sh({ "git", "commit", "-m", "feat: remote only" }, repo)
+    eq(rccode, 0, "remote-only commit: " .. rcout:sub(1, 80))
+    local rpcode, rpout = sh({ "git", "push", "origin", "metronome/rejected" }, repo)
+    eq(rpcode, 0, "remote-only push: " .. rpout:sub(1, 80))
+    sh({ "git", "checkout", "-q", "main" }, repo)
+    local dcode, dout = sh({ "git", "branch", "-D", "metronome/rejected" }, repo)
+    eq(dcode, 0, "local seeded branch removed: " .. dout:sub(1, 80))
+
+    local wcode, wout = sh({ "git", "checkout", "-q", "-b", "metronome/rejected", "main" }, worktree)
+    eq(wcode, 0, "worktree branch cut from stale main: " .. wout:sub(1, 80))
+    maki.fs.write(maki.fs.joinpath(worktree, "local-only.txt"), "local\n")
+    local lsha, lserr = git.commit(worktree, "feat: local only")
+    eq(lserr, nil, "local-only commit: " .. tostring(lserr))
+    eq(type(lsha), "string", "local-only commit returns a sha")
+    local rej, rej_err, rej_diag = git.push(worktree, "metronome/rejected")
+    eq(rej, nil, "diverged push refused")
+    eq(type(rej_err), "string", "diverged push explains itself")
+    assert_diag(rej_diag, "push_rejected", "push_rejected")
+    prove_failed("T-20261114-b003", rej_diag, "push_rejected")
+    -- The refusal names the reason, not only git's "To <url>" preamble.
+    has(rej_err or "", "rejected", "the push refusal reports why")
+    eq((rej_err or ""):find("^To ", 1) ~= nil, false, "the refusal is not git's preamble")
+
+    -- The pipeline rewrites its own branches (rebase onto the fresh base,
+    -- rollback to a checkpoint), so a task branch is pushed with a lease: the
+    -- same diverged push succeeds, and the remote now holds the local commit.
+    local forced, forced_err = git.push(worktree, "metronome/rejected", { force = true })
+    eq(forced, true, "a leased push replaces a rewritten branch: " .. tostring(forced_err))
+    local remote_sha_code, remote_sha = sh({ "git", "-C", remote, "rev-parse", "metronome/rejected" })
+    eq(remote_sha_code, 0, "remote branch readable")
+    eq((remote_sha:gsub("%s+$", "")), lsha, "the remote branch holds the rewritten commit")
+
+    -- (d) The remote does not exist.
+    local fetched_missing, fm_err, fm_diag = git.fetch(repo, "nope")
+    eq(fetched_missing, nil, "missing remote refused")
+    eq(type(fm_err), "string", "missing remote explains itself")
+    assert_diag(fm_diag, "remote_missing", "remote_missing")
+    prove_failed("T-20261114-b004", fm_diag, "remote_missing")
   end
-  eq(dirty["uncommitted.js"], nil, "ls_tree ignores an uncommitted file")
+  check_failure_diagnostics()
 
-  local text, serr = git.show_file(repo, "origin/main", "src/lib.js")
-  eq(serr, nil, "show_file has no error: " .. tostring(serr))
-  eq(text, "module.exports = 1", "show_file returns the committed content, not the dirty one")
+  local function check_rebase()
+    -- Rebase and detached worktrees (REQ-20261114-31) --------------------------
+    --
+    -- A task branch is rebased onto the fresh base before the PR is merged, and
+    -- the post-merge checks run in a detached worktree cut from that base. Both
+    -- shapes are proven here, including the conflict path, which must leave the
+    -- worktree clean and the branch head untouched.
 
-  local missing_text, missing_err = git.show_file(repo, "origin/main", "does/not/exist.js")
-  eq(missing_text, nil, "show_file refuses a missing path")
-  has(missing_err or "", "does/not/exist.js", "the refusal names the path")
+    local mcode3, mout3 = sh({ "git", "push", "origin", "main" }, repo)
+    eq(mcode3, 0, "main pushed before the rebase tests: " .. mout3:sub(1, 80))
 
-  local bad_ref, bad_ref_err = git.ls_tree(repo, "origin/no-such-branch")
-  eq(bad_ref, nil, "ls_tree refuses an unknown ref")
-  eq(type(bad_ref_err), "string", "ls_tree explains an unknown ref")
+    rebase_wt = maki.fs.joinpath(base, "wt-rebase")
+    local rebase_branch = "metronome/T-20261114-r001"
+    local rwt, rwerr = git.worktree_add(repo, rebase_wt, rebase_branch, "main", { remote = "origin" })
+    eq(rwerr, nil, "rebase worktree created: " .. tostring(rwerr))
+    eq(rwt, rebase_wt, "rebase worktree path returned")
 
-  local no_ref, no_ref_err = git.ls_tree(repo, "")
-  eq(no_ref, nil, "ls_tree needs a ref")
-  eq(type(no_ref_err), "string", "ls_tree says a ref is missing")
+    maki.fs.write(maki.fs.joinpath(rebase_wt, "branch.txt"), "branch\n")
+    local rsha, rserr = git.commit(rebase_wt, "feat: branch work")
+    eq(rserr, nil, "rebase branch commit: " .. tostring(rserr))
+    eq(type(rsha), "string", "rebase branch commit returns a sha")
 
-  -- Restore the working tree so the rest of the suite is unaffected.
-  sh({ "git", "checkout", "--", "src/lib.js" }, repo)
-  maki.fs.rm(maki.fs.joinpath(repo, "uncommitted.js"))
+    -- main advances on the remote after the branch was cut.
+    maki.fs.write(maki.fs.joinpath(repo, "later.txt"), "later\n")
+    sh({ "git", "add", "-A" }, repo)
+    local lcode, lout = sh({ "git", "commit", "-m", "chore: main later" }, repo)
+    eq(lcode, 0, "main advanced for rebase: " .. lout:sub(1, 80))
+    local lpcode, lpout = sh({ "git", "push", "origin", "main" }, repo)
+    eq(lpcode, 0, "main pushed for rebase: " .. lpout:sub(1, 80))
+    local ms_code, ms_out = sh({ "git", "-C", repo, "rev-parse", "HEAD" })
+    eq(ms_code, 0, "main sha read for rebase: " .. ms_out:sub(1, 80))
+    local main_sha = (ms_out:gsub("%s+$", ""))
 
-  -- An already-committed tree is a success, whatever the locale ------------
-  --
-  -- The benign "nothing to commit" case used to be decided by finding the
-  -- English text in git's output, so a French git turned a finished task into
-  -- `git commit exit 1: Sur la branche main ... rien à valider`. The answer now
-  -- comes from the repository state, which no locale can change.
+    local fetched3, ferr3 = git.fetch(repo, "origin")
+    eq(fetched3, true, "fetch before rebase: " .. tostring(ferr3))
 
-  local commit_wt = maki.fs.joinpath(base, "wt-commit")
-  local commit_branch = "metronome/T-20261122-c001"
-  local cwt, cwerr = git.worktree_add(repo, commit_wt, commit_branch, "main", { remote = "origin" })
-  eq(cwerr, nil, "commit worktree created: " .. tostring(cwerr))
-  eq(cwt, commit_wt, "commit worktree path returned")
+    local rebased, rberr = git.rebase(rebase_wt, "origin/main")
+    eq(rberr, nil, "rebase has no error: " .. tostring(rberr))
+    eq(type(rebased), "string", "rebase returns the new head")
+    eq(#rebased, 40, "rebased head is full length")
+    eq(rebased ~= rsha, true, "rebase rewrote the branch head")
 
-  maki.fs.write(maki.fs.joinpath(commit_wt, "done.lua"), "return true\n")
-  local done_sha, done_err = git.commit(commit_wt, "feat: already done")
-  eq(done_err, nil, "the first commit lands: " .. tostring(done_err))
-  eq(type(done_sha), "string", "the first commit returns a sha")
-  eq(#(done_sha or ""), 40, "the first commit sha is full length")
+    local anc_code, anc_out = sh({ "git", "-C", rebase_wt, "merge-base", "--is-ancestor", main_sha, "HEAD" })
+    eq(anc_code, 0, "the base commit is in the branch history: " .. anc_out:sub(1, 80))
 
-  -- The commit is already in place and the tree is clean: nothing left to do.
-  local again, again_err = git.commit(commit_wt, "feat: already done")
-  eq(again, nil, "a clean tree returns no sha")
-  eq(again_err, "nothing to commit", "a clean tree reports the stable sentinel")
-  eq(git.head_sha(commit_wt), done_sha, "the benign commit leaves HEAD untouched")
+    -- A conflicting rebase is refused, aborted, and leaves the tree clean.
+    conflict_wt = maki.fs.joinpath(base, "wt-conflict")
+    local conflict_branch = "metronome/T-20261114-r002"
+    local cwt, cwerr = git.worktree_add(repo, conflict_wt, conflict_branch, "main", { remote = "origin" })
+    eq(cwerr, nil, "conflict worktree created: " .. tostring(cwerr))
 
-  -- classify() names the cause from either wording: the French output is the
-  -- one that condemned the task, and it must never read as auth or push.
-  local french = git.classify("git commit", {
-    code = 1,
-    command = "git commit -m 'feat: already done'",
-    stdout = "",
-    stderr = "Sur la branche main\nrien à valider, la copie de travail est propre\n",
-  })
-  eq(french.cause, "nothing_to_commit", "a French clean tree is classified nothing_to_commit")
-  eq(french.cause == "auth_failed" or french.cause == "push_rejected", false,
-    "a clean tree is never auth_failed or push_rejected")
-  has(french.message, "commit", "the cause says the commit is in place")
-  has(french.hint, "checks", "the remedy says to continue the checks")
-  local english = git.classify("git commit", {
-    code = 1,
-    command = "git commit -m 'feat: already done'",
-    stderr = "nothing to commit, working tree clean\n",
-  })
-  eq(english.cause, "nothing_to_commit", "the English wording gives the same cause")
-  eq(git.describe(french):find("nothing_to_commit", 1, true) ~= nil, true,
-    "the diagnostic reads as a benign cause, not as a failure")
+    maki.fs.write(maki.fs.joinpath(conflict_wt, "README.md"), "# branch edit\n")
+    local ccsha, ccserr = git.commit(conflict_wt, "feat: branch edit")
+    eq(ccserr, nil, "conflict branch commit: " .. tostring(ccserr))
+    eq(type(ccsha), "string", "conflict branch commit returns a sha")
 
-  -- A tree that really changed is still committed: the state check must not
-  -- swallow a genuine change.
-  maki.fs.write(maki.fs.joinpath(commit_wt, "extra.lua"), "return 2\n")
-  local changed_sha, changed_err = git.commit(commit_wt, "feat: real change")
-  eq(changed_err, nil, "a modified tree still commits: " .. tostring(changed_err))
-  eq(type(changed_sha), "string", "a modified tree returns a sha")
-  eq(changed_sha ~= done_sha, true, "the modified tree is a new commit")
-  local ccode, cout = sh({ "git", "-C", commit_wt, "ls-tree", "-r", "--name-only", "HEAD" })
-  eq(ccode, 0, "the commit worktree head is readable")
-  has(cout, "extra.lua", "the change is in the commit")
+    maki.fs.write(maki.fs.joinpath(repo, "README.md"), "# main edit\n")
+    sh({ "git", "add", "-A" }, repo)
+    local ccode, cout = sh({ "git", "commit", "-m", "chore: main edit" }, repo)
+    eq(ccode, 0, "main edited for the conflict: " .. cout:sub(1, 80))
+    local cpcode, cpout = sh({ "git", "push", "origin", "main" }, repo)
+    eq(cpcode, 0, "main pushed for the conflict: " .. cpout:sub(1, 80))
+    git.fetch(repo, "origin")
 
-  -- PR verification: recorded number, worktree cwd ---------------------------
-  --
-  -- A recorded `pr.state` is only a cache: pr_open re-reads the PR before
-  -- reusing it, and that read must target the task worktree -- the repository
-  -- the PR belongs to -- never the plugin's own checkout. The fake `gh` records
-  -- both its cwd and its argv, so one log proves the number and the repository.
+    local before_conflict = git.head_sha(conflict_wt)
+    local conf, conferr, confinfo = git.rebase(conflict_wt, "origin/main")
+    eq(conf, nil, "conflicting rebase refused")
+    eq(type(conferr), "string", "conflict explains itself")
+    has(conferr, "conflict", "conflict message names the conflict")
+    has(conferr, "README.md", "conflict message names the file")
+    -- The repair needs the fresh base and the exact command, not only git's raw
+    -- output: they are what the human or the implementer is told to re-run.
+    has(conferr, "origin/main", "conflict message names the upstream base")
+    has(conferr, "git rebase origin/main", "conflict message names the exact command")
 
-  local pr_root = maki.fs.joinpath(base, "state-pr")
-  local gh_bin = maki.fs.joinpath(base, "pr-bin")
-  local gh_log = maki.fs.joinpath(base, "gh-pr.log")
-  maki.fs.mkdir(gh_bin, { parents = true })
-  maki.fs.write(gh_log, "")
-  local gh_script = maki.fs.joinpath(gh_bin, "gh")
-  local function squote(value)
-    return "'" .. value:gsub("'", "'\\''") .. "'"
+    eq(type(confinfo), "table", "the conflict details are returned for the repair")
+    eq(confinfo and confinfo.conflict and confinfo.conflict[1], "README.md",
+      "the conflicting file is reported")
+    eq(confinfo and confinfo.upstream, "origin/main", "the upstream base is reported")
+    eq(confinfo and confinfo.command, "git rebase origin/main", "the exact command is reported")
+    -- git names the commit it could not replay as an abbreviated sha; it must be
+    -- a prefix of the branch commit, and it must not be invented when absent.
+    eq(type(confinfo and confinfo.commit), "string", "the failed commit is reported")
+    eq(ccsha:sub(1, #(confinfo and confinfo.commit or "")) == (confinfo and confinfo.commit),
+      true, "the failed commit is the branch commit")
+
+    -- The marked-up blocks are captured before the abort removes them.
+    local hunks = confinfo and confinfo.hunks or {}
+    eq(#hunks >= 1, true, "at least one conflict hunk is reported")
+    local hunk = hunks[1] or {}
+    eq(hunk.file, "README.md", "the hunk names its file")
+    local hunk_text = tostring(hunk.text or "")
+    eq(hunk_text:find("<<<<<<<", 1, true) ~= nil, true, "the hunk has the opening marker")
+    eq(hunk_text:find("=======", 1, true) ~= nil, true, "the hunk has the separator")
+    eq(hunk_text:find(">>>>>>>", 1, true) ~= nil, true, "the hunk has the closing marker")
+    has(hunk_text, "# branch edit", "the hunk holds the branch side")
+    has(hunk_text, "# main edit", "the hunk holds the upstream side")
+
+    local st_code, st_out = sh({ "git", "-C", conflict_wt, "status", "--porcelain" })
+    eq(st_code, 0, "status ran after the abort")
+    eq((st_out:gsub("%s+$", "")), "", "worktree is clean after the abort")
+    eq(git.head_sha(conflict_wt), before_conflict, "branch head unchanged after the abort")
+
+    -- A rebase that fails without naming any conflicting file still explains
+    -- itself: the message is never empty and invents neither a file nor a commit.
+    local broken, broken_err, broken_info = git.rebase(conflict_wt, "origin/no-such-base")
+    eq(broken, nil, "a rebase onto a missing upstream is refused")
+    eq(type(broken_err), "string", "the refusal explains itself")
+    eq(#broken_err > 0, true, "the refusal is never empty")
+    has(broken_err, "origin/no-such-base", "the refusal names the upstream")
+    has(broken_err, "git rebase origin/no-such-base", "the refusal names the command")
+    eq(broken_info and broken_info.conflict, nil, "no conflicting file is invented")
+    eq(broken_info and broken_info.commit, nil, "no failed commit is invented")
+    eq(broken_info and broken_info.hunks, nil, "no hunk is invented")
+
+    -- A detached worktree has no branch: that is what the post-merge checks need.
+    detach_wt = maki.fs.joinpath(base, "wt-detach")
+    local dwt, dwerr = git.worktree_add(repo, detach_wt, nil, "origin/main", { detach = true })
+    eq(dwerr, nil, "detached worktree created: " .. tostring(dwerr))
+    eq(dwt, detach_wt, "detached worktree path returned")
+    eq(git.current_branch(detach_wt), "HEAD", "detached worktree has no branch")
+
+    -- rev_parse resolves a ref for reset_hard, which only takes a sha --------
+    local head_now = git.head_sha(repo)
+    local resolved, rperr = git.rev_parse(repo, "main")
+    eq(rperr, nil, "rev_parse resolves a branch: " .. tostring(rperr))
+    eq(resolved, head_now, "rev_parse returns the commit sha")
+    local bad_reset, bad_reset_err = git.reset_hard(repo, "origin/main")
+    eq(bad_reset, nil, "reset_hard refuses a ref")
+    eq(type(bad_reset_err), "string", "the refusal explains itself")
+    local bad_ref, bad_ref_err = git.rev_parse(repo, "no-such-ref")
+    eq(bad_ref, nil, "rev_parse refuses an unknown ref")
+    eq(type(bad_ref_err), "string", "the refusal explains itself")
   end
-  maki.fs.write(gh_script, table.concat({
-    "#!/usr/bin/env bash",
-    "printf 'cwd=%s argv=%s\\n' \"$(pwd)\" \"$*\" >> " .. squote(gh_log),
-    "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then",
-    "  echo '{\"number\":77,\"url\":\"https://github.com/example/repo/pull/77\",\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"baseRefName\":\"main\"}'",
-    "  exit 0",
-    "fi",
-    "echo \"unexpected: $*\" >&2",
-    "exit 2",
-    "",
-  }, "\n"))
-  local gh_code, gh_out = sh({ "chmod", "+x", gh_script })
-  eq(gh_code, 0, "fake gh is executable: " .. gh_out:sub(1, 80))
+  check_rebase()
 
-  local pr_task_id = "T-20261122-pr01"
-  local pr_created, pr_cerr = state.create(pr_root, {
-    id = pr_task_id,
-    title = "verify pr",
-    status = "reviewing",
-  })
-  eq(pr_cerr, nil, "PR task created: " .. tostring(pr_cerr))
-  eq(pr_created and pr_created.status, "reviewing", "PR task starts reviewing")
+  local function check_tree()
+    -- ls_tree / show_file: the qualifier reads the committed tree -------------
+    --
+    -- The qualifier must describe `origin/<base>`, not whatever the local
+    -- checkout holds. These two read git, so a dirty working tree cannot leak
+    -- into a task sheet.
 
-  local pr_attached, pr_aerr = git.pr_attach(state, pr_root, pr_task_id, {
-    number = 77,
-    url = "https://github.com/example/repo/pull/77",
-    state = "open",
-  })
-  eq(pr_aerr, nil, "the recorded PR is attached: " .. tostring(pr_aerr))
-  eq(pr_attached and pr_attached.pr and pr_attached.pr.number, 77, "the task carries PR 77")
+    maki.fs.mkdir(maki.fs.joinpath(repo, "src"), { parents = true })
+    maki.fs.write(maki.fs.joinpath(repo, "src", "lib.js"), "module.exports = 1\n")
+    sh({ "git", "add", "-A" }, repo)
+    code, out = sh({ "git", "commit", "-m", "feat: add lib" }, repo)
+    eq(code, 0, "lib committed: " .. out:sub(1, 80))
+    code, out = sh({ "git", "push", "origin", "main" }, repo)
+    eq(code, 0, "lib pushed: " .. out:sub(1, 80))
 
-  local pr_reused, pr_rerr = git.pr_open(state, pr_root, pr_task_id, {
-    title = "feat: verify pr",
-    base = "main",
-    head = "metronome/T-20261122-pr01",
-    worktree = worktree,
-    gh = gh_script,
-    attach_only = true,
-  })
-  eq(pr_rerr, nil, "pr_open reuses the verified PR: " .. tostring(pr_rerr))
-  eq(pr_reused and pr_reused.number, 77, "pr_open returns the recorded number")
+    local tree, terr = git.ls_tree(repo, "origin/main")
+    eq(terr, nil, "ls_tree has no error: " .. tostring(terr))
+    local in_tree = {}
+    for _, path in ipairs(tree or {}) do
+      in_tree[path] = true
+    end
+    eq(in_tree["README.md"], true, "ls_tree lists a committed file")
+    eq(in_tree["src/lib.js"], true, "ls_tree lists a nested committed file")
 
-  local gh_text = maki.fs.read(gh_log) or ""
-  has(gh_text, "cwd=" .. worktree, "the verification runs in the task worktree")
-  eq(gh_text:find("cwd=" .. repo .. " ", 1, true), nil,
-    "the verification never runs in the project repository")
-  has(gh_text, "argv=pr view 77 --json number,url,state,mergeable,baseRefName",
-    "the verification uses the recorded number and the full JSON field list")
-  eq(gh_text:find("pr create", 1, true), nil, "a verified open PR is not recreated")
+    -- A dirty working tree must not change what the ref says.
+    maki.fs.write(maki.fs.joinpath(repo, "src", "lib.js"), "module.exports = 2\n")
+    maki.fs.write(maki.fs.joinpath(repo, "uncommitted.js"), "nope\n")
+    local dirty_tree = git.ls_tree(repo, "origin/main")
+    local dirty = {}
+    for _, path in ipairs(dirty_tree or {}) do
+      dirty[path] = true
+    end
+    eq(dirty["uncommitted.js"], nil, "ls_tree ignores an uncommitted file")
+
+    local text, serr = git.show_file(repo, "origin/main", "src/lib.js")
+    eq(serr, nil, "show_file has no error: " .. tostring(serr))
+    eq(text, "module.exports = 1", "show_file returns the committed content, not the dirty one")
+
+    local missing_text, missing_err = git.show_file(repo, "origin/main", "does/not/exist.js")
+    eq(missing_text, nil, "show_file refuses a missing path")
+    has(missing_err or "", "does/not/exist.js", "the refusal names the path")
+
+    local bad_ref, bad_ref_err = git.ls_tree(repo, "origin/no-such-branch")
+    eq(bad_ref, nil, "ls_tree refuses an unknown ref")
+    eq(type(bad_ref_err), "string", "ls_tree explains an unknown ref")
+
+    local no_ref, no_ref_err = git.ls_tree(repo, "")
+    eq(no_ref, nil, "ls_tree needs a ref")
+    eq(type(no_ref_err), "string", "ls_tree says a ref is missing")
+
+    -- Restore the working tree so the rest of the suite is unaffected.
+    sh({ "git", "checkout", "--", "src/lib.js" }, repo)
+    maki.fs.rm(maki.fs.joinpath(repo, "uncommitted.js"))
+
+    -- An already-committed tree is a success, whatever the locale ------------
+    --
+    -- The benign "nothing to commit" case used to be decided by finding the
+    -- English text in git's output, so a French git turned a finished task into
+    -- `git commit exit 1: Sur la branche main ... rien à valider`. The answer now
+    -- comes from the repository state, which no locale can change.
+
+    commit_wt = maki.fs.joinpath(base, "wt-commit")
+    local commit_branch = "metronome/T-20261122-c001"
+    local cwt, cwerr = git.worktree_add(repo, commit_wt, commit_branch, "main", { remote = "origin" })
+    eq(cwerr, nil, "commit worktree created: " .. tostring(cwerr))
+    eq(cwt, commit_wt, "commit worktree path returned")
+
+    maki.fs.write(maki.fs.joinpath(commit_wt, "done.lua"), "return true\n")
+    local done_sha, done_err = git.commit(commit_wt, "feat: already done")
+    eq(done_err, nil, "the first commit lands: " .. tostring(done_err))
+    eq(type(done_sha), "string", "the first commit returns a sha")
+    eq(#(done_sha or ""), 40, "the first commit sha is full length")
+
+    -- The commit is already in place and the tree is clean: nothing left to do.
+    local again, again_err = git.commit(commit_wt, "feat: already done")
+    eq(again, nil, "a clean tree returns no sha")
+    eq(again_err, "nothing to commit", "a clean tree reports the stable sentinel")
+    eq(git.head_sha(commit_wt), done_sha, "the benign commit leaves HEAD untouched")
+
+    -- classify() names the cause from either wording: the French output is the
+    -- one that condemned the task, and it must never read as auth or push.
+    local french = git.classify("git commit", {
+      code = 1,
+      command = "git commit -m 'feat: already done'",
+      stdout = "",
+      stderr = "Sur la branche main\nrien à valider, la copie de travail est propre\n",
+    })
+    eq(french.cause, "nothing_to_commit", "a French clean tree is classified nothing_to_commit")
+    eq(french.cause == "auth_failed" or french.cause == "push_rejected", false,
+      "a clean tree is never auth_failed or push_rejected")
+    has(french.message, "commit", "the cause says the commit is in place")
+    has(french.hint, "checks", "the remedy says to continue the checks")
+    local english = git.classify("git commit", {
+      code = 1,
+      command = "git commit -m 'feat: already done'",
+      stderr = "nothing to commit, working tree clean\n",
+    })
+    eq(english.cause, "nothing_to_commit", "the English wording gives the same cause")
+    eq(git.describe(french):find("nothing_to_commit", 1, true) ~= nil, true,
+      "the diagnostic reads as a benign cause, not as a failure")
+
+    -- A tree that really changed is still committed: the state check must not
+    -- swallow a genuine change.
+    maki.fs.write(maki.fs.joinpath(commit_wt, "extra.lua"), "return 2\n")
+    local changed_sha, changed_err = git.commit(commit_wt, "feat: real change")
+    eq(changed_err, nil, "a modified tree still commits: " .. tostring(changed_err))
+    eq(type(changed_sha), "string", "a modified tree returns a sha")
+    eq(changed_sha ~= done_sha, true, "the modified tree is a new commit")
+    local ccode, cout = sh({ "git", "-C", commit_wt, "ls-tree", "-r", "--name-only", "HEAD" })
+    eq(ccode, 0, "the commit worktree head is readable")
+    has(cout, "extra.lua", "the change is in the commit")
+  end
+  check_tree()
+
+  local function check_pr_verification()
+    -- PR verification: recorded number, worktree cwd ---------------------------
+    --
+    -- A recorded `pr.state` is only a cache: pr_open re-reads the PR before
+    -- reusing it, and that read must target the task worktree -- the repository
+    -- the PR belongs to -- never the plugin's own checkout. The fake `gh` records
+    -- both its cwd and its argv, so one log proves the number and the repository.
+
+    local pr_root = maki.fs.joinpath(base, "state-pr")
+    local gh_bin = maki.fs.joinpath(base, "pr-bin")
+    local gh_log = maki.fs.joinpath(base, "gh-pr.log")
+    maki.fs.mkdir(gh_bin, { parents = true })
+    maki.fs.write(gh_log, "")
+    local gh_script = maki.fs.joinpath(gh_bin, "gh")
+    local function squote(value)
+      return "'" .. value:gsub("'", "'\\''") .. "'"
+    end
+    maki.fs.write(gh_script, table.concat({
+      "#!/usr/bin/env bash",
+      "printf 'cwd=%s argv=%s\\n' \"$(pwd)\" \"$*\" >> " .. squote(gh_log),
+      "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then",
+      "  echo '{\"number\":77,\"url\":\"https://github.com/example/repo/pull/77\",\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"baseRefName\":\"main\"}'",
+      "  exit 0",
+      "fi",
+      "echo \"unexpected: $*\" >&2",
+      "exit 2",
+      "",
+    }, "\n"))
+    local gh_code, gh_out = sh({ "chmod", "+x", gh_script })
+    eq(gh_code, 0, "fake gh is executable: " .. gh_out:sub(1, 80))
+
+    local pr_task_id = "T-20261122-pr01"
+    local pr_created, pr_cerr = state.create(pr_root, {
+      id = pr_task_id,
+      title = "verify pr",
+      status = "reviewing",
+    })
+    eq(pr_cerr, nil, "PR task created: " .. tostring(pr_cerr))
+    eq(pr_created and pr_created.status, "reviewing", "PR task starts reviewing")
+
+    local pr_attached, pr_aerr = git.pr_attach(state, pr_root, pr_task_id, {
+      number = 77,
+      url = "https://github.com/example/repo/pull/77",
+      state = "open",
+    })
+    eq(pr_aerr, nil, "the recorded PR is attached: " .. tostring(pr_aerr))
+    eq(pr_attached and pr_attached.pr and pr_attached.pr.number, 77, "the task carries PR 77")
+
+    local pr_reused, pr_rerr = git.pr_open(state, pr_root, pr_task_id, {
+      title = "feat: verify pr",
+      base = "main",
+      head = "metronome/T-20261122-pr01",
+      worktree = worktree,
+      gh = gh_script,
+      attach_only = true,
+    })
+    eq(pr_rerr, nil, "pr_open reuses the verified PR: " .. tostring(pr_rerr))
+    eq(pr_reused and pr_reused.number, 77, "pr_open returns the recorded number")
+
+    local gh_text = maki.fs.read(gh_log) or ""
+    has(gh_text, "cwd=" .. worktree, "the verification runs in the task worktree")
+    eq(gh_text:find("cwd=" .. repo .. " ", 1, true), nil,
+      "the verification never runs in the project repository")
+    has(gh_text, "argv=pr view 77 --json number,url,state,mergeable,baseRefName",
+      "the verification uses the recorded number and the full JSON field list")
+    eq(gh_text:find("pr create", 1, true), nil, "a verified open PR is not recreated")
+    -- Kept in a nested function: this section alone declares several locals,
+    -- and the whole case function sits close to the Lua 5.1 limit of 200
+    -- active locals (the limit counts the enclosing scope plus the block).
+  end
+  check_pr_verification()
+
+  -- Single-flight fetch (T-20261122-0047) -----------------------------------
+  --
+  -- Two tasks that start at the same time both want a fresh base, and two
+  -- `git fetch` children on one clone fight over the same ref locks. The
+  -- sandbox offers neither io nor flock, so the module keeps an in-process
+  -- registry of fetches in flight instead of a lock file: callers that ask for
+  -- a fetch already running for the same key (repo + remote + args) wait for
+  -- it and reuse its result, and only the owner launches the git child.
+  --
+  -- The wrapper counts the real `git ... fetch` children per key, so "one
+  -- command" is measured, not assumed.
+  local function check_fetch_single_flight()
+      do
+        local real_jobstart = maki.fn.jobstart
+        local launched = {}
+        local function argv_key(argv)
+          local is_fetch = false
+          for _, arg in ipairs(argv) do
+            if arg == "fetch" then is_fetch = true end
+          end
+          return is_fetch and table.concat(argv, " ") or nil
+        end
+        maki.fn.jobstart = function(argv, opts)
+          local key = argv_key(argv)
+          if not key then
+            return real_jobstart(argv, opts)
+          end
+          -- Hold the child a moment before it runs: a local fetch is instant, and
+          -- the point here is four callers that overlap, not a fast remote. The
+          -- counted command is still the one git fetch the module asked for.
+          local slow = { "sh", "-c", 'sleep 0.6; exec "$@"', "sh" }
+          for _, arg in ipairs(argv) do
+            slow[#slow + 1] = arg
+          end
+          -- Count the children that really started: run() retries a jobstart that
+          -- has no task scope, and an attempt that raised is not a git child.
+          local job = real_jobstart(slow, opts)
+          if job then
+            launched[key] = (launched[key] or 0) + 1
+          end
+          return job
+        end
+        local function fetch_key(repo_path, remote_name)
+          return table.concat({
+            "env", "LC_ALL=C", "LANG=C", "git", "-C", repo_path, "fetch", remote_name, "--prune",
+          }, " ")
+        end
+        local origin_key = fetch_key(repo, "origin")
+
+        -- (a) Four callers, one clone, one remote: four successes, one child.
+        eq(type(maki.async and maki.async.gather), "function", "the host can run four callers at once")
+        local outcomes = maki.async.gather({
+          function() return git.fetch(repo, "origin") end,
+          function() return git.fetch(repo, "origin") end,
+          function() return git.fetch(repo, "origin") end,
+          function() return git.fetch(repo, "origin") end,
+        })
+        eq(#(outcomes or {}), 4, "four concurrent fetches answered")
+        for i = 1, 4 do
+          local outcome = (outcomes or {})[i] or {}
+          eq(outcome.ok, true, "concurrent fetch " .. i .. " succeeds: " .. tostring(outcome.err))
+          eq(outcome.value, true, "concurrent fetch " .. i .. " reuses the fetch success")
+        end
+        eq(launched[origin_key], 1, "four callers launched a single git fetch child")
+
+        -- (b) A failed fetch does not poison the registry -----------------------
+        --
+        -- The registry must be released on every path: a missing remote (a real
+        -- git failure) and a crash raised while collecting the child (pcall).
+        local nope_key = fetch_key(repo, "nope")
+        local nope1, nope1_err = git.fetch(repo, "nope")
+        eq(nope1, nil, "the first failing fetch fails")
+        eq(type(nope1_err), "string", "the first failing fetch explains itself")
+        local nope2, nope2_err = git.fetch(repo, "nope")
+        eq(nope2, nil, "an identical fetch fails again instead of hanging")
+        eq(type(nope2_err), "string", "the second failing fetch explains itself")
+        eq(launched[nope_key], 2, "the fetch after a failure launches a new child")
+
+        local real_jobwait = maki.fn.jobwait
+        local crash_next = false
+        maki.fn.jobwait = function(job, ms)
+          local result = real_jobwait(job, ms)
+          if crash_next then
+            crash_next = false
+            -- Raise only after the child exited: the point is the registry
+            -- cleanup, not an orphaned fetch that would hold a ref lock.
+            error("simulated crash while waiting on git")
+          end
+          return result
+        end
+        local before_crash = launched[origin_key] or 0
+        crash_next = true
+        local crashed, crashed_err = git.fetch(repo, "origin")
+        maki.fn.jobwait = real_jobwait
+        eq(crashed, nil, "a crash inside a fetch is reported, not raised")
+        has(crashed_err or "", "simulated crash", "the crash message survives")
+        eq(launched[origin_key], before_crash + 1, "the crashed fetch did launch one child")
+        local recovered, recovered_err = git.fetch(repo, "origin")
+        eq(recovered, true, "the fetch after a crash succeeds: " .. tostring(recovered_err))
+        eq(launched[origin_key], before_crash + 2, "the registry was released after the exception")
+
+        -- (b-bis) A concurrent failure reaches every waiter: one child, one error,
+        -- no retry behind the caller's back.
+        local function ask_failing_fetch()
+          local ok, err = git.fetch(repo, "nope")
+          return { ok = ok, err = err }
+        end
+        local failed = maki.async.gather({ ask_failing_fetch, ask_failing_fetch })
+        eq(#(failed or {}), 2, "two concurrent failing fetches answered")
+        for i = 1, 2 do
+          local outcome = (failed or {})[i] or {}
+          local answer = outcome.value or {}
+          eq(outcome.ok, true, "concurrent failure " .. i .. " is reported, not raised")
+          eq(answer.ok, nil, "concurrent failure " .. i .. " did not fetch")
+          has(tostring(answer.err), "remote_missing", "concurrent failure " .. i .. " carries the cause")
+        end
+        eq(launched[nope_key], 3, "two failing callers launched a single git fetch child")
+
+        maki.fn.jobstart = real_jobstart
+      end
+  end
+  check_fetch_single_flight()
+
+  local function check_ref_lock()
+    -- (c) A ref lock is contention, not a failure of the command --------------
+    --
+    -- Any git command can lose a race for a ref lock (fetch, push, rebase). The
+    -- cause is dedicated and marked transient/retryable so a caller replays it
+    -- instead of failing the task; the message names the contention and the
+    -- hint names the remedy.
+    do
+      local lock_patterns = {
+        "error: cannot lock ref 'refs/remotes/origin/main': Unable to create '...lock': File exists.",
+        "error: unable to update local ref",
+        "error: failed to update ref",
+      }
+      for _, what in ipairs({ "fetch", "push", "rebase" }) do
+        for _, pattern in ipairs(lock_patterns) do
+          local label = what .. " lock: " .. pattern:sub(1, 24)
+          local diag = git.classify(what, {
+            code = 1,
+            command = "git " .. what,
+            stdout = "",
+            stderr = pattern .. "\n",
+          })
+          eq(diag.cause, "git_lock", label .. " is classified git_lock")
+          eq(diag.transient, true, label .. " is transient")
+          eq(diag.retryable, true, label .. " is retryable")
+          has(diag.message, "lock", label .. " names the contention")
+          has(diag.hint, "retry", label .. " names the remedy")
+          has(git.describe(diag), "git_lock", label .. " reads as git_lock")
+        end
+      end
+      local plain = git.classify("fetch", {
+        code = 1,
+        command = "git fetch",
+        stdout = "",
+        stderr = "fatal: the remote hung up unexpectedly\n",
+      })
+      eq(plain.cause, "git_error", "a stderr without a lock pattern stays git_error")
+      eq(plain.transient, nil, "a plain failure is not transient")
+    end
+
+    -- A real lock, through M.rebase: a leftover .lock file makes git fail with
+    -- "cannot lock ref", so the caller must see git_lock; once the lock is gone
+    -- the retry succeeds. A conflict still reports the conflict, not a lock.
+    do
+      local lock_wt = maki.fs.joinpath(base, "wt-lock")
+      local lock_branch = "metronome/T-20261122-l001"
+      local lwt, lwerr = git.worktree_add(repo, lock_wt, lock_branch, "main", { remote = "origin" })
+      eq(lwerr, nil, "lock worktree created: " .. tostring(lwerr))
+      maki.fs.write(maki.fs.joinpath(lock_wt, "locked.txt"), "locked\n")
+      local lock_sha, lock_serr = git.commit(lock_wt, "feat: work to rebase")
+      eq(lock_serr, nil, "lock worktree commit: " .. tostring(lock_serr))
+      eq(type(lock_sha), "string", "lock worktree commit returns a sha")
+
+      -- main moves on after the branch was cut, so the rebase really replays a
+      -- commit and has to update the branch ref (a no-op rebase touches no lock).
+      maki.fs.write(maki.fs.joinpath(repo, "lock-main.txt"), "main\n")
+      sh({ "git", "add", "-A" }, repo)
+      local lmcode, lmout = sh({ "git", "commit", "-m", "chore: main before the lock" }, repo)
+      eq(lmcode, 0, "main advanced for the lock: " .. lmout:sub(1, 80))
+      local lmpcode, lmpout = sh({ "git", "push", "origin", "main" }, repo)
+      eq(lmpcode, 0, "main pushed for the lock: " .. lmpout:sub(1, 80))
+      local lock_fetched, lock_fetched_err = git.fetch(repo, "origin")
+      eq(lock_fetched, true, "fetch before the locked rebase: " .. tostring(lock_fetched_err))
+
+      local lock_path = maki.fs.joinpath(repo, ".git", "refs", "heads", lock_branch .. ".lock")
+      maki.fs.mkdir(maki.fs.joinpath(repo, ".git", "refs", "heads", "metronome"), { parents = true })
+      local wrote_lock, wrote_lock_err = maki.fs.write(lock_path, "")
+      eq(wrote_lock ~= nil and wrote_lock ~= false, true, "the ref lock fixture was written: " .. tostring(wrote_lock_err))
+      local locked, locked_err, locked_diag = git.rebase(lock_wt, "origin/main")
+      eq(locked, nil, "a rebase that loses the ref lock fails")
+      eq(locked_diag and locked_diag.cause, "git_lock", "the rebase failure is classified git_lock")
+      eq(locked_diag and locked_diag.retryable, true, "the locked rebase is retryable")
+      has(tostring(locked_err), "git_lock", "the rebase error names git_lock")
+      maki.fs.rm(lock_path)
+
+      -- git's sequencer had already applied the commit to the index when the ref
+      -- update lost the lock, so the fixture restores the pre-rebase tree before
+      -- the retry: a locked ref update is a contention, not a conflict, and the
+      -- branch head itself never moved.
+      sh({ "git", "-C", lock_wt, "rebase", "--abort" }, base)
+      local lr_code, lr_out = sh({ "git", "-C", lock_wt, "reset", "--hard", lock_sha }, base)
+      eq(lr_code, 0, "the worktree is restored before the retry: " .. lr_out:sub(1, 80))
+
+      local retried, retried_err = git.rebase(lock_wt, "origin/main")
+      eq(type(retried), "string", "the retry after the lock succeeds: " .. tostring(retried_err))
+      eq(#(retried or ""), 40, "the retried rebase returns the new head")
+      git.worktree_remove(repo, lock_wt, { force = true })
+
+      local conf_again, conf_again_err, conf_diag = git.rebase(conflict_wt, "origin/main")
+      eq(conf_again, nil, "the conflicting rebase is refused again")
+      has(conf_again_err or "", "README.md", "the conflict still names the file")
+      eq(conf_diag and conf_diag.cause, "git_error", "a conflict is not a lock")
+      eq(conf_diag and conf_diag.conflict and conf_diag.conflict[1], "README.md",
+        "the conflict list survives the classification")
+    end
+  end
+  check_ref_lock()
 
   -- Cleanup -----------------------------------------------------------------
 
