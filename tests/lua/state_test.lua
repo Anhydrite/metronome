@@ -469,6 +469,58 @@ return function()
   eq(state.checkpoint_of({ failure = { cause = "unknown" } }), nil,
     "a task with a failure but no checkpoints still reads nil for the checkpoint")
 
+  -- Quarantine --------------------------------------------------------------
+  --
+  -- A blocked task is set aside, not failed: it keeps its status and carries
+  -- why. The marker travels as a field event, so it must survive journal ->
+  -- projection -> replay, and a clean re-analysis must be able to lift it
+  -- durably instead of waiting for a new submit.
+  local quarantine = {
+    reason = "analysis_blocked",
+    rules = { "missing_dependency" },
+    findings = {
+      {
+        severity = "blocking",
+        rule = "missing_dependency",
+        message = "task depends on an unknown task",
+        tasks = { "T-20261122-c001" },
+      },
+    },
+    since = "2026-11-22T11:00:00Z",
+  }
+  local quarantined = state.set_fields(root, "T-20261122-c001", { quarantine = quarantine })
+  eq(quarantined ~= nil, true, "a quarantine can be written on a task")
+  eq(quarantined and quarantined.status, "running", "a quarantine does not change the status")
+  eq(type(quarantined and quarantined.quarantine), "table", "the projection carries the quarantine")
+  eq(quarantined and quarantined.quarantine.reason, "analysis_blocked", "the reason is projected")
+  eq(quarantined and quarantined.quarantine.rules[1], "missing_dependency", "the rules are projected")
+  eq(quarantined and quarantined.quarantine.findings[1].severity, "blocking",
+    "the findings are projected")
+  eq(quarantined and quarantined.quarantine.since, "2026-11-22T11:00:00Z", "the timestamp is projected")
+
+  -- A rebuilt projection is not the truth: replaying the journal must bring the
+  -- quarantine back, or a crash would silently un-quarantine a blocked task.
+  maki.fs.rm(state.paths(root).projection)
+  local replayed_quarantine = state.load(root).tasks["T-20261122-c001"]
+  eq(type(replayed_quarantine and replayed_quarantine.quarantine), "table",
+    "the quarantine replays from the journal")
+  eq(replayed_quarantine and replayed_quarantine.quarantine.reason, "analysis_blocked",
+    "the replayed quarantine keeps its reason")
+  eq(replayed_quarantine and replayed_quarantine.quarantine.rules[1], "missing_dependency",
+    "the replayed quarantine keeps its rules")
+
+  local cleared = state.clear_quarantine(root, "T-20261122-c001")
+  eq(type(cleared), "table", "clear_quarantine returns the task")
+  eq(cleared and cleared.quarantine, nil, "clear_quarantine drops the quarantine from the projection")
+  eq(cleared and cleared.status, "running", "clearing a quarantine leaves the status alone")
+  eq(state.clear_quarantine(root, "T-20261122-nope"), nil, "clear_quarantine refuses an unknown task")
+
+  maki.fs.rm(state.paths(root).projection)
+  local after_clear = state.load(root).tasks["T-20261122-c001"]
+  eq(after_clear and after_clear.quarantine, nil, "the clearing replays: a fresh replay has no quarantine")
+  eq(after_clear and after_clear.branch, "metronome/T-20261122-c001",
+    "clearing a quarantine keeps the rest of the task")
+
   -- The schema accepts the new field, and refuses an unknown one inside it.
   local qualify = load_module("qualify")
   local validate_tmp = test_dir("state-validate")
@@ -486,6 +538,32 @@ return function()
   eq(bad_shape_ok, nil, "the schema refuses an unknown key inside failure")
   eq(bad_shape_err ~= nil and bad_shape_err:find("failure", 1, true) ~= nil, true,
     "the refusal names the failure object")
+
+  -- The same contract for quarantine: a blocked task validates, and a key the
+  -- runtime does not write inside the marker is refused instead of silently
+  -- carried onto the task.
+  local quarantine_task = {
+    id = "T-20261122-c003",
+    title = "quarantined task",
+    status = "qualifying",
+    quarantine = quarantine,
+  }
+  local quarantine_ok, quarantine_err = qualify.validate_projection(quarantine_task, {
+    tmp_dir = validate_tmp,
+  })
+  eq(quarantine_ok, true, "the schema accepts a task carrying quarantine: " .. tostring(quarantine_err))
+  local bad_quarantine = {
+    id = "T-20261122-c004",
+    title = "bad quarantine",
+    status = "qualifying",
+    quarantine = { reason = "analysis_blocked", not_a_quarantine_key = true },
+  }
+  local bad_quarantine_ok, bad_quarantine_err = qualify.validate_projection(bad_quarantine, {
+    tmp_dir = validate_tmp,
+  })
+  eq(bad_quarantine_ok, nil, "the schema refuses an unknown key inside quarantine")
+  eq(bad_quarantine_err ~= nil and bad_quarantine_err:find("quarantine", 1, true) ~= nil, true,
+    "the refusal names the quarantine object")
 
   -- An empty root is not an error.
   local empty_root = tmp_root("empty")
