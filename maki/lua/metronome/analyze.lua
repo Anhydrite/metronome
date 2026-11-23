@@ -1041,16 +1041,18 @@ end
 
 -- Fingerprint cache ----------------------------------------------------------
 
--- Two independent polynomial hashes, concatenated. A single 32-bit hash has a
--- collision rate low enough to be unlikely but not low enough to bet a cache
--- hit on; two bases make an accidental match negligible without pulling a
--- crypto library into the module.
+-- Two polynomial hashes with distinct bases, concatenated. A single 32-bit hash
+-- has a collision rate low enough to be unlikely but not low enough to bet a
+-- cache hit on; two bases make an accidental match negligible without pulling a
+-- crypto library into the module. Both multipliers stay small enough that each
+-- step (h * base + byte) stays below 2^53, so the modulo is exact in double
+-- arithmetic and no low bits are lost.
 local function digest(text)
   local h1, h2 = 5381, 2166136261
   for i = 1, #text do
     local byte = text:byte(i)
     h1 = (h1 * 33 + byte) % 4294967296
-    h2 = (h2 * 16777619 + byte) % 4294967296
+    h2 = (h2 * 65599 + byte) % 4294967296
   end
   return string.format("%.0f-%.0f", h1, h2)
 end
@@ -1110,6 +1112,7 @@ local function input_fingerprint(tasks, tasks_dir, extra)
       tostring(task.base_ref or ""),
       table.concat(dedupe_sorted(string_list(task.files)), ","),
       table.concat(string_list(task.checks), "\1"),
+      table.concat(string_list(task.acceptance), "\1"),
       table.concat(dedupe_sorted(string_list(task.depends_on)), ","),
       sheet,
     }, "\2")
@@ -1269,33 +1272,43 @@ function M.gate(state, root, opts)
   -- Only a run that actually consulted the semantic half is worth caching: a
   -- structural-only dry run must never hide the analyst from the next gate.
   local cacheable = type(opts.runner) == "function" and opts.semantic ~= false
-  local fingerprint = input_fingerprint(selected, tasks_dir, input_signature())
   local cache_hit = false
   local result = nil
+  local fingerprint = nil
 
   if cacheable then
+    -- Only a cacheable run pays for the fingerprint: hashing the sheets, listing
+    -- the declared files and running `git ls_tree` is wasted work when no runner
+    -- will ever read or write the cache.
+    fingerprint = input_fingerprint(selected, tasks_dir, input_signature())
     local cache = read_cache(root)
     if type(cache) == "table"
       and cache.fingerprint == fingerprint
-      and type(cache.findings) == "table"
-      and cache.findings_signature == findings_signature(cache.findings) then
-      -- A cache hit replays findings, not a verdict: recompute the verdict from
-      -- the cached findings exactly as a fresh run does, so `analysis.json`
-      -- never says ok next to a blocking finding.
-      local cached_ok = true
-      for _, finding in ipairs(cache.findings) do
-        if finding.severity == "blocking" then
-          cached_ok = false
-          break
+      and type(cache.findings) == "table" then
+      -- A hand-edited or half-written cache can hold a findings array whose
+      -- entries are not tables. `findings_signature` indexes each entry, so a
+      -- malformed entry would raise; treat any such failure as a cache miss
+      -- instead of breaking the module's "never raises" contract.
+      local sig_ok, sig = pcall(findings_signature, cache.findings)
+      if sig_ok and cache.findings_signature == sig then
+        -- A cache hit replays findings, not a verdict: recompute the verdict
+        -- from the cached findings exactly as a fresh run does, so
+        -- `analysis.json` never says ok next to a blocking finding.
+        local cached_ok = true
+        for _, finding in ipairs(cache.findings) do
+          if finding.severity == "blocking" then
+            cached_ok = false
+            break
+          end
         end
+        result = {
+          ok = cached_ok,
+          verdict = cached_ok and "ok" or "blocked",
+          findings = cache.findings,
+          semantic = { ok = true, cached = true },
+        }
+        cache_hit = true
       end
-      result = {
-        ok = cached_ok,
-        verdict = cached_ok and "ok" or "blocked",
-        findings = cache.findings,
-        semantic = { ok = true, cached = true },
-      }
-      cache_hit = true
     end
   end
 

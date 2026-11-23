@@ -951,6 +951,18 @@ return function()
   })
   eq(cache_calls, 3, "changing a dependency invalidates the cache")
 
+  -- `acceptance` feeds `undeclared_file_dependency`, so a change there must
+  -- invalidate the cache too: otherwise analysis.json would replay a rule that
+  -- no longer holds (or miss a new one).
+  state.set_fields(cache_root, "T-20261114-q002", { acceptance = { "q1 is merged" } })
+  analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = cache_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+  })
+  eq(cache_calls, 4, "changing acceptance invalidates the cache")
+
   -- Edit the finding the cache stores: the signature no longer matches, so the
   -- gate cannot trust the cache and asks the analyst again.
   local cache_file = maki.fs.joinpath(cache_root, "analysis-cache.json")
@@ -965,7 +977,24 @@ return function()
     session_opts = session_opts,
     tasks_dir = cache_tasks_dir,
   })
-  eq(cache_calls, 4, "changing a finding invalidates the cache")
+  eq(cache_calls, 5, "changing a finding invalidates the cache")
+
+  -- A malformed cache (a findings entry that is not a table, as a hand-edited
+  -- or half-written file can produce) is a cache miss, never a crash: the gate
+  -- must still reach its quarantine/dispatch step.
+  local malformed_text = maki.fs.read(cache_file)
+  local malformed_ok, malformed_payload = pcall(maki.json.decode, malformed_text)
+  eq(malformed_ok and type(malformed_payload) == "table", true, "the cache file is readable again")
+  malformed_payload.findings[1] = 42
+  maki.fs.write(cache_file, maki.json.encode(malformed_payload))
+  local malformed = analyze.gate(state, cache_root, {
+    intention = "cache",
+    runner = cache_runner,
+    session_opts = session_opts,
+    tasks_dir = cache_tasks_dir,
+  })
+  eq(cache_calls, 6, "a malformed cache entry is a miss and retries the analyst")
+  eq(malformed and malformed.cached, false, "a malformed cache is not served")
 
   -- A re-analysis that finds the quarantined tasks clean lifts the markers and
   -- moves them to ready without a new submit. The sheet changes, so the cache
