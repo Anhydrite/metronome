@@ -83,33 +83,86 @@ local function has(s, needle, label)
   end
 end
 
--- A suffix private to this process, used when no harness token is exported:
--- pid (from /proc when readable), clock and randomness, so standalone runs stay
--- isolated from each other too.
+-- A suffix private to this process, used when the shell harness exported no
+-- token: pid (uv's own first, /proc as a fallback), a high-resolution stamp
+-- when the host has one, and a random tail. Nothing is seeded: pid and the
+-- clock already separate processes, and seeding from os.time()/os.clock()
+-- (CPU time in Lua 5.1) made two processes started in the same second draw the
+-- same tail, i.e. the same token.
 local function process_suffix()
   local pid = "0"
-  local stat = maki.fs.read("/proc/self/stat")
-  if type(stat) == "string" then
-    pid = stat:match("^(%d+)") or pid
+  if type(maki.uv.os_getpid) == "function" then
+    pid = tostring(maki.uv.os_getpid())
   end
-  local stamp = tostring(os.time()) .. tostring(os.clock()):gsub("%.", "")
-  math.randomseed(tonumber(stamp:sub(-9)) or os.time())
+  if pid == "0" then
+    local stat = maki.fs.read("/proc/self/stat")
+    if type(stat) == "string" then
+      pid = stat:match("^(%d+)") or pid
+    end
+  end
+  local stamp = nil
+  if type(maki.uv.hrtime) == "function" then
+    stamp = tostring(maki.uv.hrtime())
+  end
+  if not stamp then
+    stamp = tostring(os.time()) .. tostring(os.clock()):gsub("%.", "")
+  end
   return string.format("%s-%s-%d", pid, stamp, math.random(100000, 999999))
 end
 
 local test_token = env("MAKI_TEST_TOKEN") or process_suffix()
 
--- Workspace for one test: <state_dir>/metronome-tests/<token>/<name>. The token
--- comes from tests/run-lua.sh, so every run owns a distinct tree; the directory
--- is emptied and recreated so a rerun never inherits stale files.
+-- Root of the per-test workspaces: one test owns <root>/<name>.
+--
+-- The token must be applied exactly once. Inside tests/run-lua.sh,
+-- XDG_STATE_HOME already equals the run dir, so <state_dir> is <run>/maki and
+-- the shell exports MAKI_TEST_JOURNALS -- the very tree validate_journal()
+-- inspects. Re-appending the token here would write outside that tree and turn
+-- the journal check into a spurious failure. Outside the harness neither
+-- variable is exported, so a process-private suffix keeps standalone runs
+-- isolated under <state_dir>/metronome-tests/<suffix>/<name>.
+local function tests_root()
+  local journals = env("MAKI_TEST_JOURNALS")
+  if journals then
+    return journals
+  end
+  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests")
+  if env("MAKI_TEST_TOKEN") then
+    return base
+  end
+  return maki.fs.joinpath(base, test_token)
+end
+
+-- Workspace for one test: derived from tests_root(), emptied and recreated so a
+-- rerun never inherits stale files.
 local function test_dir(name)
-  local base = maki.fs.joinpath(maki.env.state_dir(), "metronome-tests", test_token)
-  local dir = maki.fs.joinpath(base, name)
+  local dir = maki.fs.joinpath(tests_root(), name)
   if maki.fs.metadata(dir) then
     maki.fs.rm(dir, { recursive = true })
   end
   maki.fs.mkdir(dir, { parents = true })
   return dir
+end
+
+-- Exercise the helper on every run: if test_dir() ever resolves outside the
+-- journals root, the journals it holds become invisible to validate_journal(),
+-- so prove it here instead of failing later with a misleading message.
+do
+  local root = tests_root()
+  local dir = test_dir("harness-probe")
+  local inside = dir:sub(1, #root + 1) == root .. "/"
+  local marker = maki.fs.joinpath(dir, "probe.txt")
+  maki.fs.write(marker, "ok\n")
+  local back = maki.fs.read(marker)
+  if inside and back == "ok\n" then
+    ok("test_dir writes inside the journals root (" .. dir .. ")")
+  else
+    fail("test_dir resolved outside the journals root: " .. tostring(dir)
+      .. " (root " .. tostring(root) .. ")")
+  end
+  if maki.fs.metadata(dir) then
+    maki.fs.rm(dir, { recursive = true })
+  end
 end
 
 local function run_file(path)
@@ -135,6 +188,7 @@ local function run_file(path)
     mktmpdir = helpers.mktmpdir,
     rmtree = helpers.rmtree,
     test_dir = test_dir,
+    test_root = tests_root,
     test_token = test_token,
   }
   setfenv(chunk, setmetatable(env, { __index = _G }))

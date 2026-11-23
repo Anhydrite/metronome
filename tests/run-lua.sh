@@ -29,20 +29,33 @@ fi
 export MAKI_TEST_TOKEN
 
 RUN_DIR="$STATE/metronome-tests/$TOKEN"
+
+# Where the Lua tests write their journals. maki derives its state dir as
+# <XDG_STATE_HOME>/maki and every tests/lua file writes under
+# <state_dir>/metronome-tests/<name>, so with XDG_STATE_HOME="$RUN_DIR" (below)
+# the journals root is $RUN_DIR/maki/metronome-tests. This is deliberately not
+# $RUN_DIR/<name>: maki inserts its own "maki" level and the per-test <name>
+# suffix is fixed in the test files, which this change may not touch. The root
+# is exported so metronome_test.lua's test_dir() helper resolves exactly where
+# validate_journal() looks, and printed so an operator finds the artifacts.
+TESTS_DIR="$RUN_DIR/maki/metronome-tests"
+
 export MAKI_TEST_RESULTS="$RUN_DIR/lua-results.txt"
 export MAKI_TEST_ERROR_PATH="$RUN_DIR/harness-error.txt"
+export MAKI_TEST_JOURNALS="$TESTS_DIR"
 
 # Print the workspace so a caller can prove two concurrent runs are distinct.
-echo "RUN: token=$TOKEN dir=$RUN_DIR"
+echo "RUN: token=$TOKEN dir=$RUN_DIR journals=$TESTS_DIR"
 
 if [[ ! -f "$ROOT/.maki/init.lua" ]]; then
   echo "FAIL: missing .maki/init.lua harness entry" >&2
   exit 1
 fi
 
-# Own the workspace: start clean and remove it on exit, after the journals have
-# been validated, on success and on failure alike. A reused token belongs to the
-# caller, so it is not wiped here.
+# Own the workspace: remove it on exit, after the journals have been validated,
+# on success and on failure alike. A reused token belongs to the caller, so its
+# run dir survives -- but the journals it may still hold are dropped below, so
+# a stale journal can never satisfy validate_journal() for this run.
 if [[ "$OWN_TOKEN" -eq 1 ]]; then
   rm -rf "$RUN_DIR"
   trap 'rm -rf "$RUN_DIR"' EXIT
@@ -52,11 +65,14 @@ mkdir -p "$RUN_DIR"
 # maki derives its state dir as <XDG_STATE_HOME>/maki, and every Lua test writes
 # under <state_dir>/metronome-tests/<name>. Pointing XDG_STATE_HOME at this
 # run's workspace therefore moves all of those paths (journals, temp repos,
-# worktrees) under $RUN_DIR without touching a single test file, while keeping
+# worktrees) under $TESTS_DIR without touching a single test file, while keeping
 # them real paths so git's canonical comparisons still match.
 export XDG_STATE_HOME="$RUN_DIR"
-TESTS_DIR="$RUN_DIR/maki/metronome-tests"
 
+# Start from empty artifacts, in reuse mode too: validate_journal() only detects
+# a missing journal, so leftovers from an earlier run with the same token could
+# otherwise vouch for a journal this run never wrote.
+rm -rf "$TESTS_DIR"
 rm -f "$MAKI_TEST_RESULTS" "$MAKI_TEST_ERROR_PATH"
 
 # `maki index` exits non-zero for reasons unrelated to plugins, so the result
