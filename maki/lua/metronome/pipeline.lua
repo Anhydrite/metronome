@@ -537,18 +537,7 @@ function M.resume(state, root, opts)
       -- against, and a stale walk would dispatch a task already restarted.
       local expected = entry.from
       local moved = true
-      -- A review-escalated task gets its round budget back in the same gesture
-      -- as the move back to `running`, before it crosses over: the first review
-      -- of the relaunch must be round 1, not round max+1 with no review at all.
-      if entry.review_reset then
-        local applied, aerr = apply_review_reset(state, root, entry)
-        if not applied then
-          moved = false
-          entry.reason = aerr
-          errors[#errors + 1] = { id = entry.id, skipped = true, reason = aerr }
-        end
-      end
-      for _, to in ipairs(moved and entry.path or {}) do
+      for index, to in ipairs(entry.path) do
         local current_state = state.load(root)
         local current = type(current_state) == "table"
           and current_state.tasks and current_state.tasks[entry.id] or nil
@@ -561,6 +550,21 @@ function M.resume(state, root, opts)
           moved = false
           entry.reason = string.format("status already moved to %s at %s", current.status, stamp)
           break
+        end
+        -- A review-escalated task gets its round budget back in the same gesture
+        -- as the move back to `running`, before it crosses over: the first
+        -- review of the relaunch must be round 1, not round max+1 with no review.
+        -- It lands *after* the compare-and-set check above, so only the task
+        -- this pilot still owns is mutated; a task another actor took over is
+        -- skipped untouched, with no misleading reset note in the journal.
+        if index == 1 and entry.review_reset then
+          local applied, aerr = apply_review_reset(state, root, entry)
+          if not applied then
+            moved = false
+            entry.reason = aerr
+            errors[#errors + 1] = { id = entry.id, skipped = true, reason = aerr }
+            break
+          end
         end
         local ok, merr = state.transition(root, entry.id, to, { phase = entry.phase })
         if not ok then

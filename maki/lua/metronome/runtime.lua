@@ -3329,6 +3329,15 @@ function M.new(deps)
     if not ok or type(reset) ~= "table" then
       return nil
     end
+    -- Re-read immediately before the write: the budget belongs only to a task
+    -- this pilot still owns, failed at the moment it is granted. Another actor
+    -- may have moved it since the projection was read, and resetting the round
+    -- of a task being reviewed elsewhere would be a phantom budget grant.
+    local loaded = type(deps.state.load) == "function" and deps.state.load(paths.root) or nil
+    local current = type(loaded) == "table" and loaded.tasks and loaded.tasks[task.id] or nil
+    if not current or current.status ~= task.status then
+      return nil, "task moved before its review budget could be reset"
+    end
     local stored, serr = deps.state.set_fields(paths.root, task.id, { review = reset.review })
     if not stored then
       return nil, serr or "cannot reset the review round budget"
@@ -3361,12 +3370,27 @@ function M.new(deps)
     -- relaunch would escalate on its first round with no review run at all
     -- (T-20261122-0043). The budget is granted in the same gesture as the move
     -- back to `running`, before the task crosses over.
+    local prior_review = type(task.review) == "table" and task.review or nil
     local review_reset, reset_err = reset_review_budget(paths, task)
     if reset_err then
       return { ok = false, error = reset_err }
     end
     local moved, err = deps.state.transition(paths.root, input.id, "running", { phase = "implement" })
     if not moved then
+      -- The transition re-loads and may refuse (illegal or concurrent move).
+      -- The reset has already landed, and the task stayed failed: undo it and
+      -- journal the rollback rather than leave a budget grant that never
+      -- corresponded to a relaunch.
+      if review_reset and prior_review then
+        pcall(deps.state.set_fields, paths.root, input.id, { review = prior_review })
+        if type(deps.state.append) == "function" then
+          pcall(deps.state.append, paths.root, {
+            kind = "note",
+            task_id = input.id,
+            text = "review budget reset rolled back: the task never crossed to running",
+          })
+        end
+      end
       return { ok = false, error = err }
     end
     -- A human retry is a fresh start: the attempt budget starts again from
