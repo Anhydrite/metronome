@@ -2005,6 +2005,20 @@ function M.new(deps)
     deploying = true,
   }
 
+  -- The statuses `pipeline.resume` can walk back to `running`. Mirrors its
+  -- local `RESUME_PHASE`; only a fallback for the compare-and-set the resume
+  -- does before parking a task, so a task that reached a status the resume
+  -- cannot revive (`merged`, `queued`, ...) is never parked from it.
+  local RESUME_STATUSES = {
+    running = true,
+    stalled = true,
+    verifying = true,
+    reviewing = true,
+    merging = true,
+    deploying = true,
+    failed = true,
+  }
+
   -- The requeue reason written when no slot is missing: the task is handed
   -- back to the queue because a retry or a resume must not start it on its own
   -- authority, not because the pipeline is full.
@@ -3911,9 +3925,12 @@ function M.new(deps)
     if not selected then
       return { ok = false, error = err }
     end
-    local requeued, refused, live = {}, {}, {}
+    local requeued, refused, live, skipped = {}, {}, {}, {}
     for _, entry in ipairs(selected.resumed or {}) do
       local id = type(entry) == "table" and entry.id or nil
+      -- The status the entry was selected from. Every entry `pipeline.resume`
+      -- returns carries it; it is what the compare-and-set below re-checks.
+      local expected = type(entry) == "table" and entry.from or nil
       if id and task_handles[id] ~= nil then
         -- A resume can run mid-session, while tasks are still live. A task that
         -- still holds a spawn handle is not interrupted: parking it as
@@ -3925,28 +3942,54 @@ function M.new(deps)
         log(paths, string.format("task %s: still live, resume leaves it alone", tostring(id)))
       elseif id then
         local current = deps.state.load(paths.root)
-        local in_flight, cap, free = slot_counts(
-          current and current.tasks or {}, max_parallel, id)
-        local waiting = free <= 0
-        local reason = waiting and wait_slot_reason() or REQUEUE_FOR_DISPATCH
-        local marked, merr = mark_slot_wait(paths, id, reason)
-        if marked then
-          entry.requeued = true
-          entry.waiting = waiting or nil
-          entry.wait_reason = reason
-          entry.slot_wait = waiting and {
-            reason = reason,
-            in_flight = in_flight,
-            max_parallel = cap,
-          } or nil
-          requeued[#requeued + 1] = entry
-          if waiting then
-            refused[#refused + 1] = id
+        local task = current and current.tasks and current.tasks[id] or nil
+        -- Compare-and-set, the guard the `apply = true` path always had: the
+        -- selection was read once, before this loop, and a resume can run
+        -- mid-session while a late verdict, a scheduler tick or a second resume
+        -- moves the task. Parking it from a status it no longer holds would
+        -- dispatch a `failed` task the retryability filter excluded (a run that
+        -- just failed non-retryably and lost its handle) or leave a `merged`
+        -- task parked forever, which `tick` never dispatches. Skip such an
+        -- entry instead of marking it.
+        local lost = not task
+          or (expected ~= nil and task.status ~= expected)
+          or not RESUME_STATUSES[task.status]
+        if lost then
+          entry.skipped = true
+          if not task then
+            entry.reason = "status unreadable while resuming"
+          elseif expected ~= nil and task.status ~= expected then
+            entry.reason = string.format("status already moved to %s", tostring(task.status))
+          else
+            entry.reason = string.format("status %s is not resumable", tostring(task.status))
           end
-          log(paths, string.format("task %s: queued on resume (%s)", tostring(id), reason))
+          skipped[#skipped + 1] = { id = id, skipped = true, reason = entry.reason }
+          log(paths, string.format("task %s: resume skips it (%s)",
+            tostring(id), entry.reason))
         else
-          log(paths, string.format("task %s: cannot queue on resume: %s",
-            tostring(id), tostring(merr)))
+          local in_flight, cap, free = slot_counts(
+            current and current.tasks or {}, max_parallel, id)
+          local waiting = free <= 0
+          local reason = waiting and wait_slot_reason() or REQUEUE_FOR_DISPATCH
+          local marked, merr = mark_slot_wait(paths, id, reason)
+          if marked then
+            entry.requeued = true
+            entry.waiting = waiting or nil
+            entry.wait_reason = reason
+            entry.slot_wait = waiting and {
+              reason = reason,
+              in_flight = in_flight,
+              max_parallel = cap,
+            } or nil
+            requeued[#requeued + 1] = entry
+            if waiting then
+              refused[#refused + 1] = id
+            end
+            log(paths, string.format("task %s: queued on resume (%s)", tostring(id), reason))
+          else
+            log(paths, string.format("task %s: cannot queue on resume: %s",
+              tostring(id), tostring(merr)))
+          end
         end
       end
     end
@@ -3961,6 +4004,7 @@ function M.new(deps)
       requeued = requeued,
       waiting = refused,
       live = live,
+      skipped = skipped,
     }
   end
 

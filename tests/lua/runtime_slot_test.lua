@@ -821,4 +821,85 @@ return function()
   eq(state.load(root).tasks[U].slot_wait, nil, "the dispatch clears the automatic retry's wait")
   eq(state.load(root).tasks[U].slot_wait_since, nil,
     "the dispatch clears the automatic retry's wait timestamp")
+
+  -- A resume must not park a task another actor moved since the selection ----
+  --
+  -- `runtime.resume` reads the interrupted tasks once, then parks each one.
+  -- A resume can run mid-session, so a late verdict, a scheduler tick or a
+  -- second resume may move a task between the selection and the marking.
+  -- Parking such a task from a status it no longer holds would dispatch
+  -- `failed -> running` work the retryability filter excluded, or leave a
+  -- `merged` task parked forever (`tick` never dispatches it). Each entry
+  -- carries `from`, so the resume re-reads the task and skips a stale entry,
+  -- like the old `apply = true` compare-and-set did.
+  reset()
+  local cas = {}
+  for key, value in pairs(pipeline) do
+    cas[key] = value
+  end
+  local X = "T-20261122-0021"
+  local Y = "T-20261122-0022"
+  -- The selection happens here, then each task moves before the resume's loop
+  -- reads it again: X lands (`merged`), Y fails non-retryably (`failed`).
+  cas.resume = function()
+    local snapshot = state.load(root)
+    local entries = {}
+    for _, id in ipairs({ X, Y }) do
+      local task = snapshot.tasks[id]
+      entries[#entries + 1] = {
+        id = id,
+        from = task.status,
+        phase = task.phase,
+        path = { "running" },
+      }
+    end
+    state.transition(root, X, "merged", { reason = "revue approuvee" })
+    state.transition(root, Y, "failed", {
+      reason = "checks exited 1",
+      failure = {
+        cause = "checks_failed",
+        message = "the checks are red",
+        transient = false,
+        attempts = 3,
+      },
+    })
+    return { resumed = entries, errors = {}, skipped = {} }
+  end
+  local env12 = new_env()
+  env12.pipeline = cas
+  local rt12 = build(env12)
+  -- X is interrupted in `merging` and lands while the resume is between its
+  -- selection and its loop; Y is interrupted in `running` and fails for good.
+  state.create(root, {
+    id = X,
+    title = "fusion terminee",
+    status = "merging",
+    phase = "merge",
+    files = { "src/0021.lua" },
+    checks = { "true" },
+    branch = "metronome/" .. X,
+    worktree = "/tmp/wt-" .. X,
+  })
+  create_running(Y, "echec definitif")
+
+  local raced = rt12.resume()
+  eq(raced and raced.ok, true, "the racing resume succeeds")
+  eq(type(raced and raced.skipped), "table", "the resume reports the stale entries")
+  eq(#(raced and raced.skipped or {}), 2, "both stale entries are skipped")
+  eq(#(raced and raced.requeued or {}), 0, "no stale entry is requeued")
+  eq(#env12.calls, 0, "the racing resume opens no implementer turn")
+
+  local landed = state.load(root).tasks[X]
+  eq(landed.status, "merged", "the landed task keeps its status")
+  eq(landed.slot_wait, nil, "the landed task is not parked")
+  eq(landed.slot_wait_since, nil, "the landed task carries no wait timestamp")
+  local dead = state.load(root).tasks[Y]
+  eq(dead.status, "failed", "the non-retryable task keeps its status")
+  eq(dead.slot_wait, nil, "the non-retryable task is not parked")
+  eq(dead.slot_wait_since, nil, "the non-retryable task carries no wait timestamp")
+
+  -- The drain the resume arms must not resurrect either of them.
+  pump_all(env12)
+  eq(#env12.calls, 0, "a skipped entry is never dispatched by the drain")
+  eq(env12.peak <= 1, true, "a racing resume never exceeds max_parallel")
 end
